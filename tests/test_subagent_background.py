@@ -444,6 +444,170 @@ def test_ack_endpoint_owner_verified_and_first_caller_wins(monkeypatch):
         subagent_runs._UPDATES.pop("mine", None)
 
 
+# ── Server-side sub-agent resume (Feature 2) ─────────────────────────────
+# After a SUCCESSFUL delivery: if the parent session has a live turn, the
+# result is steered into it; otherwise a detached server-resume turn is started.
+# Capped at 3 consecutive resumes, reset on user activity, never on error.
+
+import src.agent_runs as agent_runs
+
+
+@pytest.fixture(autouse=True)
+def _clean_resume_state():
+    yield
+    agent_runs._RUNS.clear()
+    subagent_runs._resume_count.clear()
+    subagent_runs._resume_running.clear()
+
+
+def _live_run(session_id):
+    run = agent_runs._Run()
+    run.status = "running"
+    agent_runs._RUNS[session_id] = run
+    return run
+
+
+async def test_server_resume_steers_into_live_turn(fake_env, monkeypatch):
+    # A live parent turn → the sub-agent result is enqueued as a steer (framed
+    # untrusted), not a detached resume turn.
+    async def fake_loop(*args, **kwargs):
+        yield _sse({"delta": "sub answer"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", fake_loop)
+    started = {"n": 0}
+
+    async def _no_start(*a, **k):
+        started["n"] += 1
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _no_start)
+
+    _live_run("res-live")
+    await mit.spawn_agent("do a thing", session_id="res-live", owner="u")
+    await _wait_done("res-live")
+    await asyncio.sleep(0.02)
+
+    # The framed result was steered into the live turn...
+    steered = agent_runs.drain_steering("res-live")
+    assert steered and steered[0]["kind"] == "subagent"
+    assert "sub answer" in steered[0]["text"]
+    # ...and no detached resume turn was started.
+    assert started["n"] == 0
+    # Poll payload flags the run as server-handled so the client won't fire.
+    upd = subagent_runs.get_updates("res-live")
+    assert upd["updates"][0]["resume"] == "server"
+
+
+async def test_server_resume_starts_detached_turn_when_idle(fake_env, monkeypatch):
+    async def fake_loop(*args, **kwargs):
+        yield _sse({"delta": "sub answer"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", fake_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append((session_id, framed, owner))
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    # No live run for the session → detached resume fires.
+    await mit.spawn_agent("do a thing", session_id="res-idle", owner="u")
+    await _wait_done("res-idle")
+    await asyncio.sleep(0.02)
+
+    assert len(calls) == 1
+    assert calls[0][0] == "res-idle"
+    assert "sub answer" in (calls[0][1] or "")
+    # Cap consumed once.
+    assert subagent_runs._resume_count.get("res-idle") == 1
+
+
+async def test_no_server_resume_on_error(fake_env, monkeypatch):
+    # An errored sub-agent delivers the failure notice but MUST NOT resume.
+    async def boom_loop(*args, **kwargs):
+        raise RuntimeError("kaboom")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", boom_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append(session_id)
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    await mit.spawn_agent("do a thing", session_id="res-err", owner="u")
+    await _wait_done("res-err")
+    await asyncio.sleep(0.02)
+
+    assert calls == []                                  # no resume on error
+    assert subagent_runs._resume_count.get("res-err", 0) == 0
+    upd = subagent_runs.get_updates("res-err")
+    assert upd["updates"][0]["resume"] is None          # not flagged server-handled
+
+
+async def test_server_resume_cap_of_three(fake_env, monkeypatch):
+    async def fake_loop(*args, **kwargs):
+        yield _sse({"delta": "answer"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", fake_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append(session_id)
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    # Four consecutive idle deliveries; only the first three may resume.
+    for i in range(4):
+        await mit.spawn_agent("t", session_id="res-cap", owner="u")
+        await _wait_done("res-cap")
+        await asyncio.sleep(0.02)
+        # Clear finished records so _wait_done sees the next run cleanly, but
+        # keep the resume counter (that's the whole point of the cap).
+        subagent_runs._UPDATES.pop("res-cap", None)
+
+    assert len(calls) == 3, f"expected cap of 3 resumes, got {len(calls)}"
+    assert subagent_runs._resume_count.get("res-cap") == 3
+
+
+async def test_server_resume_cap_resets_on_user_activity(fake_env, monkeypatch):
+    async def fake_loop(*args, **kwargs):
+        yield _sse({"delta": "answer"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", fake_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append(session_id)
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    # Exhaust the cap.
+    for _ in range(3):
+        await mit.spawn_agent("t", session_id="res-reset", owner="u")
+        await _wait_done("res-reset")
+        await asyncio.sleep(0.02)
+        subagent_runs._UPDATES.pop("res-reset", None)
+    assert len(calls) == 3
+    # A capped delivery does not resume.
+    await mit.spawn_agent("t", session_id="res-reset", owner="u")
+    await _wait_done("res-reset")
+    await asyncio.sleep(0.02)
+    subagent_runs._UPDATES.pop("res-reset", None)
+    assert len(calls) == 3
+
+    # Genuine user activity resets the cap → the next delivery resumes again.
+    subagent_runs.note_user_activity("res-reset")
+    await mit.spawn_agent("t", session_id="res-reset", owner="u")
+    await _wait_done("res-reset")
+    await asyncio.sleep(0.02)
+    assert len(calls) == 4
+
+
 async def test_no_session_runs_synchronously(monkeypatch):
     async def fake_loop(*args, **kwargs):
         yield _sse({"delta": "inline"})

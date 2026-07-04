@@ -299,10 +299,26 @@ async def spawn_agent(
     except Exception as _clamp_err:
         logger.debug("sub-agent max_tokens clamp fell back to default: %s", _clamp_err)
 
+    # Populated with the tracked run's id right after subagent_runs.start()
+    # returns, so _deliver (defined here, invoked later) can flag the run for
+    # server-side resume by id. A plain dict works because _deliver reads it at
+    # call time, well after start() has filled it in.
+    _run_meta: Dict[str, Optional[str]] = {"id": None}
+
     def _deliver(error: Optional[str], partial: str) -> None:
         """Post the sub-agent's outcome as an assistant message into the parent
         session. Persists immediately (add_message -> _persist_message commits),
-        so it renders on reload even if no client is currently connected."""
+        so it renders on reload even if no client is currently connected.
+
+        Server-side resume (Claude-Code parity): after persisting a SUCCESSFUL
+        result, ensure the parent model actually processes it, server-side —
+        no open browser required:
+          * If the parent session has a LIVE agent run, enqueue a steering entry
+            (framed as untrusted context) so the running turn reacts next round.
+          * Otherwise start a DETACHED main-agent resume turn in the parent
+            session (registered in agent_runs so clients can attach/see it).
+        Never resume on error/cancelled/timeout — those deliver the notice only.
+        """
         if not _parent_session:
             return
         try:
@@ -326,6 +342,70 @@ async def spawn_agent(
             logger.info("[subagent-deliver] delivered to %s (%d chars)", _parent_session, len(text))
         except Exception as e:
             logger.error(f"spawn_agent delivery failed for session {_parent_session}: {e}", exc_info=True)
+            return
+
+        # Only successful completions drive a resume; error/cancelled/timeout
+        # deliver the notice and stop (resuming on those would burn tokens on a
+        # spawn/fail/resume loop against a down provider).
+        if error:
+            return
+        try:
+            _maybe_server_resume(partial or "")
+        except Exception as e:
+            logger.error("[subagent-resume] resume dispatch failed for %s: %s", _parent_session, e, exc_info=True)
+
+    def _maybe_server_resume(result_text: str) -> None:
+        """Push the sub-agent's result to the parent model, server-side.
+
+        Live turn → enqueue a steering entry (Feature 1's queue). No live turn →
+        start a detached resume turn. Both frame the result via
+        untrusted_context_message so fetched/quoted content can't speak with
+        user/assistant authority. Capped + single-fire guarded via subagent_runs.
+        """
+        from src import agent_runs, subagent_runs
+        from src.prompt_security import untrusted_context_message
+
+        sub_id = _run_meta.get("id")
+        # Frame the result as untrusted context (may quote fetched web content).
+        framed = untrusted_context_message(
+            f"background sub-agent {sub_id or ''} ({_model}) result",
+            f"Background sub-agent {sub_id or ''} ({_model}) finished. Full result:\n\n{result_text}",
+        )["content"]
+
+        # 1) A turn is live for the parent session → steer into it (atomic:
+        #    enqueue only succeeds if the run is still running).
+        if agent_runs.enqueue_steer(_parent_session, framed, kind="subagent"):
+            if sub_id:
+                subagent_runs.mark_resume(_parent_session, sub_id, "server")
+            logger.info("[subagent-resume] steered result into live turn for %s", _parent_session)
+            return
+
+        # 2) No live turn → start a detached server-side resume turn, subject to
+        #    the cap and single-fire guard.
+        if not subagent_runs.can_server_resume(_parent_session):
+            logger.info("[subagent-resume] resume capped/already-running for %s — delivered only", _parent_session)
+            return
+        subagent_runs.note_server_resume(_parent_session)
+        subagent_runs.set_resume_running(_parent_session, True)
+        if sub_id:
+            subagent_runs.mark_resume(_parent_session, sub_id, "server")
+
+        async def _resume_turn() -> None:
+            try:
+                from src.chat_flows import start_server_resume_turn
+                await start_server_resume_turn(_parent_session, framed, owner=_owner)
+            except Exception as _e:
+                logger.error("[subagent-resume] detached resume turn failed for %s: %s",
+                             _parent_session, _e, exc_info=True)
+            finally:
+                subagent_runs.set_resume_running(_parent_session, False)
+
+        try:
+            asyncio.create_task(_resume_turn())
+            logger.info("[subagent-resume] started detached server resume turn for %s", _parent_session)
+        except Exception as _e:
+            subagent_runs.set_resume_running(_parent_session, False)
+            logger.error("[subagent-resume] could not schedule resume turn for %s: %s", _parent_session, _e)
 
     async def _run_subagent(deliver: bool) -> Dict:
         """Run the leaf sub-agent to completion under the guardrails. When
@@ -450,6 +530,8 @@ async def spawn_agent(
     rec = subagent_runs.start(
         _parent_session, _summary, _model, lambda: _run_subagent(deliver=True), owner=_owner
     )
+    # Let _deliver flag this run for server-side resume by id when it finishes.
+    _run_meta["id"] = rec["id"]
     return {
         "result": (
             f"Sub-agent dispatched (id={rec['id']}, model={_model}) and now running in the "

@@ -2393,6 +2393,63 @@ def build_active_plan_note(approved_plan: str) -> str:
     )
 
 
+def _inject_steering_messages(session_id: Optional[str], messages: List[Dict]) -> List[Dict]:
+    """Drain the session's steering queue and inject each message into the turn.
+
+    Returns the list of drained items ({"text", "kind"}). For each item this:
+      (a) persists a user-role ChatMessage at its chronological position (so it
+          renders in-order on reload and reaches the model on the next turn too),
+      (b) appends it to ``messages`` so the RUNNING model sees it this round,
+      (c) marks genuine user activity so the sub-agent server-resume cap resets
+          (only for kind == "user"; a sub-agent-result steer must not reset it).
+
+    A kind == "user" steer is appended verbatim as a user turn. A kind ==
+    "subagent" steer carries pre-framed untrusted context (see the delivery
+    path) and is appended as-is. Both persist so history stays truthful.
+    Returns [] when there is no session or nothing queued.
+    """
+    if not session_id:
+        return []
+    from src import agent_runs
+    items = agent_runs.drain_steering(session_id)
+    if not items:
+        return []
+    try:
+        from core.models import ChatMessage, get_session_manager
+    except Exception:
+        ChatMessage = None
+        get_session_manager = None
+    sm = get_session_manager() if get_session_manager else None
+    sess = sm.get_session(session_id) if sm else None
+    saw_user = False
+    for item in items:
+        text = item.get("text") or ""
+        kind = item.get("kind") or "user"
+        if not text:
+            continue
+        if kind == "user":
+            saw_user = True
+        messages.append({"role": "user", "content": text})
+        # Persist so a reload/other client sees the steer in chronological order.
+        if sess is not None and ChatMessage is not None:
+            try:
+                meta = {"steered": True}
+                if kind != "user":
+                    meta["steer_kind"] = kind
+                sess.add_message(ChatMessage("user", text, metadata=meta))
+            except Exception as _e:
+                logger.warning("[steer] failed to persist steered message: %s", _e)
+    # A genuine user steer counts as user activity: reset the sub-agent
+    # server-resume cap (mirrors a normal send / an ack).
+    if saw_user:
+        try:
+            from src import subagent_runs
+            subagent_runs.note_user_activity(session_id)
+        except Exception as _e:
+            logger.debug("[steer] note_user_activity skipped: %s", _e)
+    return items
+
+
 def _detect_runaway_call(call_freq, threshold=15):
     """Tool name of a call signature repeated >= ``threshold`` times — a real
     runaway loop. Counts IDENTICAL repeated calls (same tool AND args), so a
@@ -3092,6 +3149,14 @@ async def stream_agent_loop(
     _last_screenshot_msg = None  # the message dict appended last round (to replace)
 
     for round_num in range(1, max_rounds + 1):
+        # ── Steering: inject any messages sent while this turn is streaming ──
+        # Drain at the round boundary BEFORE the model call so a mid-turn user
+        # message (or a background sub-agent result) is part of this round's
+        # context. Each is persisted + appended to `messages`; emit an in-order
+        # SSE so open clients render it where it happened.
+        for _steer in _inject_steering_messages(session_id, messages):
+            yield f'data: {json.dumps({"type": "steering_injected", "text": _steer.get("text", ""), "kind": _steer.get("kind", "user")})}\n\n'
+
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
@@ -3624,6 +3689,22 @@ async def stream_agent_loop(
                 # Visible signal in the stream so the user knows we caught it.
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
+            # FINAL DRAIN: the model produced no tool call and is about to end the
+            # turn. Before ending, drain the steering queue one last time — a
+            # message that arrived DURING this round (after the round-boundary
+            # drain above) would otherwise be lost. If any surfaced, inject them
+            # and CONTINUE with another round so the model actually reacts. The
+            # enqueue side is atomic on the event loop, so nothing can slip in
+            # after this synchronous drain returns empty. max_rounds still bounds
+            # the loop, so this can't run forever.
+            if session_id and round_num < max_rounds:
+                _final = _inject_steering_messages(session_id, messages)
+                if _final:
+                    for _steer in _final:
+                        yield f'data: {json.dumps({"type": "steering_injected", "text": _steer.get("text", ""), "kind": _steer.get("kind", "user")})}\n\n'
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    full_response += "\n\n"
+                    continue
             break  # no tools — done
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────

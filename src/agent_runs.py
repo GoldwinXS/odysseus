@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class _Run:
-    __slots__ = ("buffer", "subscribers", "status", "task", "evict_task")
+    __slots__ = ("buffer", "subscribers", "status", "task", "evict_task", "steer_queue")
 
     def __init__(self) -> None:
         self.buffer: list = []          # ordered SSE event strings (replay log)
@@ -31,9 +31,58 @@ class _Run:
         self.status: str = "running"    # running | done | error | stopped
         self.task: Optional[asyncio.Task] = None
         self.evict_task: Optional[asyncio.Task] = None
+        # Steering queue: user/sub-agent messages injected into the RUNNING
+        # loop at the next round boundary (Claude Code-style steering). The
+        # loop drains this synchronously each round; a final drain before the
+        # turn ends guarantees no message is lost (see drain_steering / enqueue_steer).
+        self.steer_queue: list = []     # list of {"text": str, "kind": str}
 
 
 _RUNS: Dict[str, _Run] = {}
+
+
+# ── Steering queue ───────────────────────────────────────────────────────
+# A message sent while a turn is streaming is injected into the live agent
+# loop at the next round boundary. Enqueue and the loop's liveness check both
+# run on the single asyncio event-loop thread, so "is a live run present?"
+# and "append to its queue" happen with no await in between — atomic vs. the
+# run's teardown (which also runs on this thread, in _drain's finally). A run
+# that has gone terminal (status != "running") no longer accepts steering, so
+# the endpoint 409s and the client falls back to a normal send: no lost message.
+
+def enqueue_steer(session_id: str, text: str, kind: str = "user") -> bool:
+    """Atomically enqueue a steering message iff a LIVE run exists.
+
+    Returns True when the text was queued into a running turn, False when there
+    is no live run for the session (caller should 409 → normal send). The check
+    and append are a single synchronous critical section on the event loop, so a
+    teardown cannot slip in between them.
+    """
+    run = _RUNS.get(session_id)
+    if run is None or run.status != "running":
+        return False
+    run.steer_queue.append({"text": str(text or ""), "kind": kind})
+    return True
+
+
+def drain_steering(session_id: str) -> list:
+    """Pop and return all queued steering messages for a session (FIFO).
+
+    Synchronous, so the loop can call it at a round boundary and also as a FINAL
+    drain before ending the turn with no risk of a message arriving mid-drain
+    (enqueue runs on the same thread). Each item is {"text": str, "kind": str}.
+    """
+    run = _RUNS.get(session_id)
+    if run is None or not run.steer_queue:
+        return []
+    items = run.steer_queue
+    run.steer_queue = []
+    return items
+
+
+def has_steering(session_id: str) -> bool:
+    run = _RUNS.get(session_id)
+    return bool(run and run.steer_queue)
 
 # How long a FINISHED run (and its full replay buffer) is retained after the
 # last subscriber disconnects, so a reconnect within the window can still

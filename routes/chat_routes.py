@@ -1445,6 +1445,14 @@ def setup_chat_routes(
         if compare_mode:
             return StreamingResponse(_safe_stream(), media_type="text/event-stream")
 
+        # A genuine user send resets the sub-agent server-resume cap for this
+        # session (mirrors the frontend's resetSubagentAutoResume on manual send).
+        try:
+            from src import subagent_runs as _sar
+            _sar.note_user_activity(session)
+        except Exception:
+            pass
+
         agent_runs.start(session, _safe_stream())
         return StreamingResponse(agent_runs.subscribe(session), media_type="text/event-stream")
 
@@ -1468,6 +1476,34 @@ def setup_chat_routes(
         _verify_session_owner(request, session_id)
         stopped = agent_runs.stop(session_id)
         return {"stopped": stopped}
+
+    # ------------------------------------------------------------------ #
+    # POST /api/chat/steer — inject a message into a RUNNING agent turn.
+    # Body JSON: {"session_id": str, "text": str}. If a live agent run exists
+    # for the session, the text is enqueued into that turn's steering queue and
+    # injected at the next round boundary (Claude Code-style steering); returns
+    # {"queued": true}. If NO live run exists, returns 409 so the client falls
+    # back to a normal send — a steer is never silently lost. The liveness check
+    # and enqueue are atomic vs. run teardown (both run on the event loop with no
+    # await between; see agent_runs.enqueue_steer).
+    # ------------------------------------------------------------------ #
+    @router.post("/api/chat/steer")
+    async def chat_steer(request: Request) -> Dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+        session_id = (body or {}).get("session_id")
+        text = (body or {}).get("text")
+        if not isinstance(session_id, str) or not session_id:
+            raise HTTPException(400, "session_id is required")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(400, "text is required")
+        _verify_session_owner(request, session_id)
+        if not agent_runs.enqueue_steer(session_id, text, kind="user"):
+            # No live turn to steer — 409 tells the client to send normally.
+            raise HTTPException(409, "No active run for this session")
+        return {"queued": True}
 
     # ------------------------------------------------------------------ #
     # GET /api/chat/stream_status — check if a stream is active for a session

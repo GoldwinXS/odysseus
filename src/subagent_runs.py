@@ -52,6 +52,46 @@ _UPDATES: Dict[str, List[dict]] = {}    # session_id -> [record, ...]
 _evict_tasks: Dict[str, asyncio.Task] = {}
 _counter = 0
 
+# Server-side sub-agent resume (Claude-Code parity: the parent model always
+# processes a sub-agent result, server-side, even with no browser open).
+# _resume_count caps consecutive server-fired resumes per session so a
+# down/rate-limited provider (which finishes as status=error and would itself
+# be delivered) can't drive an unbounded spawn/finish/resume token loop.
+# _resume_running guards against starting a second resume turn while one is
+# already going. Both reset on genuine user activity (a normal send / steer).
+_MAX_SERVER_RESUMES = 3
+_resume_count: Dict[str, int] = {}      # session_id -> consecutive server resumes
+_resume_running: set = set()            # session_ids with a resume turn in flight
+
+
+def can_server_resume(session_id: str) -> bool:
+    """Whether another server-side resume may fire for this session.
+
+    False when the per-session cap is hit or a resume turn is already running.
+    """
+    if session_id in _resume_running:
+        return False
+    return _resume_count.get(session_id, 0) < _MAX_SERVER_RESUMES
+
+
+def note_server_resume(session_id: str) -> None:
+    """Record that a server-side resume just fired (consumes cap budget)."""
+    _resume_count[session_id] = _resume_count.get(session_id, 0) + 1
+
+
+def set_resume_running(session_id: str, running: bool) -> None:
+    """Mark whether a server-side resume turn is currently in flight."""
+    if running:
+        _resume_running.add(session_id)
+    else:
+        _resume_running.discard(session_id)
+
+
+def note_user_activity(session_id: str) -> None:
+    """Reset the server-resume cap on genuine user activity (normal send / steer /
+    ack). Mirrors the frontend's resetSubagentAutoResume."""
+    _resume_count.pop(session_id, None)
+
 
 def _next_id() -> str:
     global _counter
@@ -113,6 +153,12 @@ def start(
         # wins (see ack()); kept until the record is evicted so a late/second
         # poller learns the completion was already consumed and won't double-fire.
         "acked": False,
+        # How this completion's parent-model reaction is being handled. The
+        # delivery path (model_interaction_tools._deliver) sets this to
+        # "server" once it has enqueued a steer into a live turn OR started a
+        # detached resume turn itself; the frontend reads it from get_updates
+        # and MUST NOT client-fire an auto-resume when it is "server".
+        "resume": None,   # None | "server"
         "_task": None,   # asyncio.Task — internal, never serialized (see get_updates)
     }
     _UPDATES.setdefault(session_id, []).append(rec)
@@ -153,6 +199,18 @@ def ack(session_id: str, run_ids: List[str]) -> List[str]:
             rec["acked"] = True
             newly.append(rec["id"])
     return newly
+
+
+def mark_resume(session_id: str, subagent_id: str, mode: str = "server") -> None:
+    """Flag a finished run's completion as handled server-side, so no client
+    fires a duplicate auto-resume. Exposed via get_updates (`resume`)."""
+    for rec in _UPDATES.get(session_id, []):
+        if rec["id"] == subagent_id:
+            rec["resume"] = mode
+            # A server-side resume also consumes/records against the cap only
+            # once actually fired; the delivery path calls note_server_resume
+            # explicitly. Here we just record the mode on the record.
+            return
 
 
 async def _run(session_id: str, rec: dict, runner: Callable[[], Awaitable[Dict]]) -> None:
@@ -270,6 +328,10 @@ def get_updates(session_id: str) -> Dict[str, Any]:
                 "started_at": r["started_at"],
                 "finished_at": r["finished_at"],
                 "acked": r.get("acked", False),
+                # "server" => the parent-model reaction is being handled
+                # server-side (steer into a live turn or a detached resume
+                # turn). The client must NOT client-fire an auto-resume for it.
+                "resume": r.get("resume"),
             }
             for r in lst
         ],
