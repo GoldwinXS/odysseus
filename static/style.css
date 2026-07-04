@@ -9339,6 +9339,24 @@ body.fullwidth-chat .chat-history {
   font-size: 0.85em;
   opacity: 0.5;
 }
+/* Target of a tool call — filename / command / query. Claude-Code-style:
+   "Edit  chatRenderer.js". Truncates so a long command never wraps the chip. */
+.agent-thread-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 48ch;
+}
+/* Diff summary on the chip: +adds / −dels (or "new"). */
+.agent-thread-stat {
+  font-size: 0.82em;
+  opacity: 0.65;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+}
 .agent-thread-chevron {
   font-size: 0.7em;
   transition: transform 0.2s ease;

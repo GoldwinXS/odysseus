@@ -1933,8 +1933,14 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
         const sMeta = sessions.find(s => s.id === id);
         if (sMeta && sMeta.model !== modelName) {
           sMeta.model = modelName;
-          updateModelPicker();
         }
+        // Always repaint, not just when the cached meta changed: the early
+        // updateModelPicker() call above runs before history is fetched, and
+        // if the session list wasn't loaded yet at that point the label was
+        // painted from the pending-chat default fallback. With the meta now
+        // authoritative, a repaint here guarantees the picker shows this
+        // session's real model even if a later render step fails.
+        updateModelPicker();
       }
     }
 

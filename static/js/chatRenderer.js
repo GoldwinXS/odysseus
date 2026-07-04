@@ -2192,6 +2192,113 @@ export function renderAskUserCard(payload, options) {
 /**
  * Add a message to the chat history.
  */
+
+// ---- Tool-call chip helpers (shared by history reconstruction + expand) ----
+
+// Short Claude-Code-style verb for a raw tool name.
+const _TOOL_VERB = {
+  read_file: 'Read', read_document: 'Read', list_files: 'List', list_models: 'List',
+  write_file: 'Write', create_document: 'Write',
+  edit_file: 'Edit', edit_document: 'Edit', update_document: 'Edit', suggest_document: 'Review',
+  bash: 'Bash', python: 'Python',
+  web_search: 'Search', web_fetch: 'Fetch', deep_research: 'Research',
+  image_gen: 'Image', generate_image: 'Image',
+  manage_memory: 'Memory', save_memory: 'Memory', search_memory: 'Recall',
+  manage_session: 'Session', ui_control: 'UI',
+};
+
+function _basename(p) {
+  if (typeof p !== 'string') return '';
+  const parts = p.split(/[\\/]/);
+  return parts[parts.length - 1] || p;
+}
+
+// One-line summary for a tool event: { verb, detail, stat, ok }. `detail` is the
+// target (filename / command / query), kept short — mirrors how Claude Code
+// labels a call as e.g. "Edit(app.js)  +12 −3".
+export function toolChipSummary(ev) {
+  const tool = (ev.tool || '').toLowerCase();
+  const verb = _TOOL_VERB[tool] || (ev.tool ? ev.tool.charAt(0).toUpperCase() + ev.tool.slice(1) : 'Tool');
+  let detail = '';
+  if (ev.diff && ev.diff.file) {
+    detail = _basename(ev.diff.file);
+  } else if (ev.command) {
+    const cmd = ev.command.trim();
+    // File tools persist their args as JSON; bash/python persist a raw script.
+    if (cmd.startsWith('{')) {
+      try {
+        const args = JSON.parse(cmd);
+        const path = args.path || args.file || args.file_path || args.filename || args.name;
+        if (path) detail = _basename(String(path));
+        else if (args.query) detail = String(args.query);
+        else if (args.pattern) detail = String(args.pattern);
+      } catch (_) { /* fall through to raw */ }
+    }
+    if (!detail) detail = cmd.split('\n')[0];
+  }
+  if (detail.length > 64) detail = detail.slice(0, 61) + '…';
+  let stat = '';
+  if (ev.diff) {
+    const d = ev.diff;
+    stat = [
+      d.new_file ? 'new' : '',
+      d.added ? `+${d.added}` : '',
+      d.removed ? `−${d.removed}` : '',
+    ].filter(Boolean).join(' ');
+  }
+  const ok = (ev.exit_code === 0 || ev.exit_code == null);
+  return { verb, detail, stat, ok };
+}
+
+// Build the (heavy) expandable content for a tool event — command, output, diff,
+// screenshot. Called LAZILY the first time a history chip is expanded, so a turn
+// with 100+ tool calls costs almost nothing until a chip is actually opened.
+// Output is view-capped so one huge result can't freeze the tab on expand.
+export function buildToolContentHtml(ev) {
+  const esc = uiModule.esc;
+  let html = '';
+  // Command (hidden when a diff already says it better).
+  if (ev.command && !(ev.diff && ev.diff.text)) {
+    html += `<pre class="agent-thread-cmd">${esc(ev.command)}</pre>`;
+  }
+  // Output, view-capped (full text stays in the saved metadata).
+  if (ev.output && ev.output.trim()) {
+    const CAP = 4000;
+    const full = ev.output;
+    if (full.length > CAP) {
+      const more = (full.length - CAP).toLocaleString();
+      html += `<details class="agent-tool-output"><summary>Output (${full.length.toLocaleString()} chars — showing first ${CAP.toLocaleString()})</summary><pre>${esc(full.slice(0, CAP))}\n… [${more} more chars truncated in view]</pre></details>`;
+    } else {
+      html += `<details class="agent-tool-output"><summary>Output</summary><pre>${esc(full)}</pre></details>`;
+    }
+  }
+  // Screenshot.
+  const shot = safeToolScreenshotSrc(ev.screenshot);
+  if (shot) {
+    html += `<details class="agent-tool-output"><summary>Screenshot</summary><img src="${esc(shot)}" style="max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)" /></details>`;
+  }
+  // File-write/edit diff.
+  if (ev.diff && ev.diff.text) {
+    const d = ev.diff;
+    const stat = [
+      d.new_file ? '<span class="diff-stat-new">new</span>' : '',
+      d.added ? `<span class="diff-stat-add">+${d.added}</span>` : '',
+      d.removed ? `<span class="diff-stat-del">−${d.removed}</span>` : '',
+    ].filter(Boolean).join(' ');
+    const rows = d.text.split('\n').map(line => {
+      let cls = 'diff-ctx', text = line;
+      if (line.startsWith('+++') || line.startsWith('---')) cls = 'diff-meta';
+      else if (line.startsWith('@@')) cls = 'diff-hunk';
+      else if (line.startsWith('+')) { cls = 'diff-add'; text = line.slice(1); }
+      else if (line.startsWith('-')) { cls = 'diff-del'; text = line.slice(1); }
+      else if (line.startsWith(' ')) { text = line.slice(1); }
+      return `<span class="${cls}">${esc(text) || '&nbsp;'}</span>`;
+    }).join('');
+    html += `<details class="agent-tool-output agent-tool-diff"><summary><span class="diff-file">${esc(d.file || 'diff')}</span> <span class="diff-summary-stats">${stat}</span></summary><pre class="diff-pre">${rows}</pre></details>`;
+  }
+  return html;
+}
+
 export function addMessage(role, content, modelName, metadata) {
   try {
     hideWelcomeScreen();
@@ -2209,6 +2316,8 @@ export function addMessage(role, content, modelName, metadata) {
     // --- Agent multi-bubble reconstruction from saved metadata ---
     if (role === 'assistant' && metadata && metadata.tool_events && metadata.tool_events.length > 0) {
       const roundTexts = metadata.round_texts || [];
+      // Lazy chips make rendering every event cheap, so no cap is needed —
+      // even a runaway 100+ tool turn is just that many one-line chips.
       const toolEvents = metadata.tool_events;
       let pendingAskUser = null;
       let lastWrap = null;
@@ -2288,43 +2397,17 @@ export function addMessage(role, content, modelName, metadata) {
           }
           for (const ev of roundTools) {
             if (ev.ask_user) pendingAskUser = ev.ask_user;
-            const ok = (ev.exit_code === 0 || ev.exit_code == null);
-            let outHtml = '';
-            if (ev.output && ev.output.trim()) {
-              outHtml = `<details class="agent-tool-output"><summary>Output</summary><pre>${esc(ev.output)}</pre></details>`;
-            }
-            const screenshotSrc = safeToolScreenshotSrc(ev.screenshot);
-            if (screenshotSrc) {
-              outHtml += `<details class="agent-tool-output"><summary>Screenshot</summary><img src="${esc(screenshotSrc)}" style="max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)" /></details>`;
-            }
-            // File-write/edit diff (persisted in the tool event) \u2014 re-render it
-            // so it survives reload, matching the live stream.
-            let evDiffHtml = '';
-            if (ev.diff && ev.diff.text) {
-              const d = ev.diff;
-              const stat = [
-                d.new_file ? '<span class="diff-stat-new">new</span>' : '',
-                d.added ? `<span class="diff-stat-add">+${d.added}</span>` : '',
-                d.removed ? `<span class="diff-stat-del">\u2212${d.removed}</span>` : '',
-              ].filter(Boolean).join(' ');
-              const rows = d.text.split('\n').map(line => {
-                let cls = 'diff-ctx', text = line;
-                if (line.startsWith('+++') || line.startsWith('---')) cls = 'diff-meta';
-                else if (line.startsWith('@@')) cls = 'diff-hunk';
-                // Drop the leading diff marker (+/-/space) — colour encodes add/del.
-                else if (line.startsWith('+')) { cls = 'diff-add'; text = line.slice(1); }
-                else if (line.startsWith('-')) { cls = 'diff-del'; text = line.slice(1); }
-                else if (line.startsWith(' ')) { text = line.slice(1); }
-                return `<span class="${cls}">${esc(text) || '&nbsp;'}</span>`;
-              }).join('');  // spans are display:block \u2014 a literal \n would double-space
-              evDiffHtml = `<details class="agent-tool-output agent-tool-diff"><summary><span class="diff-file">${esc(d.file || 'diff')}</span> <span class="diff-summary-stats">${stat}</span></summary><pre class="diff-pre">${rows}</pre></details>`;
-            }
+            const sum = toolChipSummary(ev);
             const node = document.createElement('div');
-            node.className = 'agent-thread-node' + (ok ? '' : ' error');
-            // Hide the raw JSON command when a diff says it better (same as live).
-            const evCmdHtml = (ev.command && !(ev.diff && ev.diff.text)) ? `<pre class="agent-thread-cmd">${esc(ev.command)}</pre>` : '';
-            node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(ev.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${evCmdHtml}${outHtml}${evDiffHtml}</div>`;
-            // Click handling is delegated globally \u2014 see chat.js init.
+            node.className = 'agent-thread-node' + (sum.ok ? '' : ' error');
+            // Lightweight one-line chip. The heavy detail (command/output/diff/
+            // screenshot) is built lazily the first time the chip is expanded \u2014
+            // see the delegated click handler in chat.js \u2014 so a 100+ tool turn
+            // never dumps hundreds of KB of hidden DOM on load.
+            const detailHtml = sum.detail ? `<span class="agent-thread-detail">${esc(sum.detail)}</span>` : '';
+            const statHtml = sum.stat ? `<span class="agent-thread-stat">${esc(sum.stat)}</span>` : '';
+            node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${sum.ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(sum.verb)}</span>${detailHtml}${statHtml}<span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content"></div>`;
+            node._ev = ev;  // stashed for lazy content build on first expand
             threadWrap.appendChild(node);
           }
           // Check if next round has text — extend line down to connect
@@ -2691,6 +2774,8 @@ const chatRenderer = {
   stripToolBlocks,
   copyMessageText,
   safeToolScreenshotSrc,
+  toolChipSummary,
+  buildToolContentHtml,
   safeDisplayImageSrc,
   removeAskUserCards,
   renderAskUserCard,

@@ -715,6 +715,25 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     }
 
     if (!sessionModule.getCurrentSessionId()) {
+      // Recover the last-open session before falling back to auto-create.
+      // After a tab crash/reload the modules reinitialize with a null
+      // currentSessionId; if the user sends before the async auto-select in
+      // loadSessions() completes, the message would otherwise escape into a
+      // silently-created default-model chat (wrong model, phantom "new chat").
+      try {
+        const lastId = Storage.get('lastSessionId');
+        if (lastId) {
+          const known = (sessionModule.getSessions && sessionModule.getSessions()) || [];
+          // If the session list hasn't loaded yet, trust the saved id —
+          // selectSession fetches history by id directly.
+          if (!known.length || known.some(s => s.id === lastId && !s.archived)) {
+            await sessionModule.selectSession(lastId, { keepSidebar: true });
+          }
+        }
+      } catch (_) { /* fall through to default-chat auto-create */ }
+    }
+
+    if (!sessionModule.getCurrentSessionId()) {
       // Auto-create a session using default chat config. Always fetch fresh
       // so that a recent Settings change takes effect without a page reload.
       try {
@@ -5190,6 +5209,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (!header) return;
       const node = header.closest('.agent-thread-node');
       if (!node) return;
+      // History chips are rendered as an empty one-liner; their heavy detail
+      // (command / output / diff / screenshot) is built lazily the first time
+      // they are expanded. This is what keeps a turn with 100+ tool calls from
+      // dumping hundreds of KB of hidden DOM on load. Materialise it on demand.
+      if (node._ev && !node._lazyBuilt) {
+        const content = node.querySelector('.agent-thread-content');
+        if (content) {
+          content.innerHTML = chatRenderer.buildToolContentHtml(node._ev);
+          if (window.hljs) content.querySelectorAll('pre code:not(.hljs)').forEach(b => window.hljs.highlightElement(b));
+        }
+        node._lazyBuilt = true;
+      }
       const opened = node.classList.toggle('open');
       if (opened) {
         // Expanding the final tool trace can push a pending ask_user card below

@@ -737,11 +737,19 @@ export function updateModelPicker() {
   const s = sessions.find(x => x.id === currentSessionId);
   let modelId = null;
   if (s && s.model) {
+    // The session's stored model is authoritative — the backend will use it
+    // regardless of what the model cache currently lists. Do NOT null it via
+    // _modelExists here: a transient offline flag, an unfetched models list,
+    // or an endpoint-URL mismatch would blank the label (or worse, let a
+    // default-model fallback paint over it) while the session keeps
+    // generating with its real model. (The "picker says qwen but every
+    // message is glm" desync.)
     modelId = s.model;
-    if (!_modelExists(modelId, s.endpoint_url || '')) {
-      modelId = null;
-    }
-  } else if (_pendingChat && _pendingChat.modelId) {
+  } else if (!currentSessionId && _pendingChat && _pendingChat.modelId) {
+    // pendingChat is only meaningful while composing a NEW chat. With a
+    // session current but its meta not yet loaded, showing the pending
+    // default here would display the wrong model for the open session —
+    // leave the placeholder until the session meta / history sync paints it.
     modelId = _pendingChat.modelId;
     if (!_modelExists(modelId, _pendingChat.url || '')) {
       _deps.setPendingChat(null);

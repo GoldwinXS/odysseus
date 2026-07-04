@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v336';
+const CACHE_NAME = 'odysseus-v341';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
@@ -99,15 +99,15 @@ self.addEventListener('fetch', (e) => {
   // go to the network/static handlers below; otherwise every navigation was
   // served the app index, replacing the page the user actually asked for.
   if (e.request.mode === 'navigate' && url.pathname === '/') {
+    // Network-first for the app shell: on a localhost app the network is always
+    // up, so this always serves the freshest index.html (with current script
+    // versions). Cache is only a fallback for genuine offline. Prevents a stale
+    // shell from pinning old JS after a code update.
     e.respondWith(
-      caches.open(CACHE_NAME).then(async cache => {
-        const cached = await cache.match('/');
-        const network = fetch(e.request).then(res => {
-          if (res && res.ok) cache.put('/', res.clone());
-          return res;
-        }).catch(() => cached);
-        return cached || network;
-      })
+      fetch(e.request).then(res => {
+        if (res && res.ok) caches.open(CACHE_NAME).then(cache => cache.put('/', res.clone()));
+        return res;
+      }).catch(() => caches.open(CACHE_NAME).then(cache => cache.match('/')))
     );
     return;
   }
