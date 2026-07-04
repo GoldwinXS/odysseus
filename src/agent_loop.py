@@ -2471,6 +2471,13 @@ async def stream_agent_loop(
     _t0 = time.time()
     _needs_admin = _detect_admin_intent(messages)
     _last_user = _extract_last_user_message(messages)
+    # Browser intent persists across a conversation: once the user asks to
+    # screenshot/navigate a page, a follow-up nudge ("try now", "go") carries
+    # the same intent even though it names no browser keyword. Scan the recent
+    # user turns, not just the latest line, so the browser MCP toolset stays
+    # available through the whole back-and-forth (see _BROWSER_INTENT_KEYWORDS).
+    _browser_intent_ctx = _recent_context_for_retrieval(messages, max_user=4, max_chars=1500).lower()
+    _wants_browser = any(kw in _browser_intent_ctx for kw in _BROWSER_INTENT_KEYWORDS)
     _intent = _classify_agent_request(messages, _last_user)
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
@@ -3078,10 +3085,10 @@ async def stream_agent_loop(
                     if s.get("function", {}).get("name") in _schema_names
                 ]
                 # Include RAG-selected MCP tools, plus the whole browser MCP
-                # toolset whenever the turn has visual/browser intent (so
-                # navigate + take_screenshot always arrive together, not a
-                # cherry-picked subset). See _BROWSER_INTENT_KEYWORDS.
-                _wants_browser = any(kw in _last_user.lower() for kw in _BROWSER_INTENT_KEYWORDS)
+                # toolset whenever the conversation has visual/browser intent
+                # (so navigate + take_screenshot always arrive together, not a
+                # cherry-picked subset). _wants_browser is computed from recent
+                # user turns above, so a bare "try now" nudge still counts.
                 _mcp_filtered = [
                     s for s in mcp_schemas
                     if s.get("function", {}).get("name") in _relevant_tools
