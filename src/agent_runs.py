@@ -175,6 +175,33 @@ async def _drain(session_id: str, agen: AsyncGenerator[str, None],
         )
         _publish(run, "data: [DONE]\n\n")
     finally:
+        # TEARDOWN DRAIN: status is already terminal (set above on every path),
+        # so enqueue_steer now refuses new items — anything still queued raced
+        # the loop's exit and would otherwise be silently dropped despite the
+        # client's 200. Persist leftovers as user messages so they render
+        # in-order and reach the model on the session's next turn.
+        leftovers = list(run.steer_queue)
+        run.steer_queue.clear()
+        if leftovers:
+            try:
+                from core.models import ChatMessage, get_session_manager
+                sm = get_session_manager()
+                sess = sm.get_session(session_id) if sm else None
+                if sess is not None:
+                    for item in leftovers:
+                        text = (item.get("text") or "") if isinstance(item, dict) else ""
+                        if not text:
+                            continue
+                        meta = {"steered": True}
+                        if isinstance(item, dict) and item.get("kind") == "subagent":
+                            meta["hidden"] = True  # framed context, not user prose
+                        sess.add_message(ChatMessage("user", text, metadata=meta))
+                    sm.save_sessions()
+                    logger.info("[agent-run] %s: persisted %d undrained steer(s) at teardown",
+                                session_id, len(leftovers))
+            except Exception as _e:
+                logger.warning("[agent-run] %s: failed to persist leftover steers: %s",
+                               session_id, _e)
         # Wake every subscriber with the end sentinel so their SSE closes.
         for q in list(run.subscribers):
             try:

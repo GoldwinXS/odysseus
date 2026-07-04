@@ -87,8 +87,13 @@ async def start_server_resume_turn(
         messages: List[Dict] = list(sess.get_context_messages())
     except Exception:
         messages = []
-    if framed_result:
-        # Give the model the full framed result verbatim, adjacent to the prompt.
+    if framed_result and not messages:
+        # Fallback only: history normally already contains the delivered
+        # "Sub-agent result" assistant message (persisted by _deliver before we
+        # run) and the resume prompt directs the model to it — appending the
+        # framed copy on top would send the same result twice. Only when the
+        # history build failed does the framed copy become the model's sole
+        # view of the result.
         messages.append({"role": "user", "content": framed_result})
 
     try:

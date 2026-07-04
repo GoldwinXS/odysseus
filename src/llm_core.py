@@ -1156,7 +1156,14 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             if isinstance(last_block, dict) and last_block.get("type") in (
                 "text", "image", "tool_use", "tool_result", "document",
             ):
-                last_block["cache_control"] = {"type": "ephemeral"}
+                # Copy before marking: list-content blocks are shared BY
+                # REFERENCE with the caller's live `messages` (the converters
+                # shallow-copy), so mutating in place would leak a stray
+                # cache_control key into later rounds and non-Anthropic
+                # fallback providers.
+                marked = dict(last_block)
+                marked["cache_control"] = {"type": "ephemeral"}
+                chat_messages[-1]["content"] = list(last_content[:-1]) + [marked]
     # Anthropic only accepts temperature in [0.0, 1.0] and 400s on anything above
     # 1.0. Clamp here (in the Anthropic builder only) so presets/sliders that use
     # the wider OpenAI 0.0-2.0 range — e.g. the shipped "Nietzsche" preset at 1.2

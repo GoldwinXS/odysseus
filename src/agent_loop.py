@@ -3697,14 +3697,19 @@ async def stream_agent_loop(
             # enqueue side is atomic on the event loop, so nothing can slip in
             # after this synchronous drain returns empty. max_rounds still bounds
             # the loop, so this can't run forever.
-            if session_id and round_num < max_rounds:
+            if session_id:
                 _final = _inject_steering_messages(session_id, messages)
                 if _final:
                     for _steer in _final:
                         yield f'data: {json.dumps({"type": "steering_injected", "text": _steer.get("text", ""), "kind": _steer.get("kind", "user")})}\n\n'
-                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
-                    full_response += "\n\n"
-                    continue
+                    if round_num < max_rounds:
+                        yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                        full_response += "\n\n"
+                        continue
+                    # Terminal round: no budget for the model to react, but the
+                    # drain above already PERSISTED the steers as user messages,
+                    # so they render in-order and reach the model on the NEXT
+                    # turn — never silently dropped.
             break  # no tools — done
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
