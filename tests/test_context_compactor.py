@@ -19,6 +19,7 @@ for mod in [
 
 import src.context_compactor as cc
 from src.context_compactor import (
+    COMPACT_ABS_TRIGGER,
     COMPACT_THRESHOLD,
     SELF_SUMMARY_SYSTEM_PROMPT,
     SUMMARY_MAX_TOKENS,
@@ -34,6 +35,55 @@ class TestCompactThreshold:
 
     def test_summary_max_tokens(self):
         assert SUMMARY_MAX_TOKENS == 1024
+
+
+class TestLargeWindowAbsoluteTrigger:
+    """A large context window must not silently disable compaction. On a
+    1M-window model, 85% is 850K — a real chat balloons to the send-budget cap
+    (~200K) and grinds long before that. Compaction must fire at the absolute
+    ceiling instead. Small-window models keep the percentage trigger."""
+
+    def _run(self, used_tokens, *, context_length):
+        saved = (cc.get_context_length, cc.llm_call_async, cc.resolve_endpoint,
+                 cc._update_session_history, cc.estimate_tokens)
+
+        async def _fake_summary(*a, **k):
+            return "compact summary text"
+
+        cc.get_context_length = lambda url, model: context_length
+        cc.llm_call_async = _fake_summary
+        cc.resolve_endpoint = lambda which, owner=None: (None, None, None)
+        cc._update_session_history = lambda *a, **k: None
+        cc.estimate_tokens = lambda msgs: used_tokens
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(8):
+            messages.append({"role": "user", "content": f"u{i}"})
+            messages.append({"role": "assistant", "content": f"a{i}"})
+        try:
+            return asyncio.run(maybe_compact(
+                session=None,
+                endpoint_url="https://api.z.ai/api/paas/v4/chat/completions",
+                model="glm-5.2", messages=messages, headers={}))
+        finally:
+            (cc.get_context_length, cc.llm_call_async, cc.resolve_endpoint,
+             cc._update_session_history, cc.estimate_tokens) = saved
+
+    def test_compacts_above_absolute_trigger_on_1m_window(self):
+        # 120K used on a 1M window: 85% (=850K) would never fire, but the
+        # absolute ceiling must — this is the exact bug the fix addresses.
+        _, _, was_compacted = self._run(COMPACT_ABS_TRIGGER + 50_000, context_length=1_000_000)
+        assert was_compacted is True
+
+    def test_skips_below_absolute_trigger_on_1m_window(self):
+        _, _, was_compacted = self._run(COMPACT_ABS_TRIGGER - 10_000, context_length=1_000_000)
+        assert was_compacted is False
+
+    def test_small_window_still_uses_percentage(self):
+        # 8K window: trigger stays 85% (~6963), far below the absolute ceiling.
+        # 5000 used → no compaction; 7000 used → compaction.
+        _, _, low = self._run(5_000, context_length=8_192)
+        _, _, high = self._run(7_000, context_length=8_192)
+        assert low is False and high is True
 
 
 class TestSelfSummaryPrompt:

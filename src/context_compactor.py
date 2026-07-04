@@ -37,6 +37,15 @@ def _content_as_text(content: Any) -> str:
 
 
 COMPACT_THRESHOLD = 0.85  # Trigger compaction at 85% of context window
+# Absolute token ceiling for the compaction trigger. 85% of a large window
+# (850K on a 1M-context model like glm-5.2) means compaction effectively never
+# fires: the conversation balloons to the send-budget cap (~200K) and grinds —
+# slow (every token reprocessed each turn, no prompt caching) and prone to
+# tool-loops — long before the percentage trigger is reached. Triggering at the
+# SMALLER of 85%-of-window and this ceiling keeps long-context chats lean, while
+# the full window stays available for occasional large single payloads. Small-
+# window models are unaffected (85% of their window is already below this).
+COMPACT_ABS_TRIGGER = 70000
 SUMMARY_MAX_TOKENS = 1024
 SMALL_CONTEXT_LIMIT = 8192  # Models with context <= this get aggressive trimming
 
@@ -325,11 +334,18 @@ async def maybe_compact(
     used = estimate_tokens(messages)
     pct = (used / context_length) * 100 if context_length else 0
 
-    if pct < COMPACT_THRESHOLD * 100:
+    # Trigger at the SMALLER of 85%-of-window and the absolute ceiling, so a
+    # large window can't silently disable compaction (see COMPACT_ABS_TRIGGER).
+    # When the window is unknown (0), fall back to the absolute ceiling alone.
+    pct_trigger = COMPACT_THRESHOLD * context_length if context_length else 0
+    trigger_tokens = min(pct_trigger, COMPACT_ABS_TRIGGER) if pct_trigger > 0 else COMPACT_ABS_TRIGGER
+
+    if used < trigger_tokens:
         return messages, context_length, False
 
     logger.info(
-        f"Context at {pct:.1f}% ({used}/{context_length} tokens) — compacting"
+        f"Context at {used} tokens (>= {int(trigger_tokens)} trigger, "
+        f"{pct:.1f}% of {context_length} window) — compacting"
     )
 
     # Split into system preface and conversation
