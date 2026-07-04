@@ -1966,8 +1966,14 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
       // but it used the default" bug after a restart / stale cache).
       if (modelName) {
         const sMeta = sessions.find(s => s.id === id);
-        if (sMeta && sMeta.model !== modelName) {
-          sMeta.model = modelName;
+        if (sMeta) {
+          if (sMeta.model !== modelName) sMeta.model = modelName;
+        } else {
+          // Session list not fetched yet (deep link raced loadSessions).
+          // Seed a minimal stub so the repaint below can read the model —
+          // loadSessions replaces the whole array when it lands, so the
+          // stub never reaches the sidebar.
+          sessions.push({ id, model: modelName });
         }
         // Always repaint, not just when the cached meta changed: the early
         // updateModelPicker() call above runs before history is fetched, and
