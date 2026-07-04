@@ -571,10 +571,33 @@ def _compact_tool_line(name: str, section: str) -> str:
     return f"- `{name}` — " + lines[0][:160]
 
 
-def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool = False) -> str:
-    """Build the system prompt with only the specified tools included."""
+def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool = False,
+                     fenced: bool = False) -> str:
+    """Build the system prompt with only the specified tools included.
+
+    `fenced`: the model will NOT receive native tool schemas this turn (no
+    `tools` param is sent) and the agent loop parses fenced code blocks
+    instead — Ollama-native / local OpenAI-compat models. The compact prompt
+    must say so: telling such a model "use native tool calls, do not write
+    tool syntax in chat" (the schema-carrying wording below) leaves it with
+    no usable tool channel at all, and obedient models (qwen2.5-coder)
+    conclude they can't touch the system and refuse every action.
+    """
     disabled = disabled_tools or set()
     included = tool_names - disabled
+
+    if compact and fenced:
+        tool_lines = []
+        for name, _default_section in TOOL_SECTIONS.items():
+            if name in included:
+                tool_lines.append(_compact_tool_line(name, _section_text(name, _default_section)))
+        parts = [
+            _AGENT_PREAMBLE,
+            "## Available tools\n" + ("\n".join(tool_lines) if tool_lines else "none"),
+            _AGENT_RULES,
+        ]
+        parts.extend(_domain_rules_for_tools(included))
+        return "\n\n".join(parts)
 
     if compact:
         tool_lines = []
@@ -1305,6 +1328,7 @@ def _build_system_prompt(
     relevant_tools: Optional[Set[str]] = None,
     mcp_disabled_map: Optional[Dict[str, set]] = None,
     compact: bool = False,
+    fenced: bool = False,
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
     suppress_skills: bool = False,
@@ -1325,7 +1349,7 @@ def _build_system_prompt(
         _ov_sig = _hl.sha256(_json.dumps(get_builtin_overrides() or {}, sort_keys=True).encode()).hexdigest()
     except Exception:
         _ov_sig = ""
-    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, owner, suppress_local_context, suppress_skills)
+    cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, fenced, _ov_sig, owner, suppress_local_context, suppress_skills)
     if _cached_base_prompt and _cached_base_prompt_key == cache_key and not active_document:
         agent_prompt = _cached_base_prompt
         # Skill index is user-editable (name + description), so it must never
@@ -1333,7 +1357,7 @@ def _build_system_prompt(
         # when the cache hits.
         _, _skill_index_block = _build_base_prompt(
             disabled_tools, mcp_mgr, needs_admin, relevant_tools,
-            mcp_disabled_map=mcp_disabled_map, compact=compact, owner=owner,
+            mcp_disabled_map=mcp_disabled_map, compact=compact, fenced=fenced, owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
         )
@@ -1345,6 +1369,7 @@ def _build_system_prompt(
             relevant_tools,
             mcp_disabled_map=mcp_disabled_map,
             compact=compact,
+            fenced=fenced,
             owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
@@ -1855,6 +1880,7 @@ def _build_base_prompt(
     relevant_tools=None,
     mcp_disabled_map=None,
     compact: bool = False,
+    fenced: bool = False,
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
     suppress_skills: bool = False,
@@ -1881,7 +1907,7 @@ def _build_base_prompt(
         tool_names = set(relevant_tools) | {"ask_user", "update_plan"}
         if needs_admin:
             tool_names |= _ADMIN_TOOLS
-        agent_prompt = _assemble_prompt(tool_names, disabled, compact=compact)
+        agent_prompt = _assemble_prompt(tool_names, disabled, compact=compact, fenced=fenced)
     else:
         # Fallback: full prompt (RAG unavailable)
         agent_prompt = AGENT_SYSTEM_PROMPT
@@ -1892,10 +1918,10 @@ def _build_base_prompt(
                 "chat_with_model", "ask_teacher", "list_models",
             }
             agent_prompt = _assemble_prompt(
-                set(TOOL_SECTIONS.keys()) - mgmt_tools, disabled, compact=compact
+                set(TOOL_SECTIONS.keys()) - mgmt_tools, disabled, compact=compact, fenced=fenced
             )
         elif compact:
-            agent_prompt = _assemble_prompt(set(TOOL_SECTIONS.keys()), disabled, compact=True)
+            agent_prompt = _assemble_prompt(set(TOOL_SECTIONS.keys()), disabled, compact=True, fenced=fenced)
 
     # Inject the Level-0 skill index — one line per skill so the agent
     # knows what canonical procedures exist. Includes published skills
@@ -2747,6 +2773,10 @@ async def stream_agent_loop(
         needs_admin=_needs_admin, relevant_tools=_relevant_tools,
         mcp_disabled_map=_mcp_disabled_map,
         compact=_compact_agent_prompt,
+        # Ollama-native/compat models are forced off the native tool channel
+        # (no schemas sent — see _is_api_model above), so their compact
+        # prompt must teach fenced blocks instead of claiming API schemas.
+        fenced=not _is_api_model,
         owner=owner,
         suppress_local_context=guide_only,
         suppress_skills=_low_signal_turn,
