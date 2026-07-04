@@ -297,7 +297,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Spawn a sub-agent that runs a full tool-using agent loop on a self-contained task and returns its final result. The sub-agent has the normal tools (files, shell, browser, etc.) but cannot spawn further agents. Use to delegate a focused unit of work — e.g. 'read js/render/models.js, screenshot localhost:1338, and list what looks visually wrong'.",
+            "description": "Spawn/dispatch a sub-agent that runs a full tool-using agent loop on a self-contained task IN THE BACKGROUND. Returns immediately with an acknowledgement — do NOT wait for it; the sub-agent's result is delivered into this chat as a message when it finishes. Use to dispatch or delegate a focused unit of work to an autonomous agent that reports back — e.g. 'read js/render/models.js, screenshot localhost:1338, and list what looks visually wrong'. The sub-agent has the normal tools (files, shell, browser, etc.) but cannot spawn further agents.",
             "parameters": {
                 "type": "object",
                 "properties": {
