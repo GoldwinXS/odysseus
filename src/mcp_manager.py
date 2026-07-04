@@ -475,6 +475,20 @@ class McpManager:
 
     async def _do_call(self, session, tool_name: str, arguments: Dict) -> Dict:
         """Execute a single MCP tool call and return result dict."""
+        # Playwright MCP's browser_take_screenshot returns the inline image ONLY
+        # when no `filename` is given. Passing one makes it save to disk and
+        # return just a text link ("[Screenshot](./foo.png)") with NO image
+        # content block — so a multimodal model "takes" a screenshot it can never
+        # see (regressed upstream around @playwright/mcp 0.0.77). Models reflex-
+        # ively pass a filename, so strip it: the screenshot then comes back as
+        # inline pixels (Playwright still saves a copy to its default output dir).
+        if (
+            tool_name.endswith("browser_take_screenshot")
+            and isinstance(arguments, dict)
+            and "filename" in arguments
+        ):
+            arguments = {k: v for k, v in arguments.items() if k != "filename"}
+            logger.info("[mcp] dropped 'filename' from %s so it returns inline image pixels", tool_name)
         result = await session.call_tool(tool_name, arguments)
         output_parts = []
         images = []
