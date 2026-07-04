@@ -522,6 +522,7 @@ async def _direct_fallback(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
+    disabled_tools: Optional[set] = None,
 ) -> Optional[Dict]:
     _subproc_env = {
         **os.environ,
@@ -537,6 +538,10 @@ async def _direct_fallback(
             "subproc_env": _subproc_env,
             "session_id": session_id,
             "owner": owner,
+            # The parent turn's effective disabled-tools policy, threaded through so
+            # spawn_agent can propagate it to the sub-agent (a child must not regain
+            # a tool the parent turn had disabled — see SpawnAgentTool.execute).
+            "disabled_tools": disabled_tools,
         }
 
         from src.agent_tools import TOOL_HANDLERS
@@ -951,6 +956,7 @@ async def _execute_tool_block_impl(
         res = await _direct_fallback(
             tool, content, progress_cb=progress_cb,
             session_id=session_id, owner=owner,
+            disabled_tools=disabled_tools,
         )
 
         if isinstance(res, tuple):

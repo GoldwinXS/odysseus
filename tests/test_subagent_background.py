@@ -104,17 +104,44 @@ async def test_total_cap_rejects_when_full(fake_env, monkeypatch):
     monkeypatch.setattr(agent_loop, "stream_agent_loop", hang_loop)
     try:
         started = []
+        # Spread across owners so the per-owner fairness cap doesn't trip first —
+        # this test exercises the GLOBAL _MAX_TOTAL backstop specifically.
         for i in range(subagent_runs._MAX_TOTAL):
-            r = await mit.spawn_agent("x", session_id=f"cap-{i}", owner="u")
+            r = await mit.spawn_agent("x", session_id=f"cap-{i}", owner=f"u{i}")
             started.append(r)
             assert r.get("background") is True
-        # One more must be rejected.
-        rejected = await mit.spawn_agent("x", session_id="cap-extra", owner="u")
+        # One more must be rejected (global cap), even for a brand-new owner.
+        rejected = await mit.spawn_agent("x", session_id="cap-extra", owner="u-extra")
         assert "error" in rejected
         assert rejected.get("background") is not True
     finally:
         hold.set()
         # Let the hung tasks drain so they don't leak into other tests.
+        await asyncio.sleep(0.05)
+
+
+async def test_per_owner_cap_rejects_before_global(fake_env, monkeypatch):
+    # One owner may hold at most _MAX_PER_OWNER outstanding sub-agents, even
+    # though the global cap is higher — so a busy user can't starve others.
+    hold = asyncio.Event()
+
+    async def hang_loop(*args, **kwargs):
+        await hold.wait()
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", hang_loop)
+    try:
+        for i in range(subagent_runs._MAX_PER_OWNER):
+            r = await mit.spawn_agent("x", session_id=f"owner-{i}", owner="busy")
+            assert r.get("background") is True
+        # The next one for the SAME owner is rejected on the per-owner cap...
+        rejected = await mit.spawn_agent("x", session_id="owner-x", owner="busy")
+        assert "error" in rejected and rejected.get("background") is not True
+        # ...but a DIFFERENT owner can still start (global pool not yet full).
+        other = await mit.spawn_agent("x", session_id="other-1", owner="fresh")
+        assert other.get("background") is True
+    finally:
+        hold.set()
         await asyncio.sleep(0.05)
 
 
@@ -274,6 +301,147 @@ async def test_subagent_gets_coding_tool_baseline(fake_env, monkeypatch):
         assert t in rt, f"{t} missing from sub-agent tool set: {sorted(rt)}"
     # Leaf worker: recursion/orchestration tools must never be present.
     assert "spawn_agent" not in rt and "manage_agents" not in rt
+
+
+async def test_parent_disabled_tools_inherited_by_child(fake_env, monkeypatch):
+    # A child must NOT regain a tool the parent turn had disabled: if the parent
+    # turn ran with bash disabled, the spawned sub-agent must be dispatched with
+    # bash both disabled AND stripped from its selectable tool set.
+    captured = {}
+
+    async def capture_loop(*args, **kwargs):
+        captured.update(kwargs)
+        yield _sse({"delta": "done"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", capture_loop)
+    await mit.spawn_agent(
+        "read a file and run a shell command",
+        session_id="inherit-1", owner="u",
+        parent_disabled={"bash"},
+    )
+    await _wait_done("inherit-1")
+    # bash flows into the child's disabled set...
+    assert "bash" in (captured.get("disabled_tools") or set())
+    # ...and is stripped from its selectable tools even though it's in the baseline.
+    assert "bash" not in (captured.get("relevant_tools") or set())
+    # Other baseline tools the parent did NOT disable are still available.
+    assert "read_file" in (captured.get("relevant_tools") or set())
+
+
+async def test_spawn_agent_ctx_threads_disabled_tools(fake_env, monkeypatch):
+    # The registry wrapper must forward the parent turn's disabled_tools from ctx.
+    captured = {}
+
+    async def capture_loop(*args, **kwargs):
+        captured.update(kwargs)
+        yield _sse({"delta": "done"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", capture_loop)
+    tool = mit.SpawnAgentTool()
+    await tool.execute(
+        "do a thing",
+        {"session_id": "ctx-1", "owner": "u", "disabled_tools": {"write_file"}},
+    )
+    await _wait_done("ctx-1")
+    assert "write_file" in (captured.get("disabled_tools") or set())
+    assert "write_file" not in (captured.get("relevant_tools") or set())
+
+
+async def test_ask_user_excluded_from_subagent(fake_env, monkeypatch):
+    # A background sub-agent has no interactive channel, so ask_user/update_plan
+    # must be disabled and never dispatched.
+    captured = {}
+
+    async def capture_loop(*args, **kwargs):
+        captured.update(kwargs)
+        yield _sse({"delta": "done"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", capture_loop)
+    await mit.spawn_agent(
+        "ask the user what they want and update the plan",
+        session_id="asku-1", owner="u",
+    )
+    await _wait_done("asku-1")
+    assert "ask_user" in mit._SUBAGENT_DISABLED
+    assert "update_plan" in mit._SUBAGENT_DISABLED
+    assert "ask_user" in (captured.get("disabled_tools") or set())
+    rt = captured.get("relevant_tools") or set()
+    assert "ask_user" not in rt and "update_plan" not in rt
+
+
+def test_ack_first_caller_wins():
+    # ack() transitions a finished run once: the first caller gets the id, a
+    # second call for the same id gets nothing (so a reload won't double-fire).
+    sid = "ack-unit-1"
+
+    def _rec(rid, status):
+        return {"id": rid, "status": status, "summary": "", "model": "", "owner": None,
+                "started_at": 0.0, "finished_at": 0.0, "error": None, "acked": False}
+
+    subagent_runs._UPDATES[sid] = [_rec("sub_a", "done"), _rec("sub_b", "running")]
+    try:
+        first = subagent_runs.ack(sid, ["sub_a", "sub_b"])
+        assert first == ["sub_a"]                 # only the finished one
+        second = subagent_runs.ack(sid, ["sub_a"])
+        assert second == []                        # already acked — first caller won
+        # Exposed in the poll payload.
+        upd = subagent_runs.get_updates(sid)
+        rec = next(u for u in upd["updates"] if u["id"] == "sub_a")
+        assert rec["acked"] is True
+    finally:
+        subagent_runs._UPDATES.pop(sid, None)
+
+
+def test_ack_endpoint_owner_verified_and_first_caller_wins(monkeypatch):
+    # End-to-end through the HTTP route: owner mismatch is rejected; the first
+    # ack of an id wins and already-acked ids are omitted.
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    from routes import chat_routes
+
+    # Owner-gate: allow only session "mine".
+    def _verify(request, session):
+        if session != "mine":
+            raise HTTPException(403, "forbidden")
+
+    monkeypatch.setattr(chat_routes, "_verify_session_owner", _verify)
+
+    subagent_runs._UPDATES["mine"] = [
+        {"id": "sub_1", "status": "done", "acked": False},
+    ]
+
+    # Route bodies reference their deps only at call time; the ack route uses
+    # none of them, so building the router with None deps is enough to register
+    # and exercise /api/subagent/ack in isolation.
+    router = chat_routes.setup_chat_routes(
+        session_manager=None,
+        chat_handler=None,
+        chat_processor=None,
+        memory_manager=None,
+        research_handler=None,
+        upload_handler=None,
+    )
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    try:
+        # Wrong owner → 403.
+        r = client.post("/api/subagent/ack", json={"session_id": "theirs", "run_ids": ["sub_1"]})
+        assert r.status_code == 403
+        # Right owner, first call wins.
+        r = client.post("/api/subagent/ack", json={"session_id": "mine", "run_ids": ["sub_1"]})
+        assert r.status_code == 200 and r.json() == {"acked": ["sub_1"]}
+        # Second call: already acked → omitted.
+        r = client.post("/api/subagent/ack", json={"session_id": "mine", "run_ids": ["sub_1"]})
+        assert r.status_code == 200 and r.json() == {"acked": []}
+        # Bad body → 400.
+        r = client.post("/api/subagent/ack", json={"session_id": "mine"})
+        assert r.status_code == 400
+    finally:
+        subagent_runs._UPDATES.pop("mine", None)
 
 
 async def test_no_session_runs_synchronously(monkeypatch):

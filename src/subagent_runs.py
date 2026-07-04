@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 # semaphore) so a misbehaving agent can't pile up work without limit.
 _MAX_TOTAL = 6
 
+# Per-owner fairness cap: one owner may hold at most this many outstanding
+# sub-agents at once, so a single busy user can't consume the whole global pool
+# (and the shared Semaphore(3)) and starve everyone else. The global _MAX_TOTAL
+# above is still the hard backstop on top of this.
+_MAX_PER_OWNER = 3
+
 # How long a finished record (done/error) is retained so a poller that connects
 # late — page reload mid-run, a second browser — still sees the completion once.
 # After this it is evicted to keep _UPDATES from growing without bound.
@@ -53,9 +59,26 @@ def _next_id() -> str:
     return f"sub_{_counter}"
 
 
-def can_start() -> bool:
-    """Whether another sub-agent may be started without breaching the total cap."""
-    return len(_TASKS) < _MAX_TOTAL
+def _owner_outstanding(owner: Optional[str]) -> int:
+    """How many still-running sub-agents this owner currently holds across all
+    their sessions. Counts live records (running) — the fairness cap is about
+    concurrent load, so finished/evicting records don't count."""
+    n = 0
+    for lst in _UPDATES.values():
+        for r in lst:
+            if r.get("status") == "running" and r.get("owner") == owner:
+                n += 1
+    return n
+
+
+def can_start(owner: Optional[str] = None) -> bool:
+    """Whether another sub-agent may be started without breaching the caps.
+
+    Enforces both the global runaway backstop (_MAX_TOTAL) and per-owner fairness
+    (_MAX_PER_OWNER) so one owner can't monopolise the shared pool."""
+    if len(_TASKS) >= _MAX_TOTAL:
+        return False
+    return _owner_outstanding(owner) < _MAX_PER_OWNER
 
 
 def active_count() -> int:
@@ -67,6 +90,7 @@ def start(
     summary: str,
     model: str,
     runner: Callable[[], Awaitable[Dict]],
+    owner: Optional[str] = None,
 ) -> dict:
     """Schedule a detached sub-agent.
 
@@ -81,9 +105,14 @@ def start(
         "status": "running",
         "summary": (summary or "")[:200],
         "model": model or "",
+        "owner": owner,   # for per-owner fairness accounting (never serialized)
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
+        # Whether a client has ack'd this finished run's auto-resume. First ack
+        # wins (see ack()); kept until the record is evicted so a late/second
+        # poller learns the completion was already consumed and won't double-fire.
+        "acked": False,
         "_task": None,   # asyncio.Task — internal, never serialized (see get_updates)
     }
     _UPDATES.setdefault(session_id, []).append(rec)
@@ -107,6 +136,23 @@ def stop(session_id: str, subagent_id: str) -> bool:
                 return True
             return False
     return False
+
+
+def ack(session_id: str, run_ids: List[str]) -> List[str]:
+    """Mark finished sub-agent runs as consumed (auto-resume ack'd).
+
+    First caller wins: only runs THIS call newly transitions from un-acked to
+    acked are returned, so a reload or a second device that acks the same ids
+    afterwards gets an empty list and won't re-fire the resume. Only finished
+    records can be acked (a still-running run has nothing to resume yet).
+    """
+    newly: List[str] = []
+    want = set(run_ids or [])
+    for rec in _UPDATES.get(session_id, []):
+        if rec["id"] in want and rec.get("status") != "running" and not rec.get("acked"):
+            rec["acked"] = True
+            newly.append(rec["id"])
+    return newly
 
 
 async def _run(session_id: str, rec: dict, runner: Callable[[], Awaitable[Dict]]) -> None:
@@ -223,6 +269,7 @@ def get_updates(session_id: str) -> Dict[str, Any]:
                 "error": r["error"],
                 "started_at": r["started_at"],
                 "finished_at": r["finished_at"],
+                "acked": r.get("acked", False),
             }
             for r in lst
         ],

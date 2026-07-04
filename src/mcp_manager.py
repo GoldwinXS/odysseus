@@ -448,7 +448,7 @@ class McpManager:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
 
         try:
-            result = await self._do_call(session, tool_name, arguments)
+            result = await self._do_call(session, tool_name, arguments, server_id=server_id)
         except Exception as e:
             # Auto-reconnect for builtin servers whose subprocess may have died
             if self.is_builtin(server_id):
@@ -458,7 +458,7 @@ class McpManager:
                     session = self._sessions.get(server_id)
                     if session:
                         try:
-                            result = await self._do_call(session, tool_name, arguments)
+                            result = await self._do_call(session, tool_name, arguments, server_id=server_id)
                         except Exception as e2:
                             logger.error(f"MCP tool call failed after reconnect: {qualified_name}: {e2}")
                             return {"error": str(e2), "exit_code": 1}
@@ -473,7 +473,7 @@ class McpManager:
 
         return result
 
-    async def _do_call(self, session, tool_name: str, arguments: Dict) -> Dict:
+    async def _do_call(self, session, tool_name: str, arguments: Dict, server_id: Optional[str] = None) -> Dict:
         """Execute a single MCP tool call and return result dict."""
         # Playwright MCP's browser_take_screenshot returns the inline image ONLY
         # when no `filename` is given. Passing one makes it save to disk and
@@ -482,11 +482,19 @@ class McpManager:
         # see (regressed upstream around @playwright/mcp 0.0.77). Models reflex-
         # ively pass a filename, so strip it: the screenshot then comes back as
         # inline pixels (Playwright still saves a copy to its default output dir).
+        #
+        # Scope this to OUR builtin browser only: a user-added Playwright server
+        # may legitimately expect its save-path honoured, so we must not silently
+        # swallow the filename there. When we do drop it, note it in the result
+        # text so the model isn't left thinking its path was used.
+        _stripped_filename = None
         if (
-            tool_name.endswith("browser_take_screenshot")
+            server_id == "builtin_browser"
+            and tool_name.endswith("browser_take_screenshot")
             and isinstance(arguments, dict)
             and "filename" in arguments
         ):
+            _stripped_filename = arguments.get("filename")
             arguments = {k: v for k, v in arguments.items() if k != "filename"}
             logger.info("[mcp] dropped 'filename' from %s so it returns inline image pixels", tool_name)
         result = await session.call_tool(tool_name, arguments)
@@ -505,6 +513,16 @@ class McpManager:
 
         output = "\n".join(output_parts)
         is_error = getattr(result, 'isError', False)
+
+        # Tell the model its requested save path was ignored (we dropped it above so
+        # the screenshot comes back as inline pixels), so it doesn't reference a file
+        # that was never written where it asked.
+        if _stripped_filename and not is_error:
+            note = (
+                f"[note: the requested filename '{_stripped_filename}' was ignored — the "
+                "screenshot is returned inline as image pixels instead of saved to that path]"
+            )
+            output = f"{output}\n{note}" if output else note
 
         result_dict = {
             "stdout": output if not is_error else "",

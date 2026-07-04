@@ -2852,7 +2852,10 @@ async def stream_agent_loop(
     # (_relevant_tools is not None); the full-prompt fallback already has all
     # tools. See _session_used_tools for why this is per-turn and DB-sourced.
     if not guide_only and _relevant_tools is not None:
-        _sticky = _session_used_tools(session_id) - set(disabled_tools or ())
+        # Runs a synchronous SQLAlchemy query that can pull up to 200 large
+        # meta_data blobs — off the event loop so it never stalls other users'
+        # streams (matches _resolve_model / tool-RAG offloading).
+        _sticky = (await asyncio.to_thread(_session_used_tools, session_id)) - set(disabled_tools or ())
         if _sticky - _relevant_tools:
             logger.info(f"[tool-rag] Sticky session tools re-added: {sorted(_sticky - _relevant_tools)}")
         _relevant_tools |= _sticky
@@ -3077,6 +3080,16 @@ async def stream_agent_loop(
     # using tools — i.e. it was cut off, not finished. Drives a "Continue" event
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
+
+    # Browser screenshots are attached to `messages` as OpenAI image_url parts so a
+    # vision model can actually SEE the page. Two guards: (1) only for vision models
+    # — a non-vision model 400s on image parts in the next round; (2) keep only the
+    # LATEST round's screenshots — track the appended message so the next round can
+    # drop it before appending, otherwise one image message accumulates per round
+    # for the rest of the turn and balloons the context.
+    from src.chat_helpers import model_supports_vision as _model_supports_vision
+    _vision_ok = _model_supports_vision(model, endpoint_url)
+    _last_screenshot_msg = None  # the message dict appended last round (to replace)
 
     for round_num in range(1, max_rounds + 1):
         round_response = ""
@@ -3768,14 +3781,29 @@ async def stream_agent_loop(
                 _tool_task = asyncio.create_task(_run_tool())
                 # Drain progress events as they arrive — block until the
                 # next event OR the tool finishes (sentinel = None).
-                while True:
-                    evt = await _progress_q.get()
-                    if evt is None:
-                        break
-                    yield (
-                        f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
-                    )
-                desc, result = await _tool_task
+                #
+                # If this generator is cancelled while a tool is in flight (a
+                # sub-agent stop() / the 240s timeout cancels us at one of the
+                # awaits below), the tool task would otherwise keep running
+                # detached — a runaway bash/browser the cancel was meant to
+                # stop. Cancel and await it before re-raising so nothing leaks.
+                try:
+                    while True:
+                        evt = await _progress_q.get()
+                        if evt is None:
+                            break
+                        yield (
+                            f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
+                        )
+                    desc, result = await _tool_task
+                except asyncio.CancelledError:
+                    if not _tool_task.done():
+                        _tool_task.cancel()
+                        try:
+                            await _tool_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    raise
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -4134,7 +4162,17 @@ async def stream_agent_loop(
         # `user` turn as OpenAI-style image_url content — the same multimodal
         # shape llm_core already normalizes for vision models. Capped so a
         # burst of screenshots can't blow up the context.
-        if round_screenshots:
+        # Drop the previous round's screenshot message (if any) so screenshots
+        # don't accumulate one message per round for the rest of the turn.
+        if _last_screenshot_msg is not None:
+            try:
+                messages.remove(_last_screenshot_msg)
+            except ValueError:
+                pass
+            _last_screenshot_msg = None
+        # Only feed images back to a model that can actually accept them — a
+        # non-vision model 400s on image_url parts on the next round.
+        if round_screenshots and _vision_ok:
             _shots = round_screenshots[:4]
             _img_content = [{
                 "type": "text",
@@ -4143,7 +4181,8 @@ async def stream_agent_loop(
             }]
             for _uri in _shots:
                 _img_content.append({"type": "image_url", "image_url": {"url": _uri}})
-            messages.append({"role": "user", "content": _img_content})
+            _last_screenshot_msg = {"role": "user", "content": _img_content}
+            messages.append(_last_screenshot_msg)
 
         # Emit agent_step event
         yield (

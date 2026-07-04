@@ -1510,6 +1510,29 @@ def setup_chat_routes(
         return {"stopped": subagent_runs.stop(session, id)}
 
     # ------------------------------------------------------------------ #
+    # POST /api/subagent/ack — mark finished sub-agent runs as consumed so an
+    # auto-resume fires exactly once. Body JSON: {"session_id": str,
+    # "run_ids": [str]}. First caller wins: returns {"acked": [ids THIS call
+    # newly transitioned to acked]} — a reload / second device that acks the same
+    # ids afterwards gets [] and won't double-fire the resume.
+    # ------------------------------------------------------------------ #
+    @router.post("/api/subagent/ack")
+    async def subagent_ack(request: Request) -> Dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+        session_id = (body or {}).get("session_id")
+        run_ids = (body or {}).get("run_ids")
+        if not isinstance(session_id, str) or not session_id:
+            raise HTTPException(400, "session_id is required")
+        if not isinstance(run_ids, list) or not all(isinstance(r, str) for r in run_ids):
+            raise HTTPException(400, "run_ids must be a list of strings")
+        _verify_session_owner(request, session_id)
+        from src import subagent_runs
+        return {"acked": subagent_runs.ack(session_id, run_ids)}
+
+    # ------------------------------------------------------------------ #
     # POST /api/inject_context
     # ------------------------------------------------------------------ #
     @router.post("/api/inject_context/{session_id}")

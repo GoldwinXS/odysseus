@@ -129,10 +129,13 @@ _SUBAGENT_MAX_TOKENS = 12000                  # per-round output cap. The loop d
                                               # mid-word; sized to cover the char cap
                                               # above (~2.5 dense chars/token).
 # Tools a sub-agent may NOT use: anything that would spawn/orchestrate more
-# agents (recursion) or reach into other chats.
+# agents (recursion) or reach into other chats. ask_user/update_plan are also
+# barred: a background sub-agent has no interactive channel, so a run that ends
+# by asking the user a question just dead-ends with a question nobody can answer.
 _SUBAGENT_DISABLED = frozenset({
     "spawn_agent", "manage_agents", "create_session", "send_to_session",
     "list_sessions", "manage_session", "pipeline", "chat_with_model", "ask_teacher",
+    "ask_user", "update_plan",
 })
 # Tools EVERY sub-agent must reliably have, regardless of how its task is worded.
 # A sub-agent's tools are otherwise picked by RAG from the task text alone (it has
@@ -164,7 +167,12 @@ _SUBAGENT_SYSTEM_PROMPT = (
 )
 
 
-async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
+async def spawn_agent(
+    content: str,
+    session_id: Optional[str] = None,
+    owner: Optional[str] = None,
+    parent_disabled: Optional[set] = None,
+) -> Dict:
     """Spawn a sub-agent that runs a full tool-using agent loop on a task IN THE
     BACKGROUND and reports its result back into this chat when it finishes.
 
@@ -257,6 +265,13 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     # its task wording didn't lexically retrieve them (the root cause of sub-
     # agents reporting themselves "blocked — no filesystem tools"). RAG still runs
     # on the task on top of the baseline, so task-specific tools are added too.
+    # Effective disabled set = the leaf-worker baseline PLUS whatever the PARENT
+    # turn had disabled. A child must never regain a capability the parent turn
+    # withheld: the route computes disabled_tools per turn (global setting, chat-
+    # mode escalation dropping bash/python/read_file/write_file, compare mode,
+    # code-execution-off) and spawn_agent is ALWAYS_AVAILABLE, so without this a
+    # parent with bash disabled could spawn a child WITH bash. (#security)
+    _disabled = set(_SUBAGENT_DISABLED) | set(parent_disabled or ())
     _sub_tools = set(ALWAYS_AVAILABLE) | set(_SUBAGENT_TOOL_BASELINE)
     try:
         _tool_idx = get_tool_index()
@@ -266,7 +281,23 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
             )
     except Exception as _tsel_err:
         logger.debug("sub-agent tool pre-selection fell back to baseline: %s", _tsel_err)
-    _sub_tools -= set(_SUBAGENT_DISABLED)
+    _sub_tools -= _disabled
+
+    # Clamp the per-round output cap to what the model can actually accept. A model
+    # with a small context window (e.g. 8K) 400s every round on an unclamped 12K
+    # output request. Only clamp when the window is PROVEN (endpoint-reported /
+    # known table) — an unknown fallback isn't evidence the model is small, so we
+    # keep the generous default. Reserve headroom for the prompt/history.
+    _max_tokens = _SUBAGENT_MAX_TOKENS
+    try:
+        from src.model_context import get_context_length_known
+        _ctx_len, _ctx_known = await asyncio.to_thread(get_context_length_known, _url, _model)
+        if _ctx_known and _ctx_len:
+            # Never ask for more output than ~half the window (leaving room for the
+            # task + tool results), and never exceed the window itself.
+            _max_tokens = min(_max_tokens, max(1024, _ctx_len // 2))
+    except Exception as _clamp_err:
+        logger.debug("sub-agent max_tokens clamp fell back to default: %s", _clamp_err)
 
     def _deliver(error: Optional[str], partial: str) -> None:
         """Post the sub-agent's outcome as an assistant message into the parent
@@ -313,12 +344,14 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                 headers=_headers,
                 owner=_owner,
                 session_id=None,                        # ephemeral — not persisted
-                disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
+                disabled_tools=set(_disabled),           # leaf worker: no recursion, plus
+                                                         # the parent turn's disabled policy
                 relevant_tools=set(_sub_tools),          # coding baseline force-included
                 workspace=_workspace,                    # inherit parent's project folder
                 max_rounds=_SUBAGENT_MAX_ROUNDS,
-                max_tokens=_SUBAGENT_MAX_TOKENS,         # the default 4096 truncated
-                                                         # long final summaries mid-word
+                max_tokens=_max_tokens,                  # the default 4096 truncated long
+                                                         # final summaries mid-word; clamped
+                                                         # above to the model's real ceiling
                 fallbacks=_fallbacks,
             ):
                 # Capture a real upstream failure (e.g. 429 rate-limit / spend cap)
@@ -406,14 +439,17 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     # Background mode: register a detached run and return immediately so the main
     # turn is not blocked. The result is delivered into this session on completion.
     from src import subagent_runs
-    if not subagent_runs.can_start():
+    if not subagent_runs.can_start(_owner):
         return {
             "error": (
-                f"Too many sub-agents already running (limit {subagent_runs._MAX_TOTAL}). "
+                f"Too many sub-agents already running (per-owner limit "
+                f"{subagent_runs._MAX_PER_OWNER}, global {subagent_runs._MAX_TOTAL}). "
                 "Wait for one to finish before spawning another."
             )
         }
-    rec = subagent_runs.start(_parent_session, _summary, _model, lambda: _run_subagent(deliver=True))
+    rec = subagent_runs.start(
+        _parent_session, _summary, _model, lambda: _run_subagent(deliver=True), owner=_owner
+    )
     return {
         "result": (
             f"Sub-agent dispatched (id={rec['id']}, model={_model}) and now running in the "
@@ -585,7 +621,10 @@ class ListModelsTool:
 
 class SpawnAgentTool:
     async def execute(self, content: str, ctx: dict) -> Dict:
-        return await spawn_agent(content, ctx.get("session_id"), owner=ctx.get("owner"))
+        return await spawn_agent(
+            content, ctx.get("session_id"), owner=ctx.get("owner"),
+            parent_disabled=ctx.get("disabled_tools"),
+        )
 
 
 class ManageAgentsTool:
