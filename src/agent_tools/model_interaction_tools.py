@@ -210,6 +210,16 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     _parent_session = session_id
     _summary = _task.splitlines()[0][:120] if _task else ""
 
+    # Give the sub-agent the SAME fallback chain the main chat uses, so a
+    # rate-limited / spend-capped primary (e.g. Gemini 429 "exceeded monthly
+    # spending cap") falls back to another model instead of failing with an
+    # empty result. Best-effort — an empty chain just means no fallback.
+    try:
+        from src.endpoint_resolver import resolve_chat_fallback_candidates
+        _fallbacks = await asyncio.to_thread(resolve_chat_fallback_candidates, _owner)
+    except Exception:
+        _fallbacks = []
+
     def _deliver(error: Optional[str], partial: str) -> None:
         """Post the sub-agent's outcome as an assistant message into the parent
         session. Persists immediately (add_message -> _persist_message commits),
@@ -243,7 +253,7 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         ``deliver`` is set (background mode) the result is also posted into the
         parent session; otherwise it is only returned (synchronous fallback)."""
         collected: list = []
-        stats = {"tools": 0, "hit_cap": False}
+        stats = {"tools": 0, "hit_cap": False, "error": None}
 
         async def _drain():
             async for chunk in stream_agent_loop(
@@ -257,7 +267,19 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                 session_id=None,                        # ephemeral — not persisted
                 disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
                 max_rounds=_SUBAGENT_MAX_ROUNDS,
+                fallbacks=_fallbacks,
             ):
+                # Capture a real upstream failure (e.g. 429 rate-limit / spend cap)
+                # so we can report WHY instead of the generic "empty response".
+                if chunk.startswith("event: error"):
+                    for _line in chunk.split("\n"):
+                        if _line.startswith("data: "):
+                            try:
+                                _ed = json.loads(_line[6:])
+                                stats["error"] = str(_ed.get("text") or _ed.get("error") or "upstream error")[:400]
+                            except Exception:
+                                stats["error"] = "upstream error"
+                    continue
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     try:
                         d = json.loads(chunk[6:])
@@ -289,12 +311,18 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
             error = f"Sub-agent failed: {e}"
 
         result = "".join(collected).strip()
+        # The loop's generic empty-response placeholder is not a real answer — drop
+        # it so the real reason (captured below) surfaces instead.
+        if result == "The model returned an empty response. Please try again or switch to a different model.":
+            result = ""
         if len(result) > 8000:
             result = result[:8000] + "\n... (truncated)"
         # Informative fallback when the model wrote no final answer — otherwise the
         # user just sees "(no text output)" with no idea why (the #1 bizarre case).
         if not result and not error:
-            if stats["hit_cap"]:
+            if stats["error"]:
+                error = f"the sub-agent's model failed — {stats['error']}"
+            elif stats["hit_cap"]:
                 result = (
                     f"(The sub-agent ran {stats['tools']} tool call(s) but hit its "
                     f"{_SUBAGENT_MAX_ROUNDS}-round limit before writing a summary. "
