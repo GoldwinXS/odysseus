@@ -2565,9 +2565,12 @@ function _startSubagentPolling() {
         selectSession(sid);
         var _arTries = 0;
         var _tryAutoResume = function() {
-          if (currentSessionId !== sid) return;
+          if (currentSessionId !== sid) return;   // user navigated away — abandon
+          // Pass the sub-agent's session id so auto-resume refuses to fire into a
+          // different / pending chat (guards against the "turn moved to a new qwen
+          // chat" bug).
           if (window.chatModule && window.chatModule.autoResumeAfterSubagent &&
-              window.chatModule.autoResumeAfterSubagent()) return;   // fired
+              window.chatModule.autoResumeAfterSubagent(sid)) return;   // fired
           if (++_arTries < 8) setTimeout(_tryAutoResume, 1000);
         };
         setTimeout(_tryAutoResume, 900);

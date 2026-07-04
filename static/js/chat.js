@@ -435,12 +435,21 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   // with the user bubble hidden. Guarded so it never clobbers a draft or interrupts
   // an in-flight turn; the prompt discourages re-spawning (loop guard).
   const SUBAGENT_RESUME_PROMPT = 'The background sub-agent you dispatched has finished — its result is in the message directly above. Review it, incorporate the findings, and continue: give me the outcome or the next step. Do not dispatch another sub-agent unless it is genuinely necessary.';
-  export function autoResumeAfterSubagent() {
+  // `expectedSessionId` MUST be the session the sub-agent belonged to. Auto-resume
+  // only fires when the app is showing EXACTLY that session with no pending "new
+  // chat" — otherwise the normal send path would materialize a fresh default-model
+  // chat (e.g. qwen) or land the turn in the wrong conversation.
+  export function autoResumeAfterSubagent(expectedSessionId) {
     try {
-      if (isStreaming || _sendInFlight) return false;   // a turn is already running
+      if (isStreaming || _sendInFlight) return false;       // a turn is already running
+      // A pending "New Chat" would be materialized (wrong session + default model).
+      if (sessionModule.hasPendingChat && sessionModule.hasPendingChat()) return false;
+      const cur = sessionModule.getCurrentSessionId();
+      if (!cur) return false;                                // no real session in view
+      if (expectedSessionId && cur !== expectedSessionId) return false;  // user navigated away
       const input = uiModule.el('message');
-      if (input && input.value.trim()) return false;    // don't overwrite the user's draft
-      _hideUserBubble = true;                            // hide the auto-continue user bubble
+      if (input && input.value.trim()) return false;         // don't overwrite the user's draft
+      _hideUserBubble = true;                                 // hide the auto-continue user bubble
       return _setComposerAndSend(SUBAGENT_RESUME_PROMPT);
     } catch (_) { return false; }
   }
