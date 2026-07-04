@@ -165,6 +165,24 @@ async def test_empty_result_delivers_informative_fallback(fake_env, monkeypatch)
     assert "round" in content and "tool call" in content  # names tools + round limit
 
 
+async def test_upstream_error_surfaced_not_empty(fake_env, monkeypatch):
+    # A 429 / spend-cap failure must be reported as the REAL reason, not the
+    # generic "empty response" placeholder the loop emits after an error.
+    async def err_loop(*args, **kwargs):
+        yield "event: error\ndata: " + json.dumps({"status": 429, "text": "Google rate-limited the request (429)."}) + "\n\n"
+        yield _sse({"delta": "The model returned an empty response. Please try again or switch to a different model."})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", err_loop)
+    await mit.spawn_agent("do a thing", session_id="err-1", owner="u")
+    upd = await _wait_done("err-1")
+    assert upd["updates"][0]["status"] == "error"
+    content = fake_env.messages[0].content.lower()
+    assert "rate-limited" in content or "429" in content
+    assert "empty response" not in content
+    assert "failed" in content
+
+
 async def test_updates_payload_has_server_now(fake_env, monkeypatch):
     upd = subagent_runs.get_updates("whatever")
     assert isinstance(upd.get("now"), float)
