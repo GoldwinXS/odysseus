@@ -86,8 +86,13 @@ _BUILTIN_NPX_SERVERS = {
         # the "chrome" channel and hunts for a system Google Chrome install,
         # failing with "can't find Chrome at ...\\chrome.exe" on machines where
         # Chrome isn't where Playwright expects.
+        # --image-responses allow: return screenshots as inline image content
+        # (base64), not just a saved-file link. Without it browser_take_screenshot
+        # writes a .playwright-mcp\page-*.png and returns only text, so a
+        # multimodal model never receives the pixels — it "takes" a screenshot
+        # it can't see. mcp_manager forwards this image content to the model.
         "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision",
-                 "--browser", "chromium"],
+                 "--browser", "chromium", "--image-responses", "allow"],
     }
 }
 
