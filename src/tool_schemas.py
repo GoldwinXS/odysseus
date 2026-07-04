@@ -1421,6 +1421,13 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         _sa_model = (args.get("model") or "").strip()
         _sa_task = args.get("task", "")
         content = (f"model: {_sa_model}\n{_sa_task}") if _sa_model else _sa_task
+    elif tool_type == "manage_agents":
+        # The handler's matcher reads the raw content string ("" / "list" /
+        # "stop <id>"). The schema carries it as {"action": ...}; without this
+        # the generic json.dumps fallback would hand the handler '{"action":
+        # "stop sub_3"}', whose startswith("stop") fails and silently lists
+        # instead of cancelling.
+        content = args.get("action", "")
     elif tool_type == "create_session":
         content = args.get("name", "Untitled") + "\n" + args.get("model", "")
     elif tool_type == "list_sessions":

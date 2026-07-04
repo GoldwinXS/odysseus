@@ -81,12 +81,22 @@ def _strip_executed_fence(m) -> str:
 def _scan_json_objects(text: str):
     """Yield (obj_str, start, end) for each top-level balanced {...} run,
     ignoring braces inside JSON strings. Cheap single pass; used to find an
-    OpenAI-style function call a model emitted as plain content."""
+    OpenAI-style function call a model emitted as plain content.
+
+    String tracking only runs *inside* braces (depth > 0): a stray unpaired
+    quote in preceding prose must not flip us into "in string" and swallow the
+    opening `{` of a real call that follows."""
     depth = 0
     start = None
     in_str = False
     esc = False
     for i, ch in enumerate(text):
+        if depth == 0:
+            # Outside any object: only a `{` matters; quotes in prose are noise.
+            if ch == "{":
+                start = i
+                depth = 1
+            continue
         if in_str:
             if esc:
                 esc = False
@@ -98,20 +108,31 @@ def _scan_json_objects(text: str):
         if ch == '"':
             in_str = True
         elif ch == "{":
-            if depth == 0:
-                start = i
             depth += 1
         elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start is not None:
-                    yield text[start:i + 1], start, i + 1
-                    start = None
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield text[start:i + 1], start, i + 1
+                start = None
 
 
-def _find_bare_function_call(text: str):
-    """Detect an OpenAI-style function call emitted as plain message content
-    and convert it to a ToolBlock. Returns (block, start, end) or None.
+_FENCE_SPAN_RE = re.compile(r"```[\s\S]*?```")
+
+
+def _fenced_spans(text: str):
+    """Return [(start, end), ...] byte spans of ```...``` fenced regions, so a
+    bare-JSON scan can skip anything a model wrote inside an illustrative code
+    fence. Non-greedy, so consecutive fences don't merge into one span."""
+    return [(m.start(), m.end()) for m in _FENCE_SPAN_RE.finditer(text)]
+
+
+def _in_any_span(pos: int, spans) -> bool:
+    return any(s <= pos < e for s, e in spans)
+
+
+def _find_bare_function_calls(text: str, skip_fenced: bool = False):
+    """Detect OpenAI-style function calls emitted as plain message content and
+    convert them to ToolBlocks. Returns a list of (block, start, end) in order.
 
     Ollama's /v1 OpenAI-compat layer returns some models' tool calls
     (qwen2.5-coder is the common one) in `message.content` as a raw JSON
@@ -124,9 +145,22 @@ def _find_bare_function_call(text: str):
     `{"function": {...}}` / `{"type": "function", "function": {...}}`
     envelopes. Requiring the args key keeps arbitrary JSON answers that
     merely contain a "name" field from being executed as tools.
+
+    All matches convert (a model may emit two consecutive calls); each is
+    dispatched sequentially like the other multi-call patterns.
+
+    `skip_fenced`: when True (native-schema models), a JSON object sitting
+    *inside* a ```...``` fence is an illustrative example, not a call — the
+    module's skip_fenced contract already suppresses fenced tool calls, and
+    executing (and stripping) an illustrative ```json {"name": ...} fence
+    would violate it and mutilate the display.
     """
     from src.tool_schemas import function_call_to_tool_block  # lazy: avoid circular import
+    spans = _fenced_spans(text) if skip_fenced else None
+    out = []
     for obj_str, start, end in _scan_json_objects(text):
+        if spans is not None and _in_any_span(start, spans):
+            continue
         if '"name"' not in obj_str:
             continue
         try:
@@ -148,8 +182,8 @@ def _find_bare_function_call(text: str):
             args = "{}"
         block = function_call_to_tool_block(name, args)
         if block:
-            return block, start, end
-    return None
+            out.append((block, start, end))
+    return out
 
 # Pattern 2: [TOOL_CALL] ... [/TOOL_CALL] blocks (some models use this format)
 # Matches: {tool => "shell", args => {--command "ls -la"}} etc.
@@ -1228,13 +1262,15 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
         if m:
             blocks.append(ToolBlock("ui_control", f"open_panel {m.group(1).lower()}"))
 
-    # Pattern 8: OpenAI-style function call emitted as plain content JSON
-    # (Ollama /v1 didn't route it to the structured tool_calls field). Never
-    # an illustrative example, so matched regardless of skip_fenced.
+    # Pattern 8: OpenAI-style function call(s) emitted as plain content JSON
+    # (Ollama /v1 didn't route it to the structured tool_calls field). A raw
+    # {"name": ...} object in prose is a real call, but the same shape inside a
+    # ```json fence is an illustrative example under skip_fenced — honor the
+    # module's skip_fenced contract and ignore fenced spans there. All matches
+    # dispatch (a model may emit two consecutive calls).
     if not blocks:
-        fc = _find_bare_function_call(text)
-        if fc:
-            blocks.append(fc[0])
+        for fc, _s, _e in _find_bare_function_calls(text, skip_fenced=skip_fenced):
+            blocks.append(fc)
 
     return blocks
 
@@ -1276,12 +1312,36 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     cleaned = _PLAIN_UI_OPEN_PANEL_RE.sub("", cleaned)
     # Strip bare <invoke> blocks not wrapped in <tool_call>
     cleaned = _strip_bare_invoke_markup(cleaned)
-    # Remove an OpenAI-style function-call JSON emitted as content (Pattern 8)
-    # so the raw {"name": ...} blob doesn't render next to the tool chip. Uses
-    # the same detector as parse_tool_blocks, so strip and parse stay in
-    # lockstep (a call that executes is always removed from display).
-    fc = _find_bare_function_call(cleaned)
-    if fc:
-        cleaned = cleaned[:fc[1]] + cleaned[fc[2]:]
+    # Remove OpenAI-style function-call JSON emitted as content (Pattern 8) so
+    # the raw {"name": ...} blob doesn't render next to the tool chip. Must stay
+    # in lockstep with parse_tool_blocks, which only reaches Pattern 8 when NO
+    # earlier pattern produced a block (`if not blocks`): otherwise a fence like
+    # ```bash\nls\n``` executes as bash and a trailing bare JSON that never
+    # dispatched would be wrongly deleted from display. So only strip when
+    # parse dispatched nothing from Patterns 1-7, and honor skip_fenced (a JSON
+    # object inside a fence is illustrative, not a call). Strip all dispatched
+    # spans back-to-front to keep earlier offsets valid. The gate reads the
+    # ORIGINAL text (not `cleaned`, whose earlier-pattern markup was already
+    # removed above — that would always look like a lone bare call).
+    if not _parse_blocks_before_pattern8(text, skip_fenced):
+        for _fc, start, end in reversed(_find_bare_function_calls(cleaned, skip_fenced=skip_fenced)):
+            cleaned = cleaned[:start] + cleaned[end:]
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
+
+
+def _parse_blocks_before_pattern8(text: str, skip_fenced: bool) -> bool:
+    """True when parse_tool_blocks would dispatch a block from Patterns 1-7 for
+    `text` — i.e. it never reaches Pattern 8. Used by strip_tool_blocks so bare
+    function-call JSON is only removed when parse actually executed it.
+
+    Pattern 8 runs only when Patterns 1-7 yielded nothing (`if not blocks`); in
+    that case parse's full result is exactly the Pattern-8 blocks. If an earlier
+    pattern fired, Pattern 8 is skipped, so any bare-JSON call still present is
+    display text and must survive. Compare against Pattern 8's own blocks so an
+    incidental equal *count* of unrelated blocks can't fool the guard."""
+    all_blocks = parse_tool_blocks(text, skip_fenced=skip_fenced)
+    if not all_blocks:
+        return False
+    p8_blocks = [fc for fc, _s, _e in _find_bare_function_calls(text, skip_fenced=skip_fenced)]
+    return all_blocks != p8_blocks

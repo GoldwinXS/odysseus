@@ -161,6 +161,16 @@ def test_python3_fence_is_left_intact_in_display():
     assert strip_tool_blocks(text) == text
 
 
+def test_illustrative_json_fence_inert_under_skip_fenced():
+    # Native-schema models (skip_fenced=True) commonly paste an EXAMPLE OpenAI
+    # function-call object inside a ```json fence. The bare-JSON Pattern-8 scan
+    # must respect the skip_fenced contract and not reach inside the fence to
+    # execute it, and strip must leave the fence untouched.
+    text = 'Here is the shape:\n```json\n{"name": "read_file", "arguments": {"path": "README.md"}}\n```'
+    assert parse_tool_blocks(text, skip_fenced=True) == []
+    assert strip_tool_blocks(text, skip_fenced=True) == text
+
+
 def test_markdown_info_string_fence_is_left_intact_in_display():
     # strip must mirror parse for info-string fences too: not executed,
     # so not stripped from the displayed text.
