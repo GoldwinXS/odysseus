@@ -1137,6 +1137,26 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             # Convert multimodal content (image_url → image) for Anthropic
             content = _convert_openai_content_to_anthropic(m["content"])
             chat_messages.append({"role": m["role"], "content": content})
+    # Prompt-cache the conversation history too (third breakpoint alongside
+    # system + tools; Anthropic allows 4). Caching is a prefix match, so marking
+    # the last content block of the last message lets each agent round re-read
+    # the ENTIRE prior conversation — including bulky tool results, which
+    # dominate agent-loop input — at ~0.1x price instead of re-billing it.
+    # Earlier breakpoints stay valid read points, so hits accrue every round.
+    # Only for agentic calls (tools present): one-off chats rarely resend the
+    # same history, and the cache-write premium wouldn't pay back.
+    if tools and chat_messages:
+        last_content = chat_messages[-1].get("content")
+        if isinstance(last_content, str):
+            # Normalize so the breakpoint has a block to attach to.
+            chat_messages[-1]["content"] = [{"type": "text", "text": last_content}]
+            last_content = chat_messages[-1]["content"]
+        if isinstance(last_content, list) and last_content:
+            last_block = last_content[-1]
+            if isinstance(last_block, dict) and last_block.get("type") in (
+                "text", "image", "tool_use", "tool_result", "document",
+            ):
+                last_block["cache_control"] = {"type": "ephemeral"}
     # Anthropic only accepts temperature in [0.0, 1.0] and 400s on anything above
     # 1.0. Clamp here (in the Anthropic builder only) so presets/sliders that use
     # the wider OpenAI 0.0-2.0 range — e.g. the shipped "Nietzsche" preset at 1.2
@@ -1178,6 +1198,10 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
                     "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
                 })
         if anthropic_tools:
+            # Deterministic order: tools render at position 0 of the prompt, so a
+            # mere reorder (RAG selection returns sets in varying order) would
+            # invalidate the entire cache even when the SET is unchanged.
+            anthropic_tools.sort(key=lambda t: t["name"])
             # Cache the tool schemas too — they're stable for the whole agent run.
             # The breakpoint caches all tool defs preceding it in the request.
             anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
