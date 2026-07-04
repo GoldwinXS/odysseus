@@ -77,6 +77,80 @@ def _strip_executed_fence(m) -> str:
     """re.sub callback: remove only fences that parse as tool calls."""
     return "" if _fenced_tool_call(m) is not None else m.group(0)
 
+
+def _scan_json_objects(text: str):
+    """Yield (obj_str, start, end) for each top-level balanced {...} run,
+    ignoring braces inside JSON strings. Cheap single pass; used to find an
+    OpenAI-style function call a model emitted as plain content."""
+    depth = 0
+    start = None
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    yield text[start:i + 1], start, i + 1
+                    start = None
+
+
+def _find_bare_function_call(text: str):
+    """Detect an OpenAI-style function call emitted as plain message content
+    and convert it to a ToolBlock. Returns (block, start, end) or None.
+
+    Ollama's /v1 OpenAI-compat layer returns some models' tool calls
+    (qwen2.5-coder is the common one) in `message.content` as a raw JSON
+    object — `{"name": "get_workspace", "arguments": {}}` — instead of the
+    structured `tool_calls` field. The agent loop then sees no native call
+    and no fenced block and drops the turn, so the model looks like it
+    "can't use tools" and refuses. Recognize the shape when `name` is a
+    known tool (validated by function_call_to_tool_block) and an
+    arguments/parameters container is present. Also unwraps the
+    `{"function": {...}}` / `{"type": "function", "function": {...}}`
+    envelopes. Requiring the args key keeps arbitrary JSON answers that
+    merely contain a "name" field from being executed as tools.
+    """
+    from src.tool_schemas import function_call_to_tool_block  # lazy: avoid circular import
+    for obj_str, start, end in _scan_json_objects(text):
+        if '"name"' not in obj_str:
+            continue
+        try:
+            data = json.loads(obj_str)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        fn = data.get("function") if isinstance(data.get("function"), dict) else data
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if "arguments" not in fn and "parameters" not in fn:
+            continue
+        args = fn.get("arguments", fn.get("parameters"))
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        elif not isinstance(args, str):
+            args = "{}"
+        block = function_call_to_tool_block(name, args)
+        if block:
+            return block, start, end
+    return None
+
 # Pattern 2: [TOOL_CALL] ... [/TOOL_CALL] blocks (some models use this format)
 # Matches: {tool => "shell", args => {--command "ls -la"}} etc.
 _TOOL_CALL_RE = re.compile(
@@ -1154,6 +1228,14 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
         if m:
             blocks.append(ToolBlock("ui_control", f"open_panel {m.group(1).lower()}"))
 
+    # Pattern 8: OpenAI-style function call emitted as plain content JSON
+    # (Ollama /v1 didn't route it to the structured tool_calls field). Never
+    # an illustrative example, so matched regardless of skip_fenced.
+    if not blocks:
+        fc = _find_bare_function_call(text)
+        if fc:
+            blocks.append(fc[0])
+
     return blocks
 
 
@@ -1194,5 +1276,12 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     cleaned = _PLAIN_UI_OPEN_PANEL_RE.sub("", cleaned)
     # Strip bare <invoke> blocks not wrapped in <tool_call>
     cleaned = _strip_bare_invoke_markup(cleaned)
+    # Remove an OpenAI-style function-call JSON emitted as content (Pattern 8)
+    # so the raw {"name": ...} blob doesn't render next to the tool chip. Uses
+    # the same detector as parse_tool_blocks, so strip and parse stay in
+    # lockstep (a call that executes is always removed from display).
+    fc = _find_bare_function_call(cleaned)
+    if fc:
+        cleaned = cleaned[:fc[1]] + cleaned[fc[2]:]
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
