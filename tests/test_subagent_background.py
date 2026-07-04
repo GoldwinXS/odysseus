@@ -212,6 +212,46 @@ async def test_manage_agents_list_and_stop(fake_env, monkeypatch):
         await asyncio.sleep(0.05)
 
 
+async def test_context_note_none_when_no_subagents(fake_env, monkeypatch):
+    # Ordinary turns (no sub-agents ever dispatched) get no injected note.
+    assert subagent_runs.context_note("pristine-session") is None
+
+
+async def test_context_note_gives_ground_truth_and_survives_denial(fake_env, monkeypatch):
+    # A still-running sub-agent must produce a note that (a) asserts one WAS
+    # dispatched, (b) names the running id + task, and (c) points at the
+    # manage_agents tool — this is what stops the model denying it dispatched.
+    hold = asyncio.Event()
+
+    async def hang_loop(*a, **k):
+        yield _sse({"delta": "working"})
+        await hold.wait()
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", hang_loop)
+    try:
+        ret = await mit.spawn_agent(
+            "analyze js/main.js for tech debt", session_id="note-1", owner="u"
+        )
+        sub_id = ret["subagent_id"]
+        await asyncio.sleep(0.05)
+        note = subagent_runs.context_note("note-1")
+        assert note is not None
+        assert sub_id in note and "RUNNING" in note
+        assert "js/main.js" in note
+        assert "manage_agents" in note
+        assert "never dispatched" in note.lower() or "do not claim" in note.lower()
+    finally:
+        hold.set()
+        await asyncio.sleep(0.05)
+
+    # After it finishes, the note flips to reporting it as delivered — not running.
+    await _wait_done("note-1")
+    done_note = subagent_runs.context_note("note-1")
+    assert done_note is not None and "RUNNING" not in done_note
+    assert "delivered into this chat" in done_note
+
+
 async def test_no_session_runs_synchronously(monkeypatch):
     async def fake_loop(*args, **kwargs):
         yield _sse({"delta": "inline"})

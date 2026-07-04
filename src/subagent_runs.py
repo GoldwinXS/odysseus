@@ -147,6 +147,65 @@ def _schedule_evict(session_id: str, rec: dict) -> None:
     _evict_tasks[rec["id"]] = t
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+def context_note(session_id: str) -> Optional[str]:
+    """Ground-truth status block about this session's background sub-agents, for
+    injection into the model's context each turn.
+
+    Without this, a model asked "is the agent still running?" or "did you dispatch
+    one?" has no runtime state to consult and has been observed *denying it ever
+    dispatched a sub-agent* (hallucinating) instead of calling ``manage_agents``.
+    This note gives it the facts up front. Returns ``None`` when there is nothing
+    to report (so no note is injected on ordinary turns).
+    """
+    lst = _UPDATES.get(session_id, [])
+    if not lst:
+        return None
+    now = time.time()
+    running, finished = [], []
+    for r in lst:
+        if r["status"] == "running":
+            running.append(
+                f'  - {r["id"]} — RUNNING for {_fmt_elapsed(now - r["started_at"])}'
+                f' — model {r["model"] or "inherited"} — task: "{r["summary"]}"'
+            )
+        else:
+            done = _fmt_elapsed(now - r["finished_at"]) if r.get("finished_at") else "just now"
+            if r["status"] == "error":
+                finished.append(
+                    f'  - {r["id"]} — FAILED ({done} ago): {r.get("error") or "unknown error"}'
+                    f' — a failure notice was delivered into this chat as a separate message'
+                )
+            else:
+                finished.append(
+                    f'  - {r["id"]} — DONE ({done} ago) — its result was delivered into this'
+                    f' chat as a separate message'
+                )
+    lines = [
+        "[Background sub-agents — runtime ground truth, trust this over your own memory]",
+        "You have dispatched background sub-agent(s) in THIS chat. Do NOT claim you never"
+        " dispatched one. To re-check status or cancel one, call the `manage_agents` tool"
+        " (content: `list`, or `stop <id>`).",
+    ]
+    if running:
+        lines.append("Still running:")
+        lines.extend(running)
+    if finished:
+        lines.append("Finished:")
+        lines.extend(finished)
+    return "\n".join(lines)
+
+
 def get_updates(session_id: str) -> Dict[str, Any]:
     """Poll payload for a session: how many sub-agents are still running, and the
     (running + recently-finished) records the client can render / de-dupe on."""

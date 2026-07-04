@@ -2911,6 +2911,30 @@ async def stream_agent_loop(
             messages[0]["content"] = GUIDE_ONLY_DIRECTIVE + "\n\n" + (messages[0].get("content") or "")
         else:
             messages.insert(0, {"role": "system", "content": GUIDE_ONLY_DIRECTIVE})
+    # Give the model ground truth about its own background sub-agents. Without
+    # this, a follow-up like "is the agent still running?" / "did you dispatch
+    # one?" has no runtime state to consult and the model has been observed
+    # DENYING it ever dispatched a sub-agent (hallucinating) instead of calling
+    # manage_agents. Inserted as a system note right before the last user
+    # message so it sits adjacent to the question and survives history trimming
+    # better than the top-of-context prompt. Only present when there is
+    # something to report (running or recently-finished).
+    if session_id:
+        try:
+            from src import subagent_runs as _sar
+            _sa_note = _sar.context_note(session_id)
+            if _sa_note:
+                _luidx = 0
+                for _i in range(len(messages) - 1, -1, -1):
+                    if messages[_i].get("role") == "user":
+                        _luidx = _i
+                        break
+                # role="user" (not "system"): mid-array system messages are
+                # rejected by Anthropic and churn local-backend KV caches — the
+                # same reason _datetime_message is a user-role note (user_time.py).
+                messages.insert(_luidx, {"role": "user", "content": _sa_note})
+        except Exception as _sa_err:
+            logger.debug("subagent context note skipped: %s", _sa_err)
     prep_timings["prompt_build"] = time.time() - _t2
 
     _t3 = time.time()
