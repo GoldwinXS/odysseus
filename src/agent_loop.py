@@ -3041,6 +3041,12 @@ async def stream_agent_loop(
     _doc_last_len = 0      # last content length sent
     _doc_stream_create_completed = False
     _ody_doc_tool_completed = False
+    # Set when spawn_agent dispatches a sub-agent to the BACKGROUND. The work is
+    # now detached and reports back on its own, so we end the turn and hand
+    # control back to the user instead of letting the model keep looping/tool-
+    # calling (some models — e.g. Gemini — otherwise spawn and then keep working
+    # for the full round cap, so the user never gets their turn back).
+    _spawned_background = False
 
     # Set when the loop runs out of rounds while the agent was still actively
     # using tools — i.e. it was cut off, not finished. Drives a "Continue" event
@@ -4022,6 +4028,8 @@ async def stream_agent_loop(
             tool_events.append(tool_event)
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True
+            if block.tool_type == "spawn_agent" and result.get("background"):
+                _spawned_background = True
 
             formatted = format_tool_result(desc, result)
             tool_results.append(formatted)
@@ -4048,6 +4056,17 @@ async def stream_agent_loop(
         # arrives as the next message and the agent resumes from there. The
         # question text is already in the streamed response, so it persists.
         if _awaiting_user:
+            break
+
+        # A sub-agent was dispatched to the background: end the turn now so the
+        # user gets control back. The sub-agent posts its own result into the
+        # chat when done; keeping the turn open would just let the model loop.
+        if _spawned_background:
+            if not full_response.strip():
+                _msg = "The sub-agent is running in the background — I'll surface its result here when it finishes."
+                full_response = _msg
+                yield 'data: ' + json.dumps({"delta": _msg}) + '\n\n'
+            logger.info("[agent] background sub-agent dispatched — ending turn so the user regains control")
             break
 
         if _doc_stream_create_completed:

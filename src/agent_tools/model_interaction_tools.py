@@ -171,6 +171,16 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         url = getattr(parent, "endpoint_url", None)
         model = getattr(parent, "model", None)
         headers = getattr(parent, "headers", None)
+        # The cached session object can lack a resolved endpoint/headers (model
+        # race, stale cache) even when it has a model name. Resolve the name to a
+        # full endpoint so inheriting the parent's model doesn't fail with
+        # "Could not resolve a model" — the sub-agent should Just Work when the
+        # caller omits an explicit model.
+        if model and not (url and headers):
+            try:
+                url, model, headers = await asyncio.to_thread(_resolve_model, model, owner=owner)
+            except ValueError:
+                pass
     if model_spec:
         try:
             url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
@@ -283,9 +293,14 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     rec = subagent_runs.start(_parent_session, _summary, _model, lambda: _run_subagent(deliver=True))
     return {
         "result": (
-            f"Sub-agent started in the background (id={rec['id']}, model={_model}). It will "
-            "post its result into this chat when it finishes — you do NOT need to wait for it "
-            "or poll it. Continue helping the user; do not re-spawn the same task."
+            f"Sub-agent dispatched (id={rec['id']}, model={_model}) and now running in the "
+            "background.\n\n"
+            "YOUR WORK FOR THIS REQUEST IS DONE. Do NOT call any more tools. Do NOT spawn "
+            "another agent. Do NOT start doing the sub-agent's task yourself. The sub-agent "
+            "will post its own result into this chat when it finishes, and that does not "
+            "require your turn to stay open.\n\n"
+            "Now reply to the user with ONE short sentence saying the agent is working, then "
+            "STOP — end your turn immediately."
         ),
         "background": True,
         "subagent_id": rec["id"],
