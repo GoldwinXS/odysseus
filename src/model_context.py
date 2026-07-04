@@ -200,7 +200,13 @@ KNOWN_CONTEXT_WINDOWS = {
 
     # --- Moonshot / Kimi ---
     'moonshot': 128000,
-    'kimi': 128000,
+    'kimi': 262144,
+
+    # --- Zhipu / GLM ---
+    'glm-5.2': 1000000,
+    'glm-5': 1000000,
+    'glm': 262144,
+    'glm-4': 262144,
 
     # --- Microsoft ---
     'phi-4': 16000,
