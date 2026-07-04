@@ -395,11 +395,17 @@ const UI_SCALE_KEY = 'odysseus-ui-scale';
 const DEFAULT_UI_SCALE = '100';
 
 export function applyUiScale(scale) {
-  const s = scale || DEFAULT_UI_SCALE;
-  // Only one non-default scale ('125'). Remove any legacy classes too so an
-  // older stored value can't leave a stale zoom applied.
+  // EMERGENCY NEUTRALIZE: "Larger" applied a whole-page `zoom: 1.25`, which
+  // breaks position:fixed / 100dvh layout on some setups — the app became
+  // completely unclickable with no way to reach the control or DevTools to
+  // undo it. Force 100% regardless of the stored value, and reset a stored
+  // "125" back to default so the control returns to "Default" on next load.
+  // TODO: reintroduce "Larger" as a root font-size scale (rem-based), which
+  // enlarges text without the zoom layout breakage.
   document.documentElement.classList.remove('ui-scale-110', 'ui-scale-125', 'ui-scale-140');
-  if (s === '125') document.documentElement.classList.add('ui-scale-125');
+  if (scale && scale !== DEFAULT_UI_SCALE) {
+    try { localStorage.setItem(UI_SCALE_KEY, DEFAULT_UI_SCALE); } catch (e) {}
+  }
 }
 
 const _BG_CLASSES = ['bg-pattern-dots',
