@@ -3054,8 +3054,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           }
         }
       } else {
-        // Stop streaming TTS on any error/abort
-        if (streamingTTS && window.aiTTSManager) window.aiTTSManager.stop();
+        // Stop streaming TTS on any error/abort. Re-derive the condition inline:
+        // the `streamingTTS` const lives in the streaming-handler scope and is
+        // NOT visible here, so referencing it threw ReferenceError — which made
+        // this error handler itself crash and mask the real error on aborts.
+        if (window.aiTTSManager && window.aiTTSManager.autoPlay && window.aiTTSManager.available) {
+          window.aiTTSManager.stop();
+        }
 
         if (currentAbort && currentAbort.signal.aborted) {
           const abortReason = currentAbort._reason || '';

@@ -2480,7 +2480,10 @@ export function markResearching(sessionId) {
 function _startSubagentPolling() {
   if (_subagentPollTimer) return;
   _subagentPollTimer = setInterval(async function() {
-    if (typeof document !== 'undefined' && document.hidden) return;
+    // Poll regardless of tab visibility: background sub-agents are precisely for
+    // when the user has tabbed away, and we want the result rendered/ready the
+    // moment they return. Browsers already throttle background-tab timers, so
+    // this stays cheap.
     const sid = currentSessionId;
     if (!sid) return;
     let data;
@@ -2810,6 +2813,12 @@ if (document.readyState === 'loading') {
 } else {
   _initAllDropdowns();
 }
+
+// Start the background sub-agent poller once, globally. It polls whatever the
+// current session is each tick, so it covers freshly-created chats too — those
+// never go through selectSession, which is why a delivered sub-agent result
+// previously only appeared after switching away and back.
+try { _startSubagentPolling(); } catch (_) {}
 
 // Shared global listener to close all session dropdowns on click-away or Escape
 function _initDropdownDismiss() {
