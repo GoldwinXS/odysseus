@@ -113,6 +113,107 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
         return {"error": f"Teacher call failed ({model_spec}): {e}"}
 
 
+# ── Sub-agents ──────────────────────────────────────────────────────────────
+# Hard guardrails (a runaway here can exhaust the machine — see the RAM
+# incident): a sub-agent is a LEAF worker. It cannot spawn or orchestrate
+# further (depth is capped at exactly 1 — no fork bombs), concurrency is
+# bounded, each run is round- and time-limited.
+_SUBAGENT_SEMAPHORE = asyncio.Semaphore(3)   # max concurrent sub-agents
+_SUBAGENT_MAX_ROUNDS = 12                     # tool-loop rounds per sub-agent
+_SUBAGENT_TIMEOUT_S = 240                     # wall-clock cap per sub-agent
+# Tools a sub-agent may NOT use: anything that would spawn/orchestrate more
+# agents (recursion) or reach into other chats.
+_SUBAGENT_DISABLED = frozenset({
+    "spawn_agent", "create_session", "send_to_session", "list_sessions",
+    "manage_session", "pipeline", "chat_with_model", "ask_teacher",
+})
+
+
+async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
+    """Spawn a sub-agent that runs a full tool-using agent loop on a task and
+    returns its final result to the caller.
+
+    Content: the task/instructions for the sub-agent. An optional first line
+    ``model: <name>`` overrides the model (defaults to this chat's model).
+
+    Use for a self-contained unit of work you want done and reported back —
+    e.g. "read js/render/models.js, screenshot localhost:1338, and list what
+    looks visually wrong." The sub-agent has the normal tools (files, shell,
+    browser) but cannot itself spawn more agents.
+    """
+    import json
+    from src.agent_loop import stream_agent_loop
+    from src.ai_interaction import get_session_manager, _resolve_model
+
+    task = (content or "").strip()
+    if not task:
+        return {"error": "No task provided for the sub-agent"}
+
+    # Optional `model: <name>` override on the first line.
+    model_spec = None
+    if task.lower().startswith("model:"):
+        first, _, rest = task.partition("\n")
+        model_spec = first.split(":", 1)[1].strip()
+        task = rest.strip()
+        if not task:
+            return {"error": "Sub-agent task was empty after the model: line"}
+
+    # Default: inherit endpoint/model from the parent chat.
+    url = model = headers = None
+    sm = get_session_manager()
+    parent = sm.get_session(session_id) if (sm and session_id) else None
+    if parent is not None:
+        url = getattr(parent, "endpoint_url", None)
+        model = getattr(parent, "model", None)
+        headers = getattr(parent, "headers", None)
+    if model_spec:
+        try:
+            url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
+        except ValueError as e:
+            return {"error": str(e)}
+    if not (url and model):
+        return {"error": "Could not resolve a model for the sub-agent"}
+
+    collected: list = []
+
+    async def _drain():
+        async for chunk in stream_agent_loop(
+            url, model,
+            [{"role": "user", "content": task}],
+            headers=headers,
+            owner=owner,
+            session_id=None,                       # ephemeral — not persisted
+            disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
+            max_rounds=_SUBAGENT_MAX_ROUNDS,
+        ):
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                try:
+                    d = json.loads(chunk[6:])
+                except Exception:
+                    continue
+                # Accumulate visible answer text only (skip thinking tokens).
+                if "delta" in d and not d.get("thinking"):
+                    collected.append(d["delta"])
+
+    try:
+        async with _SUBAGENT_SEMAPHORE:
+            await asyncio.wait_for(_drain(), timeout=_SUBAGENT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        partial = "".join(collected).strip()
+        return {
+            "error": f"Sub-agent timed out after {_SUBAGENT_TIMEOUT_S}s",
+            "partial_result": partial[:4000],
+        }
+    except Exception as e:
+        logger.error(f"spawn_agent failed: {e}")
+        return {"error": f"Sub-agent failed: {e}"}
+
+    result = "".join(collected).strip()
+    if len(result) > 8000:
+        result = result[:8000] + "\n... (truncated)"
+    return {"model": model, "result": result or "(sub-agent produced no text output)"}
+
+
 async def list_models(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
     """List all available models across configured endpoints.
 
@@ -207,3 +308,8 @@ class AskTeacherTool:
 class ListModelsTool:
     async def execute(self, content: str, ctx: dict) -> Dict:
         return await list_models(content, ctx.get("session_id"), owner=ctx.get("owner"))
+
+
+class SpawnAgentTool:
+    async def execute(self, content: str, ctx: dict) -> Dict:
+        return await spawn_agent(content, ctx.get("session_id"), owner=ctx.get("owner"))

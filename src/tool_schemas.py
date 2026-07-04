@@ -296,6 +296,21 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "spawn_agent",
+            "description": "Spawn a sub-agent that runs a full tool-using agent loop on a self-contained task and returns its final result. The sub-agent has the normal tools (files, shell, browser, etc.) but cannot spawn further agents. Use to delegate a focused unit of work — e.g. 'read js/render/models.js, screenshot localhost:1338, and list what looks visually wrong'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The complete task/instructions for the sub-agent to carry out and report back on."},
+                    "model": {"type": "string", "description": "Optional model (or model@endpoint) for the sub-agent. Defaults to this chat's model."}
+                },
+                "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_session",
             "description": "Create a new chat for ongoing conversations with a specific model. (The UI calls these 'chats'; 'session' is the internal term.)",
             "parameters": {
@@ -1388,6 +1403,10 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = args.get("query", "")
     elif tool_type == "chat_with_model":
         content = args.get("model", "") + "\n" + args.get("message", "")
+    elif tool_type == "spawn_agent":
+        _sa_model = (args.get("model") or "").strip()
+        _sa_task = args.get("task", "")
+        content = (f"model: {_sa_model}\n{_sa_task}") if _sa_model else _sa_task
     elif tool_type == "create_session":
         content = args.get("name", "Untitled") + "\n" + args.get("model", "")
     elif tool_type == "list_sessions":
