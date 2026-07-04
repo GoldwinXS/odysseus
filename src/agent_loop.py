@@ -682,6 +682,15 @@ _API_HOSTS = frozenset([
 ])
 _MCP_KEYWORDS = frozenset(["mcp", "browse", "browser", "website", "calendar", "event", "email",
                            "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed"])
+# Visual/browser intent. When present, surface the WHOLE builtin_browser MCP
+# toolset together — semantic RAG retrieval over 29 browser tools otherwise
+# cherry-picks a noisy subset (e.g. mouse_wheel/press_key but NOT navigate or
+# take_screenshot), leaving the model with browser tools it can't actually
+# start a page with. "See your work" only works if navigate+screenshot arrive
+# as a set.
+_BROWSER_INTENT_KEYWORDS = ("screenshot", "browser", "navigate", "webpage", "web page",
+                            "website", "localhost", "render the page", "the running",
+                            "see the page", "look at the page", "open the site")
 _ADMIN_SCHEMA_NAMES = frozenset([
     "manage_session", "manage_skills", "manage_tasks",
     "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens",
@@ -3068,9 +3077,15 @@ async def stream_agent_loop(
                     s for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") in _schema_names
                 ]
+                # Include RAG-selected MCP tools, plus the whole browser MCP
+                # toolset whenever the turn has visual/browser intent (so
+                # navigate + take_screenshot always arrive together, not a
+                # cherry-picked subset). See _BROWSER_INTENT_KEYWORDS.
+                _wants_browser = any(kw in _last_user.lower() for kw in _BROWSER_INTENT_KEYWORDS)
                 _mcp_filtered = [
                     s for s in mcp_schemas
                     if s.get("function", {}).get("name") in _relevant_tools
+                    or (_wants_browser and s.get("function", {}).get("name", "").startswith("mcp__builtin_browser__"))
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:

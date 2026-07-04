@@ -81,7 +81,13 @@ _BUILTIN_NPX_SERVERS = {
     "builtin_browser": {
         "name": "Built-in: Browser",
         "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"],
+        # --browser chromium pins Playwright's own bundled Chromium (installed
+        # via `npx playwright install chromium`). Without it the MCP defaults to
+        # the "chrome" channel and hunts for a system Google Chrome install,
+        # failing with "can't find Chrome at ...\\chrome.exe" on machines where
+        # Chrome isn't where Playwright expects.
+        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision",
+                 "--browser", "chromium"],
     }
 }
 
