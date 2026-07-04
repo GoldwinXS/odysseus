@@ -311,6 +311,20 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_agents",
+            "description": "See which background sub-agents (from spawn_agent) are currently running in THIS chat, or cancel one. Use to check on dispatched work, or to stop a sub-agent that's taking too long or is no longer needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "Leave empty or 'list' to see running/recent sub-agents. Use 'stop <id>' (e.g. 'stop sub_3') to cancel one."}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_session",
             "description": "Create a new chat for ongoing conversations with a specific model. (The UI calls these 'chats'; 'session' is the internal term.)",
             "parameters": {

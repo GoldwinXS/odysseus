@@ -24,7 +24,7 @@ from .web_tools import WebSearchTool, WebFetchTool
 from .filesystem_tools import ReadFileTool, WriteFileTool, EditFileTool, LsTool, GlobTool, GrepTool, GetWorkspaceTool
 from .document_tools import CreateDocumentTool, UpdateDocumentTool, EditDocumentTool, SuggestDocumentTool, ManageDocumentTool
 from .interaction_tools import AskUserTool, UpdatePlanTool
-from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool, SpawnAgentTool
+from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool, SpawnAgentTool, ManageAgentsTool
 from .bg_job_tools import ManageBgJobsTool
 from .session_tools import CreateSessionTool, ListSessionsTool, SendToSessionTool, ManageSessionTool
 from .admin_tools import (
@@ -55,6 +55,7 @@ TOOL_HANDLERS = {
     "chat_with_model": ChatWithModelTool().execute,
     "ask_teacher": AskTeacherTool().execute,
     "spawn_agent": SpawnAgentTool().execute,
+    "manage_agents": ManageAgentsTool().execute,
     "list_models": ListModelsTool().execute,
     "manage_bg_jobs": ManageBgJobsTool().execute,
     "create_session": CreateSessionTool().execute,

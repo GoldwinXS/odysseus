@@ -188,6 +188,30 @@ async def test_updates_payload_has_server_now(fake_env, monkeypatch):
     assert isinstance(upd.get("now"), float)
 
 
+async def test_manage_agents_list_and_stop(fake_env, monkeypatch):
+    hold = asyncio.Event()
+
+    async def hang_loop(*a, **k):
+        yield _sse({"delta": "working"})
+        await hold.wait()
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", hang_loop)
+    try:
+        ret = await mit.spawn_agent("analyze the thing", session_id="mg-1", owner="u")
+        sub_id = ret["subagent_id"]
+        await asyncio.sleep(0.05)
+        listed = await mit.manage_agents("list", session_id="mg-1", owner="u")
+        assert sub_id in listed["results"] and "running" in listed["results"]
+        stopped = await mit.manage_agents(f"stop {sub_id}", session_id="mg-1", owner="u")
+        assert "ancel" in stopped["results"]           # "Cancelling ..."
+        gone = await mit.manage_agents("stop nope", session_id="mg-1", owner="u")
+        assert "No running sub-agent" in gone["results"]
+    finally:
+        hold.set()
+        await asyncio.sleep(0.05)
+
+
 async def test_no_session_runs_synchronously(monkeypatch):
     async def fake_loop(*args, **kwargs):
         yield _sse({"delta": "inline"})

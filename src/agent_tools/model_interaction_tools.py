@@ -131,8 +131,8 @@ _SUBAGENT_MAX_TOKENS = 12000                  # per-round output cap. The loop d
 # Tools a sub-agent may NOT use: anything that would spawn/orchestrate more
 # agents (recursion) or reach into other chats.
 _SUBAGENT_DISABLED = frozenset({
-    "spawn_agent", "create_session", "send_to_session", "list_sessions",
-    "manage_session", "pipeline", "chat_with_model", "ask_teacher",
+    "spawn_agent", "manage_agents", "create_session", "send_to_session",
+    "list_sessions", "manage_session", "pipeline", "chat_with_model", "ask_teacher",
 })
 # Reported back to the dispatcher/user verbatim, so the sub-agent MUST end with a
 # written answer — otherwise a model that spends its whole round budget on tool
@@ -378,7 +378,8 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
             "YOUR WORK FOR THIS REQUEST IS DONE. Do NOT call any more tools. Do NOT spawn "
             "another agent. Do NOT start doing the sub-agent's task yourself. The sub-agent "
             "will post its own result into this chat when it finishes, and that does not "
-            "require your turn to stay open.\n\n"
+            "require your turn to stay open. (You can call `manage_agents` any time to "
+            "check what's running or cancel it — but do NOT poll it in a loop.)\n\n"
             "Now reply to the user with ONE short sentence saying the agent is working, then "
             "STOP — end your turn immediately."
         ),
@@ -464,6 +465,62 @@ async def list_models(content: str, session_id: Optional[str] = None, owner: Opt
         db.close()
 
 
+async def manage_agents(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
+    """See which background sub-agents are running in THIS chat, or cancel one.
+
+    Content:
+      (empty) or "list"      → list running / recently-finished sub-agents
+      "stop <id>" / "cancel <id>" → cancel a running sub-agent by its id (e.g. sub_3)
+
+    Use this to check on work you dispatched with spawn_agent, or to stop a
+    sub-agent that is taking too long or is no longer needed.
+    """
+    import time
+    from src import subagent_runs
+
+    if not session_id:
+        return {"error": "manage_agents can only be used inside a chat session."}
+
+    action = (content or "").strip()
+    low = action.lower()
+
+    if low.startswith("stop") or low.startswith("cancel"):
+        parts = action.split(None, 1)
+        sub_id = parts[1].strip() if len(parts) > 1 else ""
+        if not sub_id:
+            return {"error": "Which sub-agent? Use: manage_agents stop <id> (e.g. stop sub_3)."}
+        stopped = subagent_runs.stop(session_id, sub_id)
+        if stopped:
+            return {"results": f"Cancelling sub-agent {sub_id}. It will post a cancellation notice with any partial output into this chat."}
+        return {"results": f"No running sub-agent {sub_id} found (it may have already finished — check the chat for its result)."}
+
+    # Default: list.
+    upd = subagent_runs.get_updates(session_id)
+    now = upd.get("now") or time.time()
+    running, finished = [], []
+    for u in upd.get("updates", []):
+        el = int(max(0, now - (u.get("started_at") or now)))
+        summ = (u.get("summary") or "").strip()
+        model = u.get("model") or "?"
+        if u.get("status") == "running":
+            running.append(f"  - {u['id']} [{model}] running {el}s — {summ}")
+        else:
+            st = u.get("status")
+            if u.get("error"):
+                st = f"{st}: {u['error']}"
+            finished.append(f"  - {u['id']} [{model}] {st} — {summ}")
+    if not running and not finished:
+        return {"results": "No background sub-agents are running or recently finished in this chat."}
+    out = []
+    if running:
+        out.append(f"{len(running)} running sub-agent(s) (cancel with `manage_agents` then `stop <id>`):")
+        out.extend(running)
+    if finished:
+        out.append("Recently finished (results already delivered into this chat):")
+        out.extend(finished)
+    return {"results": "\n".join(out)}
+
+
 # ---------------------------------------------------------------------------
 # Handler classes registered in TOOL_HANDLERS
 # ---------------------------------------------------------------------------
@@ -486,3 +543,8 @@ class ListModelsTool:
 class SpawnAgentTool:
     async def execute(self, content: str, ctx: dict) -> Dict:
         return await spawn_agent(content, ctx.get("session_id"), owner=ctx.get("owner"))
+
+
+class ManageAgentsTool:
+    async def execute(self, content: str, ctx: dict) -> Dict:
+        return await manage_agents(content, ctx.get("session_id"), owner=ctx.get("owner"))

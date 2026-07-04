@@ -48,6 +48,9 @@ ALWAYS_AVAILABLE = frozenset({
     # Kept always-on so sub-agents are reliably reachable; it's one extra tool
     # per turn. depth-1/no-recursion still blocks a sub-agent from getting it.
     "spawn_agent",
+    # Checking on / cancelling a running sub-agent can follow any message
+    # ("is it done yet?", "stop the agent"); keep it reachable alongside spawn.
+    "manage_agents",
 })
 
 # Tools that the Personal Assistant always has access to during scheduled
@@ -106,6 +109,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "manage_research": "List, read/open, or delete saved DEEP RESEARCH results from the Library. action='list' returns clickable [query](#research-<id>) rows (most-recent first). action='read' (aka open/view/get) with id returns the report + sources. action='delete' with id removes it. Use this for ANY 'open/read/find/delete my research / that report / the research on X' request. NOTE: this is for EXISTING research; to START new research use trigger_research.",
     "manage_settings": "Change ANY real app setting (the ones the Settings panel writes) so the user never has to open it: TTS voice/provider/speed, STT, search engine + result count, default/teacher/task/utility/vision/image/research models, image quality, reminder channel (browser/email/ntfy), agent timeout/tool-call budget, and more. action=set with key (friendly aliases ok: voice, 'search engine', 'default model', 'teacher model', 'image quality', 'reminder channel'...) + value; get/list/reset too. Also toggles tools on/off (disable_tool/enable_tool/list_tools). Secrets/API keys are read-only. Use for any 'change my…/set my…/use X for…/turn on…' preference request.",
     "spawn_agent": "Spawn or dispatch a sub-agent to autonomously carry out a self-contained task in the background and report its result back into the chat when done. Dispatch an agent, delegate a subtask, background task, run in the background, parallel agent work, 'have an agent do X and tell me what it found'. The sub-agent has full tools (files, shell, browser) but cannot spawn more agents.",
+    "manage_agents": "See which background sub-agents are currently running in this chat, check their status/how long they've been going, or cancel/stop one. 'Is the agent still running', 'what agents are running', 'stop/cancel the sub-agent', 'kill the background agent', 'how's the dispatched agent doing'.",
     "create_session": "Create a new chat with a name and model.",
     "list_sessions": "List all chats with their metadata (the UI calls these 'chats'). Use for 'list my chats', 'rename all my chats' (list first, then manage_session to rename each).",
     "send_to_session": "Send a message to another chat. Cross-chat communication.",
