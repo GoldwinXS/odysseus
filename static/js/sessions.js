@@ -2545,54 +2545,92 @@ function _fmtElapsed(sec) {
   return Math.floor(sec / 60) + 'm ' + String(sec % 60).padStart(2, '0') + 's';
 }
 
-// Floating "Background agents" panel — the visibility + kill switch. Rebuilt each
-// poll tick from server truth so elapsed time ticks and finished agents drop off.
-// Rows near the 240s wall-clock cap turn amber so a stuck/runaway agent stands out.
+// Collapsible "Background agents" bar — sits IN FLOW between the chat history and
+// the composer (#subagent-bar), so it never overlaps the send button (the old
+// fixed bottom-right panel did, especially on mobile). Rebuilt each poll tick
+// from server truth so elapsed time ticks and finished agents drop off. Collapsed
+// by default (a thin one-line summary); tap the header to expand for per-agent
+// model/elapsed + a Stop button. Rows near the 240s cap turn amber.
+let _subagentBarCollapsed = null;   // lazy-loaded from localStorage; default collapsed
+function _subagentBarIsCollapsed() {
+  if (_subagentBarCollapsed === null) {
+    try { _subagentBarCollapsed = localStorage.getItem('odysseus-subagent-expanded') !== '1'; }
+    catch (_) { _subagentBarCollapsed = true; }
+  }
+  return _subagentBarCollapsed;
+}
+function _setSubagentBarCollapsed(v) {
+  _subagentBarCollapsed = v;
+  try { localStorage.setItem('odysseus-subagent-expanded', v ? '0' : '1'); } catch (_) {}
+}
+
 function _renderSubagentPanel(sid, running, serverNow) {
-  let panel = document.getElementById('subagent-panel');
+  // Retire the old floating panel if a stale one is lingering in the DOM.
+  const stale = document.getElementById('subagent-panel');
+  if (stale) stale.remove();
+
+  const bar = document.getElementById('subagent-bar');
+  if (!bar) return;
   if (!running || running.length === 0) {
-    if (panel) panel.remove();
+    if (!bar.hidden) { bar.hidden = true; bar.innerHTML = ''; }
     return;
   }
-  if (!panel) {
-    panel = document.createElement('div');
-    panel.id = 'subagent-panel';
-    panel.style.cssText = [
-      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:9998',
-      'max-width:320px', 'background:var(--bg-elevated,#1e1e24)',
-      'color:var(--text-primary,#e8e8ea)', 'border:1px solid var(--border,#3a3a42)',
-      'border-radius:10px', 'box-shadow:0 6px 24px rgba(0,0,0,.35)',
-      'font-size:12px', 'padding:10px 12px', 'pointer-events:auto',
-    ].join(';');
-    document.body.appendChild(panel);
-  }
-  // Spinning gear SVG (no emoji per house style).
-  const spin = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:sa-spin 1.4s linear infinite;flex:0 0 auto"><circle cx="12" cy="12" r="9" opacity=".25"/><path d="M21 12a9 9 0 0 0-9-9"/></svg>';
+
   const esc = (uiModule && uiModule.esc) ? uiModule.esc : (s => String(s));
-  const rows = running.map(u => {
-    const elapsed = serverNow - u.started_at;
-    const warn = elapsed >= 180;   // approaching the 240s wall-clock cap
-    const model = esc(u.model || 'sub-agent');
-    const summ = u.summary ? `<div style="opacity:.6;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px">${esc(u.summary)}</div>` : '';
-    return `<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0">
-      <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
-        ${spin}
-        <div style="min-width:0">
-          <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px">${model}
-            <span style="color:${warn ? 'var(--color-warning,#e0a03a)' : 'var(--text-secondary,#9a9aa2)'};font-variant-numeric:tabular-nums"> · ${_fmtElapsed(elapsed)}</span>
-          </div>${summ}
-        </div>
-      </div>
-      <button data-sa-stop="${esc(u.id)}" title="Stop this sub-agent"
-        style="flex:0 0 auto;background:transparent;border:1px solid var(--border,#3a3a42);color:var(--text-secondary,#9a9aa2);border-radius:6px;padding:2px 7px;cursor:pointer;font-size:11px">Stop</button>
+  const collapsed = _subagentBarIsCollapsed();
+  const n = running.length;
+  const maxElapsed = Math.max.apply(null, running.map(u => serverNow - u.started_at));
+  const anyWarn = running.some(u => (serverNow - u.started_at) >= 180);
+  const warnColor = 'var(--color-warning,#e0a03a)';
+  const dimColor = 'var(--text-secondary,#9a9aa2)';
+  // Spinner + a chevron that points right (collapsed) / down (expanded). SVG, no emoji.
+  const spin = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:sa-spin 1.4s linear infinite;flex:0 0 auto"><circle cx="12" cy="12" r="9" opacity=".25"/><path d="M21 12a9 9 0 0 0-9-9"/></svg>';
+  const chevron = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex:0 0 auto;transform:rotate(${collapsed ? 0 : 90}deg);transition:transform .15s"><polyline points="9 6 15 12 9 18"/></svg>`;
+
+  const header = `<div data-sa-toggle role="button" tabindex="0"
+      title="${collapsed ? 'Show background agents' : 'Hide'}"
+      style="display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;user-select:none;font-size:12px;color:var(--text-primary,#e8e8ea)">
+      ${spin}
+      <span style="font-weight:600">${n} background agent${n > 1 ? 's' : ''} working</span>
+      <span style="color:${anyWarn ? warnColor : dimColor};font-variant-numeric:tabular-nums">· ${_fmtElapsed(maxElapsed)}</span>
+      <span style="margin-left:auto;color:${dimColor};display:inline-flex">${chevron}</span>
     </div>`;
-  }).join('');
-  panel.innerHTML = `<style>@keyframes sa-spin{to{transform:rotate(360deg)}}</style>
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-      <span style="font-weight:600">Background agents (${running.length})</span>
-    </div>${rows}`;
-  panel.querySelectorAll('[data-sa-stop]').forEach(btn => {
-    btn.addEventListener('click', () => _stopSubagent(sid, btn.getAttribute('data-sa-stop'), btn));
+
+  let rowsBlock = '';
+  if (!collapsed) {
+    const rows = running.map(u => {
+      const elapsed = serverNow - u.started_at;
+      const warn = elapsed >= 180;
+      const model = esc(u.model || 'sub-agent');
+      const summ = u.summary ? `<div style="opacity:.55;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(u.summary)}</div>` : '';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:5px 10px">
+        <div style="flex:1;min-width:0">
+          <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px">${model}
+            <span style="color:${warn ? warnColor : dimColor};font-variant-numeric:tabular-nums"> · ${_fmtElapsed(elapsed)}</span></div>
+          ${summ}
+        </div>
+        <button data-sa-stop="${esc(u.id)}" title="Stop this sub-agent"
+          style="flex:0 0 auto;background:transparent;border:1px solid var(--border,#3a3a42);color:${dimColor};border-radius:6px;padding:2px 8px;cursor:pointer;font-size:11px">Stop</button>
+      </div>`;
+    }).join('');
+    rowsBlock = `<div style="border-top:1px solid var(--border,#3a3a42);padding:3px 0 4px">${rows}</div>`;
+  }
+
+  bar.hidden = false;
+  bar.style.cssText = 'max-width:800px;width:100%;margin:0 auto 6px;box-sizing:border-box';
+  bar.innerHTML = `<style>@keyframes sa-spin{to{transform:rotate(360deg)}}</style>
+    <div style="background:var(--panel,#1e1e24);border:1px solid var(--border,#3a3a42);border-radius:10px;overflow:hidden">
+      ${header}${rowsBlock}
+    </div>`;
+
+  const toggle = () => { _setSubagentBarCollapsed(!_subagentBarIsCollapsed()); _renderSubagentPanel(sid, running, serverNow); };
+  const hdr = bar.querySelector('[data-sa-toggle]');
+  if (hdr) {
+    hdr.addEventListener('click', toggle);
+    hdr.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+  }
+  bar.querySelectorAll('[data-sa-stop]').forEach(btn => {
+    btn.addEventListener('click', (e) => { e.stopPropagation(); _stopSubagent(sid, btn.getAttribute('data-sa-stop'), btn); });
   });
 }
 
