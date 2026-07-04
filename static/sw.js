@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v341';
+const CACHE_NAME = 'odysseus-v342';
 
 // Core shell precached on install so repeat opens are instant without any
 // network wait. Keep this list in sync with the <script type="module"> tags
@@ -105,7 +105,15 @@ self.addEventListener('fetch', (e) => {
     // shell from pinning old JS after a code update.
     e.respondWith(
       fetch(e.request).then(res => {
-        if (res && res.ok) caches.open(CACHE_NAME).then(cache => cache.put('/', res.clone()));
+        // Clone SYNCHRONOUSLY, before returning res — deferring the clone into
+        // the async caches.open callback can run after the body has begun
+        // draining ("body already used"), which silently stops the cached
+        // offline copy of '/' from refreshing. (The JS/CSS handler below does
+        // this correctly.)
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put('/', copy));
+        }
         return res;
       }).catch(() => caches.open(CACHE_NAME).then(cache => cache.match('/')))
     );

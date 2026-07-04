@@ -116,8 +116,16 @@ function _historyUrl(id, { limit = null, offset = null } = {}) {
   return url.toString();
 }
 
-function _renderHistoryMessage(msg, modelName) {
-  const meta = msg.metadata ? { ...msg.metadata, _fromHistory: true } : null;
+function _renderHistoryMessage(msg, modelName, opts) {
+  // isLast marks the final message in the current history slice. Only it may
+  // render a LIVE ask_user card; earlier turns' persisted ask_user payloads
+  // were already answered, so their cards are stale (see chatRenderer). Older
+  // pages loaded via the pager are never last, so the default (undefined →
+  // suppressed) is correct there too.
+  const _isLast = !!(opts && opts.isLast);
+  const meta = msg.metadata
+    ? { ...msg.metadata, _fromHistory: true, _suppressAskUser: !_isLast }
+    : (!_isLast ? { _suppressAskUser: true } : null);
   // Tool-heavy assistant turns: rebuild the compact agent thread (round
   // texts + lazy collapsed tool chips) via chatRenderer.addMessage — the
   // same renderer used when a live stream completes — instead of pushing
@@ -348,8 +356,47 @@ let _researchPollTimer = null;
 // into the session on completion). _subagentSessions drives the "running" dot;
 // _subagentSeen de-dupes completions this client already handled.
 const _subagentSessions = new Set();
-const _subagentSeen = new Set();
+const _subagentSeen = new Set();               // LOCAL fast-path de-dupe (per page)
 let _subagentPollTimer = null;
+// Per-session consecutive auto-resume counter. Caps the spawn/finish/resume loop
+// so a down/rate-limited provider (which finishes as `status: error`) can't drive
+// an unbounded token-burning cycle. Reset to 0 on any manual user send.
+const _autoResumeCount = new Map();            // session_id -> consecutive auto-resumes
+const _SUBAGENT_AUTO_RESUME_CAP = 3;
+
+// Consume auto-resume budget for a session, returning false when the cap is hit.
+// A manual user send calls resetSubagentAutoResume() to clear the counter.
+function _canAutoResume(sid) {
+  return (_autoResumeCount.get(sid) || 0) < _SUBAGENT_AUTO_RESUME_CAP;
+}
+function _noteAutoResume(sid) {
+  _autoResumeCount.set(sid, (_autoResumeCount.get(sid) || 0) + 1);
+}
+export function resetSubagentAutoResume(sid) {
+  if (sid) _autoResumeCount.delete(sid);
+  else _autoResumeCount.clear();
+}
+
+// POST an ack so a completion fires auto-resume exactly once across reloads and
+// devices (server keeps records ~300s; the local _subagentSeen set only covers
+// this page). First caller wins: the returned `acked` list contains only ids
+// this call newly claimed. Falls back to the local set if the endpoint is
+// unavailable (older server), so behavior degrades to the previous per-page one.
+async function _ackSubagentRuns(sid, runIds) {
+  if (!runIds || !runIds.length) return [];
+  try {
+    const res = await fetch(`${API_BASE}/api/subagent/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sid, run_ids: runIds }),
+    });
+    if (!res.ok) return runIds.slice();   // endpoint missing/failed → local fast-path wins
+    const data = await res.json();
+    return Array.isArray(data && data.acked) ? data.acked : [];
+  } catch (_) {
+    return runIds.slice();                // network error → don't lose the resume
+  }
+}
 
 // Session list keyboard navigation state
 let _sessionListFocused = false;
@@ -1105,7 +1152,7 @@ function _renderSessionListImpl() {
 
   // Get saved order from localStorage
   const savedOrder = Storage.get('session-order');
-  let orderedSessions = sessions.filter(s => !s.archived && s.folder !== 'Assistant' && !_isIncognitoSession(s.id) && (s.name || '').trim() !== 'Nobody' && (s.name || '').trim() !== 'Incognito');
+  let orderedSessions = sessions.filter(s => !s._stub && !s.archived && s.folder !== 'Assistant' && !_isIncognitoSession(s.id) && (s.name || '').trim() !== 'Nobody' && (s.name || '').trim() !== 'Incognito');
 
   if (savedOrder) {
     try {
@@ -1852,7 +1899,7 @@ export async function loadSessions() {
   }
 }
 
-export async function selectSession(id, { keepSidebar = false, showLoading = true } = {}) {
+export async function selectSession(id, { keepSidebar = false, showLoading = true, preserveComposer = false } = {}) {
   // Exit compare mode cleanly if active
   if (window.compareModule && window.compareModule.isActive()) {
     window.compareModule.deactivate(true);
@@ -1921,10 +1968,15 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     const msgInput = document.getElementById('message');
     if (msgInput) {
       msgInput.disabled = false;
-      msgInput.value = '';
-      msgInput.style.height = '';
-      msgInput.style.overflow = '';
-      autoResize(msgInput);
+      // Preserve the user's draft when the poller re-selects the CURRENT session
+      // (auto-resume after a sub-agent). Wiping it here would race, and lose,
+      // the draft check in autoResumeAfterSubagent 900ms later.
+      if (!(preserveComposer && prevSessionId === id)) {
+        msgInput.value = '';
+        msgInput.style.height = '';
+        msgInput.style.overflow = '';
+        autoResize(msgInput);
+      }
     }
     const sendBtn2 = document.querySelector('.send-btn');
     if (sendBtn2) {
@@ -1979,6 +2031,18 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
         }, loadingDelayMs);
       }
       const res = await fetch(_historyUrl(id, { limit: _historyPageLimit() }));
+      // A directly-selected id whose history 404s is a session deleted
+      // elsewhere (another device) that a stale saved lastSessionId still
+      // points at. Roll back currentSessionId to the previous session so the
+      // caller's auto-create fallback (chat.js) can run instead of committing a
+      // dead id — otherwise the composer was already cleared and the message
+      // escapes into a phantom chat.
+      if (!res.ok) {
+        if (loadingTimer) { clearTimeout(loadingTimer); loadingTimer = null; }
+        if (currentSessionId === id) currentSessionId = (prevSessionId !== id ? prevSessionId : null);
+        if (chatHistory) { chatHistory.style.opacity = '1'; chatHistory.classList.remove('no-animate'); }
+        return;
+      }
       const data = await res.json();
       if (loadingTimer) {
         clearTimeout(loadingTimer);
@@ -2008,9 +2072,11 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
         } else {
           // Session list not fetched yet (deep link raced loadSessions).
           // Seed a minimal stub so the repaint below can read the model —
-          // loadSessions replaces the whole array when it lands, so the
-          // stub never reaches the sidebar.
-          sessions.push({ id, model: modelName });
+          // loadSessions replaces the whole array when it lands. Tag it _stub
+          // so renderSessionList filters it out: if this push instead runs
+          // AFTER loadSessions completed (a deleted/foreign id), an untagged
+          // stub would render as a phantom nameless row until the next reload.
+          sessions.push({ id, model: modelName, _stub: true });
         }
         // Always repaint, not just when the cached meta changed: the early
         // updateModelPicker() call above runs before history is fetched, and
@@ -2065,11 +2131,16 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
          <p>Messages will be routed through your OpenClaw agent. The agent has access to tools, memory, and skills configured in your OpenClaw workspace.</p>`,
         'OpenClaw');
     } else if (msgHistory.length) {
-      for (const msg of msgHistory) {
+      const _lastIdx = msgHistory.length - 1;
+      for (let _i = 0; _i < msgHistory.length; _i++) {
         try {
-          _renderHistoryMessage(msg, modelName);
+          // Only the final message may show a LIVE ask_user card. A persisted
+          // ask_user payload on an earlier assistant turn was already answered
+          // (a later message exists), so its card is stale — rendering it lets
+          // a click send a stale answer. isLast=false suppresses the card.
+          _renderHistoryMessage(msgHistory[_i], modelName, { isLast: _i === _lastIdx });
         } catch (e) {
-          console.warn('Failed to render history message:', e, msg);
+          console.warn('Failed to render history message:', e, msgHistory[_i]);
         }
       }
     } else {
@@ -2536,49 +2607,75 @@ function _startSubagentPolling() {
     // Live visibility panel: what's running right now, for how long, + a kill switch.
     _renderSubagentPanel(sid, updates.filter(u => u && u.status === 'running'), serverNow);
 
-    // Handle each freshly-finished sub-agent exactly once.
+    // Don't consume completions while a LIVE foreground turn is streaming into
+    // this session — a history reload would clobber it. Use the aria-busy flag
+    // (true only during an active foreground turn), NOT hasActiveStream: that
+    // also reports stale detached/resuming streams and stays stuck true after a
+    // turn ends, which permanently blocked auto-resume.
+    // chat.js maintains aria-busy on #chat-history (index.html hardcodes
+    // #chat-container to "false", so reading that was a permanent no-op that
+    // let a mid-stream completion detach the in-flight turn). Check both.
+    var _chEl = document.getElementById('chat-history');
+    var _ccEl = document.getElementById('chat-container');
+    if ((_chEl && _chEl.getAttribute('aria-busy') === 'true') ||
+        (_ccEl && _ccEl.getAttribute('aria-busy') === 'true')) {
+      return;   // a foreground turn owns the view — try again next tick
+    }
+
+    // Freshly-finished sub-agents this page hasn't handled yet. Split success
+    // from failure: only successes are eligible for auto-resume ("review and
+    // continue"). A provider that's down/rate-limited finishes as `error`;
+    // resuming on those would drive an unbounded spawn/fail/resume token loop.
     let sawCompletion = false;
+    const okRunIds = [];   // done runs eligible to ack + auto-resume
     for (const u of updates) {
       if (!u || u.status === 'running') continue;
       if (_subagentSeen.has(u.id)) continue;
-      // Don't consume a completion while a LIVE foreground turn is streaming into
-      // this session — a history reload would clobber it. Use the aria-busy flag
-      // (true only during an active foreground turn), NOT hasActiveStream: that
-      // also reports stale detached/resuming streams and stays stuck true after a
-      // turn ends, which permanently blocked auto-resume.
-      var _ccEl = document.getElementById('chat-container');
-      if (_ccEl && _ccEl.getAttribute('aria-busy') === 'true') {
-        continue;
-      }
-      _subagentSeen.add(u.id);
+      _subagentSeen.add(u.id);   // local fast-path de-dupe
       sawCompletion = true;
+      if (u.status !== 'error' && !u.acked) okRunIds.push(u.id);
     }
 
-    if (sawCompletion) {
-      if (currentSessionId === sid) {
-        // Viewing the session — reload history so the delivered message renders,
-        // then hand the main agent a turn to react to it (auto-resume). The turn
-        // that just spawned takes a moment to fully settle (isStreaming), so
-        // RETRY until autoResume actually fires (it returns false while a turn is
-        // in flight or the user is mid-draft) — otherwise a brief settling window
-        // silently swallows the auto-resume.
-        selectSession(sid);
-        var _arTries = 0;
-        var _tryAutoResume = function() {
-          if (currentSessionId !== sid) return;   // user navigated away — abandon
-          // Pass the sub-agent's session id so auto-resume refuses to fire into a
-          // different / pending chat (guards against the "turn moved to a new qwen
-          // chat" bug).
-          if (window.chatModule && window.chatModule.autoResumeAfterSubagent &&
-              window.chatModule.autoResumeAfterSubagent(sid)) return;   // fired
-          if (++_arTries < 8) setTimeout(_tryAutoResume, 1000);
-        };
-        setTimeout(_tryAutoResume, 900);
-      } else {
-        // User moved on — pulse the sidebar so they notice the result.
-        markStreamComplete(sid);
-      }
+    if (!sawCompletion) return;
+
+    if (currentSessionId !== sid) {
+      // User moved on — pulse the sidebar so they notice the result.
+      markStreamComplete(sid);
+      return;
     }
+
+    // Viewing the session — reload history so the delivered message (result OR
+    // failure notice) renders. Result messages are persisted server-side, so we
+    // refresh regardless of ack/auto-resume state. preserveComposer keeps the
+    // user's draft when re-selecting the current session (auto-resume's own
+    // draft check runs 900ms later).
+    selectSession(sid, { preserveComposer: true });
+
+    if (!okRunIds.length) return;   // only failures — render them, don't resume
+
+    // Claim these completions server-side so the resume fires exactly once
+    // across reloads / a second device. Only ids THIS call newly acked (first
+    // caller wins) may drive auto-resume.
+    const acked = await _ackSubagentRuns(sid, okRunIds);
+    if (!acked.length) return;
+    if (currentSessionId !== sid) return;   // user navigated during the ack
+    if (!_canAutoResume(sid)) return;       // cap hit — a manual send resets it
+
+    // The just-spawned turn takes a moment to settle (isStreaming), so RETRY
+    // until autoResume actually fires (it returns false while a turn is in
+    // flight or the user is mid-draft) — otherwise a brief settling window
+    // silently swallows the auto-resume.
+    var _arTries = 0;
+    var _tryAutoResume = function() {
+      if (currentSessionId !== sid) return;   // user navigated away — abandon
+      // Pass the sub-agent's session id so auto-resume refuses to fire into a
+      // different / pending chat (guards against the "turn moved to a new qwen
+      // chat" bug).
+      if (window.chatModule && window.chatModule.autoResumeAfterSubagent &&
+          window.chatModule.autoResumeAfterSubagent(sid)) { _noteAutoResume(sid); return; }
+      if (++_arTries < 8) setTimeout(_tryAutoResume, 1000);
+    };
+    setTimeout(_tryAutoResume, 900);
   }, 3000);
 }
 
@@ -3767,6 +3864,7 @@ const sessionModule = {
   clearStreaming,
   markStreamComplete,
   clearStreamComplete,
+  resetSubagentAutoResume,
   openLibrary,
   closeLibrary,
   openArchive,

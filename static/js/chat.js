@@ -678,6 +678,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     // --- Send-path entry: block re-clicks between submit and stream start ---
     if (_sendInFlight) return;
     _sendInFlight = true;
+    // A genuine user-initiated send (not an auto-continue / auto-resume, which
+    // set _hideUserBubble) resets the sub-agent auto-resume budget so the next
+    // spawn/finish cycle starts fresh. Prevents a provider-down loop from
+    // permanently exhausting the cap.
+    try {
+      if (!_hideUserBubble && sessionModule.resetSubagentAutoResume) {
+        sessionModule.resetSubagentAutoResume(sessionModule.getCurrentSessionId());
+      }
+    } catch (_) {}
     _setForegroundChatBusy(true);
     // Instant visual feedback so the user sees their click was accepted
     // even before the streaming button state kicks in below.

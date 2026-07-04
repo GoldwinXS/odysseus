@@ -2434,10 +2434,13 @@ export function addMessage(role, content, modelName, metadata) {
         box.querySelectorAll('pre code:not(.hljs)').forEach(b => window.hljs.highlightElement(b));
       }
       if (markdownModule.renderMermaid) markdownModule.renderMermaid(box);
-      if (pendingAskUser) {
+      if (pendingAskUser && !(metadata && metadata._suppressAskUser)) {
         // Session history is rendered oldest-to-newest.  A later user message
         // removes this card; if there is none, the pending choice survives a
         // refresh.  Avoid stealing focus while the history is loading.
+        // _suppressAskUser (set by the history renderer for any turn that is
+        // NOT the final message) blocks resurrecting a long-answered card whose
+        // stale answer a click would send.
         renderAskUserCard(pendingAskUser, { focus: false, scroll: false });
       }
       return lastWrap;
