@@ -194,7 +194,10 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         try:
             from core.models import ChatMessage
             sm2 = get_session_manager()
+            logger.info("[subagent-deliver] session=%s error=%r partial_len=%d sm=%s",
+                        _parent_session, error, len(partial or ""), "yes" if sm2 else "NONE")
             if not sm2:
+                logger.error("[subagent-deliver] no session manager — result LOST for %s", _parent_session)
                 return
             sess2 = sm2.get_session(_parent_session)
             if error:
@@ -206,8 +209,9 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                     partial or "(sub-agent produced no text output)"
                 )
             sess2.add_message(ChatMessage("assistant", text, metadata={"model": _model, "subagent": True}))
+            logger.info("[subagent-deliver] delivered to %s (%d chars)", _parent_session, len(text))
         except Exception as e:
-            logger.error(f"spawn_agent delivery failed for session {_parent_session}: {e}")
+            logger.error(f"spawn_agent delivery failed for session {_parent_session}: {e}", exc_info=True)
 
     async def _run_subagent(deliver: bool) -> Dict:
         """Run the leaf sub-agent to completion under the guardrails. When
@@ -253,6 +257,8 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         result = "".join(collected).strip()
         if len(result) > 8000:
             result = result[:8000] + "\n... (truncated)"
+        logger.info("[subagent-run] finished session=%s deliver=%s error=%r result_len=%d",
+                    _parent_session, deliver, error, len(result))
         if deliver:
             _deliver(error=error, partial=result)
         if error:

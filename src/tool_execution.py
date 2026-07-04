@@ -944,7 +944,14 @@ async def _execute_tool_block_impl(
     elif tool in dynamic_handlers:
         first_line = content.split(chr(10))[0][:80]
         desc = f"registry: {tool} {first_line}".strip()
-        res = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        # Thread session_id + owner into the registry dispatch. Without them
+        # spawn_agent saw session_id=None, silently fell back to running the
+        # sub-agent SYNCHRONOUSLY (blocking the turn) and never delivered its
+        # result into the chat; other registry tools lost owner-scoping too.
+        res = await _direct_fallback(
+            tool, content, progress_cb=progress_cb,
+            session_id=session_id, owner=owner,
+        )
 
         if isinstance(res, tuple):
             desc, result = res
