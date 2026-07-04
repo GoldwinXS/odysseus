@@ -4062,10 +4062,18 @@ async def stream_agent_loop(
         # user gets control back. The sub-agent posts its own result into the
         # chat when done; keeping the turn open would just let the model loop.
         if _spawned_background:
+            # Make the dispatch EXPLICIT in the assistant message. The turn ends
+            # right after the tool call, so the model never gets a round where it
+            # sees the tool result — without this, on its NEXT turn its own history
+            # shows a half-finished thought and it concludes it "never actually
+            # called spawn_agent" (observed with GLM). Appending a clear marker to
+            # the saved message fixes that and reads naturally to the user too.
             if not full_response.strip():
-                _msg = "The sub-agent is running in the background — I'll surface its result here when it finishes."
-                full_response = _msg
-                yield 'data: ' + json.dumps({"delta": _msg}) + '\n\n'
+                _confirm = "The background sub-agent is dispatched and running — its result will arrive here as a separate message when it finishes."
+            else:
+                _confirm = "\n\n_Background sub-agent dispatched — its result will arrive here as a separate message when it finishes._"
+            full_response += _confirm
+            yield 'data: ' + json.dumps({"delta": _confirm}) + '\n\n'
             logger.info("[agent] background sub-agent dispatched — ending turn so the user regains control")
             break
 

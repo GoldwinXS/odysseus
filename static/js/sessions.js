@@ -204,9 +204,32 @@ function _renderHistoryMessage(msg, modelName) {
 
   const body = document.createElement('div');
   body.className = 'body';
-  body.innerHTML = markdownModule.processWithThinking(
-    markdownModule.squashOutsideCode(markdownModule.renderContent(displayContent || ''))
-  );
+  if (meta && meta.subagent) {
+    // A delivered sub-agent result can be many KB — render it COLLAPSED by
+    // default (native <details>) so it doesn't dominate the transcript. The
+    // "**Sub-agent result** (model)" first line becomes the clickable summary.
+    const det = document.createElement('details');
+    det.className = 'subagent-result';
+    const sum = document.createElement('summary');
+    sum.style.cssText = 'cursor:pointer;font-weight:600;color:var(--accent,var(--red));list-style-position:inside;user-select:none';
+    let head = 'Sub-agent result';
+    let rest = displayContent || '';
+    const hm = /^\s*\*\*(.+?)\*\*\s*(\([^)]*\))?\s*\n+([\s\S]*)$/.exec(displayContent || '');
+    if (hm) { head = (hm[1] + ' ' + (hm[2] || '')).trim(); rest = hm[3]; }
+    sum.textContent = head;
+    det.appendChild(sum);
+    const inner = document.createElement('div');
+    inner.style.cssText = 'margin-top:6px';
+    inner.innerHTML = markdownModule.processWithThinking(
+      markdownModule.squashOutsideCode(markdownModule.renderContent(rest))
+    );
+    det.appendChild(inner);
+    body.appendChild(det);
+  } else {
+    body.innerHTML = markdownModule.processWithThinking(
+      markdownModule.squashOutsideCode(markdownModule.renderContent(displayContent || ''))
+    );
+  }
   if (msg.role === 'user' && Array.isArray(meta?.attachments) && meta.attachments.length) {
     if (chatRenderer.buildAttachCards) {
       body.appendChild(chatRenderer.buildAttachCards(meta.attachments));
