@@ -252,6 +252,30 @@ async def test_context_note_gives_ground_truth_and_survives_denial(fake_env, mon
     assert "delivered into this chat" in done_note
 
 
+async def test_subagent_gets_coding_tool_baseline(fake_env, monkeypatch):
+    # A task that never lexically mentions files must STILL be dispatched with the
+    # file/shell/search tools — otherwise the worker reports itself "blocked, no
+    # filesystem tools" (the reported bug). Also: recursion tools stay stripped.
+    captured = {}
+
+    async def capture_loop(*args, **kwargs):
+        captured.update(kwargs)
+        yield _sse({"delta": "done"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", capture_loop)
+    await mit.spawn_agent(
+        "improve the look of the buildings so they feel more polished",
+        session_id="tools-1", owner="u",
+    )
+    await _wait_done("tools-1")
+    rt = captured.get("relevant_tools") or set()
+    for t in ("read_file", "write_file", "edit_file", "bash", "ls", "grep", "get_workspace"):
+        assert t in rt, f"{t} missing from sub-agent tool set: {sorted(rt)}"
+    # Leaf worker: recursion/orchestration tools must never be present.
+    assert "spawn_agent" not in rt and "manage_agents" not in rt
+
+
 async def test_no_session_runs_synchronously(monkeypatch):
     async def fake_loop(*args, **kwargs):
         yield _sse({"delta": "inline"})

@@ -134,6 +134,19 @@ _SUBAGENT_DISABLED = frozenset({
     "spawn_agent", "manage_agents", "create_session", "send_to_session",
     "list_sessions", "manage_session", "pipeline", "chat_with_model", "ask_teacher",
 })
+# Tools EVERY sub-agent must reliably have, regardless of how its task is worded.
+# A sub-agent's tools are otherwise picked by RAG from the task text alone (it has
+# no session history / sticky tools to fall back on), so a task like "improve the
+# buildings graphics" that never lexically mentions files would be dispatched with
+# NO read_file/edit_file/bash — the worker then reports itself "blocked, I have no
+# filesystem tools" while a sibling whose wording happened to retrieve them
+# succeeds. These are unconditionally seeded so a dispatched worker can always
+# read, edit, search, and run — the whole point of a sub-agent. (MCP tools like
+# the browser are already unconditional; only native tools are RAG-gated.)
+_SUBAGENT_TOOL_BASELINE = frozenset({
+    "read_file", "write_file", "edit_file", "ls", "grep", "get_workspace", "bash",
+    "web_search", "web_fetch",
+})
 # Reported back to the dispatcher/user verbatim, so the sub-agent MUST end with a
 # written answer — otherwise a model that spends its whole round budget on tool
 # calls (common with Gemini, which emits no narration between calls) delivers an
@@ -171,6 +184,7 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     import json
     from src.agent_loop import stream_agent_loop
     from src.ai_interaction import get_session_manager, _resolve_model
+    from src.tool_index import get_tool_index, ALWAYS_AVAILABLE
 
     task = (content or "").strip()
     if not task:
@@ -227,6 +241,33 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     except Exception:
         _fallbacks = []
 
+    # Inherit the parent turn's active workspace so the sub-agent's file/shell
+    # tools are confined to (and resolve "the project" as) the same folder the
+    # user is working in. spawn_agent runs inside the parent's tool-execution
+    # context, where the workspace contextvar is set; capture it now, before the
+    # detached runner starts.
+    try:
+        from src.tool_execution import get_active_workspace
+        _workspace = get_active_workspace()
+    except Exception:
+        _workspace = None
+
+    # Pre-select the sub-agent's tools with the coding baseline force-included, so
+    # a worker is never dispatched without file/shell/search tools just because
+    # its task wording didn't lexically retrieve them (the root cause of sub-
+    # agents reporting themselves "blocked — no filesystem tools"). RAG still runs
+    # on the task on top of the baseline, so task-specific tools are added too.
+    _sub_tools = set(ALWAYS_AVAILABLE) | set(_SUBAGENT_TOOL_BASELINE)
+    try:
+        _tool_idx = get_tool_index()
+        if _tool_idx:
+            _sub_tools = await asyncio.to_thread(
+                _tool_idx.get_tools_for_query, _task, 8, _sub_tools
+            )
+    except Exception as _tsel_err:
+        logger.debug("sub-agent tool pre-selection fell back to baseline: %s", _tsel_err)
+    _sub_tools -= set(_SUBAGENT_DISABLED)
+
     def _deliver(error: Optional[str], partial: str) -> None:
         """Post the sub-agent's outcome as an assistant message into the parent
         session. Persists immediately (add_message -> _persist_message commits),
@@ -273,6 +314,8 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                 owner=_owner,
                 session_id=None,                        # ephemeral — not persisted
                 disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
+                relevant_tools=set(_sub_tools),          # coding baseline force-included
+                workspace=_workspace,                    # inherit parent's project folder
                 max_rounds=_SUBAGENT_MAX_ROUNDS,
                 max_tokens=_SUBAGENT_MAX_TOKENS,         # the default 4096 truncated
                                                          # long final summaries mid-word
