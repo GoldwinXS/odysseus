@@ -477,6 +477,7 @@ If `dtend` omitted, defaults to dtstart+1h (or +1d when `all_day: true`). \
 For a RECURRING event pass `rrule` as an iCalendar RRULE string, e.g. `"FREQ=WEEKLY;BYDAY=MO"` (every Monday), `"FREQ=DAILY;COUNT=10"`, or `"FREQ=MONTHLY;BYMONTHDAY=1"` — create ONE event with the rrule, do not loop creating many events. Do not pass `rrule` for "next Wednesday only", "just this once", or any single occurrence. \
 If the user asks for a reminder/alarm before the event, pass `reminder_minutes` as an integer; do not write reminder text into the event description and do NOT also call `manage_notes` for the same reminder because calendar reminders are routed through Notes automatically. \
 `calendar` accepts a name ("Main") or short-id prefix.""",
+    "spawn_agent": "- ```spawn_agent``` — Spawn a sub-agent that runs a full tool-using loop on a self-contained task and returns its result. Content = the task (optional first line `model: <name>`). The sub-agent has files/shell/browser tools but CANNOT spawn more agents. Use to delegate a focused subtask, e.g. `spawn_agent` then `screenshot localhost:1338 and list what looks visually wrong`.",
     "create_session": "- ```create_session``` — Create a new chat. Line 1 = chat name, line 2 = model name. Use for background/parallel work.",
     "list_sessions": "- ```list_sessions``` — List chats sorted MOST-RECENT FIRST (the UI calls them 'chats') with clickable chat-title links. Output includes a relative \"last active\" timestamp per row, so the first row is the user's most recent chat. Content = optional filter keyword (matches chat name). When answering, preserve the `[title](#session-id)` links exactly; do not convert them into plain text.",
     "send_to_session": "- ```send_to_session``` — Send a message to another session. Line 1 = session_id, rest = message. Use for orchestrating work across sessions.",
@@ -2359,12 +2360,11 @@ def _session_used_tools(session_id: Optional[str]) -> set:
     except Exception as _e:
         logger.debug("session used-tools lookup failed: %s", _e)
         return set()
-    # Only re-offer names that are real executable tool tags (drops legacy /
-    # MCP-only names like "note" that aren't current tags). TOOL_TAGS — not
-    # TOOL_SECTIONS.keys() — is the universe: grep/glob/ls are valid tags
-    # documented under a shared section, so they have no section key of their
-    # own but must still be allowed to stick.
-    return used & TOOL_TAGS
+    # Re-offer real executable tool tags AND MCP tools (mcp__server__tool):
+    # a capability a conversation has exercised must never disappear, and that
+    # includes MCP tools like the browser (they aren't in TOOL_TAGS because
+    # their names are dynamic). Drops only legacy/unknown labels like "note".
+    return {t for t in used if t in TOOL_TAGS or t.startswith("mcp__")}
 
 
 def build_active_plan_note(approved_plan: str) -> str:
@@ -3085,14 +3085,18 @@ async def stream_agent_loop(
                     if s.get("function", {}).get("name") in _schema_names
                 ]
                 # Include RAG-selected MCP tools, plus the whole browser MCP
-                # toolset whenever the conversation has visual/browser intent
-                # (so navigate + take_screenshot always arrive together, not a
-                # cherry-picked subset). _wants_browser is computed from recent
-                # user turns above, so a bare "try now" nudge still counts.
+                # toolset whenever the conversation has visual/browser intent OR
+                # has ALREADY used a browser tool (sticky put it in
+                # _relevant_tools). Once a conversation touches the browser, the
+                # full navigate+screenshot+snapshot set stays available for the
+                # rest of it — tools added to a chat don't disappear later.
+                _include_browser = _wants_browser or any(
+                    n.startswith("mcp__builtin_browser__") for n in (_relevant_tools or ())
+                )
                 _mcp_filtered = [
                     s for s in mcp_schemas
                     if s.get("function", {}).get("name") in _relevant_tools
-                    or (_wants_browser and s.get("function", {}).get("name", "").startswith("mcp__builtin_browser__"))
+                    or (_include_browser and s.get("function", {}).get("name", "").startswith("mcp__builtin_browser__"))
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
