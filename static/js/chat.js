@@ -3593,6 +3593,20 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       uiModule.scrollHistory();
     };
 
+    // Throttled variant for the replay/stream loop. On reconnect, the server
+    // replays a detached run's ENTIRE buffered event log at once (see
+    // agent_runs.subscribe). A long agentic turn (e.g. a model that looped for
+    // dozens of rounds) buffers thousands of delta events; calling the full
+    // markdown re-render on every one — over the whole growing text — is O(N^2)
+    // synchronous work with no paint in between, which froze the tab on open.
+    // Cap re-renders to ~10/sec; a final flush after the loop shows the last
+    // state. Live typing still feels instant (100ms batching is imperceptible).
+    let _lastDeltaRenderAt = 0;
+    const renderDeltaThrottled = () => {
+      const now = Date.now();
+      if (now - _lastDeltaRenderAt >= 100) { _lastDeltaRenderAt = now; renderDelta(); }
+    };
+
     try {
       readLoop:
       while (true) {
@@ -3625,7 +3639,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               rich = true;
             }
             if (!gotDelta) { gotDelta = true; try { spinner.destroy(); } catch (_) {} }
-            renderDelta();
+            renderDeltaThrottled();
           } else if (json.type === 'doc_stream_open') {
             rich = true;
             if (documentModule) documentModule.streamDocOpen(json.title || '', json.lang || '');
@@ -3646,6 +3660,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     } catch (e) {
       // Network drop or parse failure: fall through to the reload below.
     }
+
+    // Flush the final text state (the throttle may have skipped the last delta).
+    if (gotDelta) { try { renderDelta(); } catch (_) {} }
 
     cleanup();
     if (docFenceOpened) _finishDocumentWritingStatus(holder, true);
