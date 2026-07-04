@@ -17,8 +17,14 @@ let currentSessionId = null;
 let _sessionNavToken = 0;
 let _skipAutoSelect = false;
 let _suppressNextSessionLoading = false;
-const HISTORY_DISPLAY_CHAR_LIMIT = 160000;
-const HISTORY_DISPLAY_TAIL_CHARS = 20000;
+// A single plain-text (non-tool) history message this large is clipped for
+// display — the full text stays in the DB/export. 160K was far too high: one
+// 433K code-dump reply clipped to 160K still carried ~490 fenced code blocks,
+// and rendering + syntax-highlighting all of them flat froze the tab (the
+// lazy tool chips don't cover a plain-text message with no tool_events). 24K
+// keeps a readable head+tail while staying light enough to never lock up.
+const HISTORY_DISPLAY_CHAR_LIMIT = 24000;
+const HISTORY_DISPLAY_TAIL_CHARS = 4000;
 const HISTORY_PAGE_LIMIT_MOBILE = 8;
 const HISTORY_PAGE_LIMIT_DESKTOP = 24;
 
