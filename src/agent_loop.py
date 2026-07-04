@@ -2297,6 +2297,67 @@ PLAN_MODE_DIRECTIVE = (
 )
 
 
+# Matches only the real `"tool": "<tag>"` keys in a tool_events JSON blob.
+# An occurrence inside a tool's output string is escaped (`\"tool\": ...`), so
+# the backslash before the closing quote makes it fail this pattern — only the
+# genuine unescaped event keys are captured.
+_SESSION_TOOL_KEY_RE = re.compile(r'"tool"\s*:\s*"([a-zA-Z0-9_]+)"')
+
+
+def _session_used_tools(session_id: Optional[str]) -> set:
+    """Tools this session has already invoked, from persisted tool_events.
+
+    Tool selection is otherwise stateless per-turn — a fresh semantic
+    retrieval over just the latest user message. Deep into a file-editing
+    session, a follow-up phrased about the outcome ("make the grid look
+    better") retrieves no file tools, so that turn's prompt loses
+    read_file/edit_file/bash and the model tells the user it "has no file
+    access this turn" and asks them to paste the file. A capability the
+    session has actually exercised must never disappear, so its used tools
+    are unioned back into the selected set every turn.
+
+    Read from the DB: the in-memory `messages` are LLM-formatted and don't
+    reliably carry tool names across turns. tool_events store the tool tag
+    verbatim in a "tool" field; a regex over the raw metadata avoids parsing
+    the (often hundreds of KB) tool-output blobs. Bounded to the most recent
+    assistant turns so a pathological session can't make this unbounded.
+    Best-effort: any failure returns an empty set and the turn proceeds with
+    plain per-turn selection.
+    """
+    if not session_id:
+        return set()
+    try:
+        from core.database import SessionLocal as _SL, ChatMessage as _CM
+    except Exception:
+        return set()
+    used = set()
+    try:
+        _db = _SL()
+        try:
+            rows = (
+                _db.query(_CM.meta_data)
+                .filter(_CM.session_id == session_id, _CM.role == "assistant")
+                .order_by(_CM.timestamp.desc())
+                .limit(200)
+                .all()
+            )
+        finally:
+            _db.close()
+        for (meta,) in rows:
+            if not meta or '"tool"' not in meta:
+                continue
+            used.update(_SESSION_TOOL_KEY_RE.findall(meta))
+    except Exception as _e:
+        logger.debug("session used-tools lookup failed: %s", _e)
+        return set()
+    # Only re-offer names that are real executable tool tags (drops legacy /
+    # MCP-only names like "note" that aren't current tags). TOOL_TAGS — not
+    # TOOL_SECTIONS.keys() — is the universe: grep/glob/ls are valid tags
+    # documented under a shared section, so they have no section key of their
+    # own but must still be allowed to stick.
+    return used & TOOL_TAGS
+
+
 def build_active_plan_note(approved_plan: str) -> str:
     """System note that pins an approved plan during execution.
 
@@ -2767,6 +2828,18 @@ async def stream_agent_loop(
         _is_api_model = False
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
+    # Sticky tools: a capability the session has already used never disappears
+    # on a later turn just because that turn's wording didn't retrieve it.
+    # Union the session's previously-invoked tools into the selected set (minus
+    # anything the user has since disabled). Only when RAG selection is active
+    # (_relevant_tools is not None); the full-prompt fallback already has all
+    # tools. See _session_used_tools for why this is per-turn and DB-sourced.
+    if not guide_only and _relevant_tools is not None:
+        _sticky = _session_used_tools(session_id) - set(disabled_tools or ())
+        if _sticky - _relevant_tools:
+            logger.info(f"[tool-rag] Sticky session tools re-added: {sorted(_sticky - _relevant_tools)}")
+        _relevant_tools |= _sticky
+
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
