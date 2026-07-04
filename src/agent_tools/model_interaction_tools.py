@@ -124,6 +124,10 @@ _SUBAGENT_TIMEOUT_S = 240                     # wall-clock cap per sub-agent
 _SUBAGENT_RESULT_CAP = 30000                  # max chars of result delivered (the
                                               # parent sees this verbatim — keep it
                                               # generous so answers aren't truncated)
+_SUBAGENT_MAX_TOKENS = 12000                  # per-round output cap. The loop default
+                                              # (4096) cut long final summaries off
+                                              # mid-word; sized to cover the char cap
+                                              # above (~2.5 dense chars/token).
 # Tools a sub-agent may NOT use: anything that would spawn/orchestrate more
 # agents (recursion) or reach into other chats.
 _SUBAGENT_DISABLED = frozenset({
@@ -270,6 +274,8 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                 session_id=None,                        # ephemeral — not persisted
                 disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
                 max_rounds=_SUBAGENT_MAX_ROUNDS,
+                max_tokens=_SUBAGENT_MAX_TOKENS,         # the default 4096 truncated
+                                                         # long final summaries mid-word
                 fallbacks=_fallbacks,
             ):
                 # Capture a real upstream failure (e.g. 429 rate-limit / spend cap)
