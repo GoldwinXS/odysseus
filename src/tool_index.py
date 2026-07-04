@@ -42,6 +42,12 @@ ALWAYS_AVAILABLE = frozenset({
     "ask_user",
     # Write back to the active plan (tick steps done / revise) during execution.
     "update_plan",
+    # Dispatching a background sub-agent can follow any message ("have an agent
+    # do X while we keep talking"), and RAG phrasing-matching was unreliable for
+    # it (models asked for a "dispatch/background agent" and never got the tool).
+    # Kept always-on so sub-agents are reliably reachable; it's one extra tool
+    # per turn. depth-1/no-recursion still blocks a sub-agent from getting it.
+    "spawn_agent",
 })
 
 # Tools that the Personal Assistant always has access to during scheduled
