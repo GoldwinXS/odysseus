@@ -429,6 +429,22 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     return true;
   }
 
+  // Auto-resume: after a background sub-agent delivers its result, hand the MAIN
+  // agent a turn to react to it — the "agent gets its turn back when the sub-agent
+  // finishes" behavior. Reuses the normal send path (so it works for EVERY model),
+  // with the user bubble hidden. Guarded so it never clobbers a draft or interrupts
+  // an in-flight turn; the prompt discourages re-spawning (loop guard).
+  const SUBAGENT_RESUME_PROMPT = 'The background sub-agent you dispatched has finished — its result is in the message directly above. Review it, incorporate the findings, and continue: give me the outcome or the next step. Do not dispatch another sub-agent unless it is genuinely necessary.';
+  export function autoResumeAfterSubagent() {
+    try {
+      if (isStreaming || _sendInFlight) return false;   // a turn is already running
+      const input = uiModule.el('message');
+      if (input && input.value.trim()) return false;    // don't overwrite the user's draft
+      _hideUserBubble = true;                            // hide the auto-continue user bubble
+      return _setComposerAndSend(SUBAGENT_RESUME_PROMPT);
+    } catch (_) { return false; }
+  }
+
   function _sendQueuedWhenIdle(item) {
     if (!item) return;
     const trySend = () => {
@@ -5193,6 +5209,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   const chatModule = {
     init,
     initListeners,
+    autoResumeAfterSubagent,
     openAttachment,
     addMessage: chatRenderer.addMessage,
     displayMetrics: chatRenderer.displayMetrics,

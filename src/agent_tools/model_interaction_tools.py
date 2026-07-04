@@ -121,6 +121,9 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
 _SUBAGENT_SEMAPHORE = asyncio.Semaphore(3)   # max concurrent sub-agents
 _SUBAGENT_MAX_ROUNDS = 12                     # tool-loop rounds per sub-agent
 _SUBAGENT_TIMEOUT_S = 240                     # wall-clock cap per sub-agent
+_SUBAGENT_RESULT_CAP = 30000                  # max chars of result delivered (the
+                                              # parent sees this verbatim — keep it
+                                              # generous so answers aren't truncated)
 # Tools a sub-agent may NOT use: anything that would spawn/orchestrate more
 # agents (recursion) or reach into other chats.
 _SUBAGENT_DISABLED = frozenset({
@@ -304,7 +307,7 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
             # Deliver whatever it produced before cancellation, then propagate so
             # the run manager records it as stopped/error and cleans up.
             if deliver:
-                _deliver(error="Sub-agent was cancelled", partial="".join(collected).strip()[:8000])
+                _deliver(error="Sub-agent was cancelled", partial="".join(collected).strip()[:_SUBAGENT_RESULT_CAP])
             raise
         except Exception as e:
             logger.error(f"spawn_agent run failed: {e}")
@@ -315,8 +318,11 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         # it so the real reason (captured below) surfaces instead.
         if result == "The model returned an empty response. Please try again or switch to a different model.":
             result = ""
-        if len(result) > 8000:
-            result = result[:8000] + "\n... (truncated)"
+        # Cap generously so the PARENT model receives the sub-agent's FULL answer
+        # (the delivered message IS the parent's context on auto-resume); only
+        # genuinely huge outputs get trimmed, with a clear marker.
+        if len(result) > _SUBAGENT_RESULT_CAP:
+            result = result[:_SUBAGENT_RESULT_CAP] + f"\n\n… [sub-agent result truncated at {_SUBAGENT_RESULT_CAP} chars]"
         # Informative fallback when the model wrote no final answer — otherwise the
         # user just sees "(no text output)" with no idea why (the #1 bizarre case).
         if not result and not error:

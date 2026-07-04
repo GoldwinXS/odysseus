@@ -159,6 +159,7 @@ function _renderHistoryMessage(msg, modelName) {
       trimmed === 'Continue where you left off' ||
       trimmed.startsWith('Your message was cut off.') ||
       trimmed.startsWith('Your previous response was interrupted.') ||
+      trimmed.startsWith('The background sub-agent you dispatched has finished') ||
       displayContent.includes('[Instruction: Rewrite') ||
       displayContent.includes('[Instruction: Explain')
     ) {
@@ -2552,8 +2553,21 @@ function _startSubagentPolling() {
 
     if (sawCompletion) {
       if (currentSessionId === sid) {
-        // Viewing the session — reload history so the delivered message renders.
+        // Viewing the session — reload history so the delivered message renders,
+        // then hand the main agent a turn to react to it (auto-resume). The turn
+        // that just spawned takes a moment to fully settle (isStreaming), so
+        // RETRY until autoResume actually fires (it returns false while a turn is
+        // in flight or the user is mid-draft) — otherwise a brief settling window
+        // silently swallows the auto-resume.
         selectSession(sid);
+        var _arTries = 0;
+        var _tryAutoResume = function() {
+          if (currentSessionId !== sid) return;
+          if (window.chatModule && window.chatModule.autoResumeAfterSubagent &&
+              window.chatModule.autoResumeAfterSubagent()) return;   // fired
+          if (++_arTries < 8) setTimeout(_tryAutoResume, 1000);
+        };
+        setTimeout(_tryAutoResume, 900);
       } else {
         // User moved on — pulse the sidebar so they notice the result.
         markStreamComplete(sid);
