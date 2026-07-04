@@ -112,6 +112,32 @@ function _historyUrl(id, { limit = null, offset = null } = {}) {
 
 function _renderHistoryMessage(msg, modelName) {
   const meta = msg.metadata ? { ...msg.metadata, _fromHistory: true } : null;
+  // Tool-heavy assistant turns: rebuild the compact agent thread (round
+  // texts + lazy collapsed tool chips) via chatRenderer.addMessage — the
+  // same renderer used when a live stream completes — instead of pushing
+  // the concatenated content blob through the markdown pipeline. A
+  // 150-tool turn is ~200 KB of markdown full of code fences; rendering
+  // it flat (plus syntax-highlighting every fence) is what froze the tab
+  // when reloading heavy agentic chats. Returns the array of appended
+  // nodes (a thread renders as several siblings, not one .msg).
+  if (
+    msg.role === 'assistant' &&
+    meta && Array.isArray(meta.tool_events) && meta.tool_events.length &&
+    Array.isArray(meta.round_texts) && meta.round_texts.length &&
+    chatRenderer.addMessage
+  ) {
+    const boxEl = document.getElementById('chat-history');
+    if (boxEl) {
+      try {
+        const before = boxEl.childElementCount;
+        chatRenderer.addMessage('assistant', msg.content, modelName, meta);
+        const appended = Array.prototype.slice.call(boxEl.children, before);
+        if (appended.length) return appended;
+      } catch (e) {
+        console.warn('Agent-thread history render failed; falling back to flat render:', e);
+      }
+    }
+  }
   let displayContent;
   if (typeof msg.content === 'string') {
     displayContent = _displayHistoryContent(msg.content);
@@ -233,7 +259,10 @@ function _installHistoryPager(id, pageInfo, modelName) {
       for (const msg of data.history || []) {
         if (msg.role !== 'user' && msg.role !== 'assistant') continue;
         const el = _renderHistoryMessage(msg, _historyPager.modelName);
-        if (el) newEls.push(el);
+        // Agent-thread turns come back as an array of sibling nodes
+        // (text bubbles + chip threads) — insert each in order.
+        if (Array.isArray(el)) newEls.push(...el);
+        else if (el) newEls.push(el);
       }
       for (const el of newEls) {
         box.insertBefore(el, anchor || box.firstChild);
@@ -1672,7 +1701,13 @@ export async function loadSessions() {
         savedId = null;
       }
     }
-    const hasPendingChat = !!_pendingChat;
+    // Only a USER-picked pending chat blocks auto-select. Speculative
+    // fallbacks (auto: true, set by updateModelPicker so the label isn't
+    // stuck on "Select model") must not — otherwise whenever the model
+    // cache resolves before this fetch, the reload skips the hash /
+    // lastSessionId the user was returning to and lands on an empty New
+    // Chat with an arbitrary first-listed model.
+    const hasPendingChat = !!(_pendingChat && !_pendingChat.auto);
     let targetId = null;
     if (hasPendingChat) {
       // A model was picked and the UI is showing a fresh New Chat, but the
@@ -2221,7 +2256,10 @@ export async function materializePendingSession() {
   return true;
 }
 
-export function hasPendingChat() { return !!_pendingChat; }
+// Auto (speculative) pending chats are a picker-label placeholder only —
+// they must not materialize a session on send or when attaching documents.
+// Callers that need the raw object (the picker itself) use getPendingChat.
+export function hasPendingChat() { return !!(_pendingChat && !_pendingChat.auto); }
 export function getPendingChat() { return _pendingChat; }
 // Getters for external access
 export function getCurrentSessionId() {

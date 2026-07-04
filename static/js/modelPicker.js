@@ -103,6 +103,13 @@ function _firstAvailableModel() {
       url: item.url,
       modelId: models[0],
       endpointId: item.endpoint_id || '',
+      // Speculative UI fallback, not a user choice. Auto pending-chats keep
+      // the picker label usable but must never block session auto-select or
+      // materialize a session on send — otherwise an init race (model cache
+      // resolving before the session list) hijacks a reload that was headed
+      // back to the user's last chat and strands them on a phantom New Chat
+      // with an arbitrary first-listed model.
+      auto: true,
     };
   }
   return null;
@@ -135,6 +142,7 @@ async function _ensureDefaultPendingChat() {
         url: dc.endpoint_url,
         modelId: dc.model,
         endpointId: dc.endpoint_id || '',
+        auto: true, // speculative default, not a user pick — see _firstAvailableModel
       });
       try { window.__odysseusDefaultChat = dc; } catch (_) {}
       updateModelPicker();
@@ -789,7 +797,9 @@ export function updateModelPicker() {
       const fallback = items.find(item => !item.offline && (item.models || []).length > 0);
       if (fallback) {
         modelId = fallback.models[0];
-        _deps.setPendingChat({ url: fallback.url, modelId, endpointId: fallback.endpoint_id });
+        // Substituting for a vanished model — preserve whether the original
+        // pending chat was a real user pick or a speculative auto fallback.
+        _deps.setPendingChat({ url: fallback.url, modelId, endpointId: fallback.endpoint_id, auto: !!_pendingChat.auto });
       }
     }
   }
