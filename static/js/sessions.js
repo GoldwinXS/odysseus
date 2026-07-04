@@ -320,6 +320,13 @@ const _streamingSessions = new Set();   // Background chat streams (not polled a
 const _completedSessions = new Set();   // Sessions with completed background streams
 let _researchPollTimer = null;
 
+// Background sub-agent tracking (spawn_agent runs detached; result is delivered
+// into the session on completion). _subagentSessions drives the "running" dot;
+// _subagentSeen de-dupes completions this client already handled.
+const _subagentSessions = new Set();
+const _subagentSeen = new Set();
+let _subagentPollTimer = null;
+
 // Session list keyboard navigation state
 let _sessionListFocused = false;
 
@@ -2097,6 +2104,8 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     }
     // Check server for active stream (survives page refresh)
     _checkServerStream(id);
+    // Ensure the background sub-agent poller is running for this (and future) sessions.
+    _startSubagentPolling();
     // Document panel: keep open if next session also wants it, otherwise close
     if (window.documentModule) {
       const docBtn = document.getElementById('overflow-doc-btn');
@@ -2412,7 +2421,7 @@ window.addEventListener('hashchange', () => {
 function _updateResearchDots() {
   document.querySelectorAll('.session-star[data-session-id]').forEach(function(star) {
     var sid = star.dataset.sessionId;
-    var isRunning = _researchingSessions.has(sid) || _streamingSessions.has(sid);
+    var isRunning = _researchingSessions.has(sid) || _streamingSessions.has(sid) || _subagentSessions.has(sid);
     var isCompleted = _completedSessions.has(sid) && !isRunning;
     var listItem = star.closest('.list-item');
     star.classList.toggle('processing', isRunning);
@@ -2460,6 +2469,140 @@ export function markResearching(sessionId) {
   _updateResearchDots();
   _updateRailNotifs();
   _startResearchPolling();
+}
+
+// ── Background sub-agent polling ──
+// A single persistent poller for the CURRENTLY-open session. Sub-agents deliver
+// their result as a saved message, so all this does is: (a) light the running
+// dot while one is active, and (b) reload history (or pulse the sidebar) once a
+// result lands, so the user doesn't have to manually refresh. Cheap endpoint,
+// skipped while the tab is hidden.
+function _startSubagentPolling() {
+  if (_subagentPollTimer) return;
+  _subagentPollTimer = setInterval(async function() {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    const sid = currentSessionId;
+    if (!sid) return;
+    let data;
+    try {
+      const res = await fetch(`${API_BASE}/api/subagent-updates?session=${encodeURIComponent(sid)}`);
+      if (!res.ok) {
+        if (_subagentSessions.delete(sid)) _updateResearchDots();
+        return;
+      }
+      data = await res.json();
+    } catch (e) {
+      return;
+    }
+
+    const updates = (data && data.updates) || [];
+    const active = (data && data.active) || 0;
+    const serverNow = (data && data.now) || (Date.now() / 1000);
+
+    // Running dot reflects server truth for this session.
+    if (active > 0) {
+      if (!_subagentSessions.has(sid)) { _subagentSessions.add(sid); _updateResearchDots(); }
+    } else if (_subagentSessions.delete(sid)) {
+      _updateResearchDots();
+    }
+
+    // Live visibility panel: what's running right now, for how long, + a kill switch.
+    _renderSubagentPanel(sid, updates.filter(u => u && u.status === 'running'), serverNow);
+
+    // Handle each freshly-finished sub-agent exactly once.
+    let sawCompletion = false;
+    for (const u of updates) {
+      if (!u || u.status === 'running') continue;
+      if (_subagentSeen.has(u.id)) continue;
+      // Don't consume a completion while a foreground stream is rendering into
+      // this session — a history reload would clobber it. Leave it unseen so the
+      // next tick (after the stream ends) picks it up.
+      if (window.chatModule && window.chatModule.hasActiveStream && window.chatModule.hasActiveStream(sid)) {
+        continue;
+      }
+      _subagentSeen.add(u.id);
+      sawCompletion = true;
+    }
+
+    if (sawCompletion) {
+      if (currentSessionId === sid) {
+        // Viewing the session — reload history so the delivered message renders.
+        selectSession(sid);
+      } else {
+        // User moved on — pulse the sidebar so they notice the result.
+        markStreamComplete(sid);
+      }
+    }
+  }, 3000);
+}
+
+function _fmtElapsed(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + 's';
+  return Math.floor(sec / 60) + 'm ' + String(sec % 60).padStart(2, '0') + 's';
+}
+
+// Floating "Background agents" panel — the visibility + kill switch. Rebuilt each
+// poll tick from server truth so elapsed time ticks and finished agents drop off.
+// Rows near the 240s wall-clock cap turn amber so a stuck/runaway agent stands out.
+function _renderSubagentPanel(sid, running, serverNow) {
+  let panel = document.getElementById('subagent-panel');
+  if (!running || running.length === 0) {
+    if (panel) panel.remove();
+    return;
+  }
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'subagent-panel';
+    panel.style.cssText = [
+      'position:fixed', 'right:16px', 'bottom:16px', 'z-index:9998',
+      'max-width:320px', 'background:var(--bg-elevated,#1e1e24)',
+      'color:var(--text-primary,#e8e8ea)', 'border:1px solid var(--border,#3a3a42)',
+      'border-radius:10px', 'box-shadow:0 6px 24px rgba(0,0,0,.35)',
+      'font-size:12px', 'padding:10px 12px', 'pointer-events:auto',
+    ].join(';');
+    document.body.appendChild(panel);
+  }
+  // Spinning gear SVG (no emoji per house style).
+  const spin = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:sa-spin 1.4s linear infinite;flex:0 0 auto"><circle cx="12" cy="12" r="9" opacity=".25"/><path d="M21 12a9 9 0 0 0-9-9"/></svg>';
+  const esc = (uiModule && uiModule.esc) ? uiModule.esc : (s => String(s));
+  const rows = running.map(u => {
+    const elapsed = serverNow - u.started_at;
+    const warn = elapsed >= 180;   // approaching the 240s wall-clock cap
+    const model = esc(u.model || 'sub-agent');
+    const summ = u.summary ? `<div style="opacity:.6;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px">${esc(u.summary)}</div>` : '';
+    return `<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0">
+      <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
+        ${spin}
+        <div style="min-width:0">
+          <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px">${model}
+            <span style="color:${warn ? 'var(--color-warning,#e0a03a)' : 'var(--text-secondary,#9a9aa2)'};font-variant-numeric:tabular-nums"> · ${_fmtElapsed(elapsed)}</span>
+          </div>${summ}
+        </div>
+      </div>
+      <button data-sa-stop="${esc(u.id)}" title="Stop this sub-agent"
+        style="flex:0 0 auto;background:transparent;border:1px solid var(--border,#3a3a42);color:var(--text-secondary,#9a9aa2);border-radius:6px;padding:2px 7px;cursor:pointer;font-size:11px">Stop</button>
+    </div>`;
+  }).join('');
+  panel.innerHTML = `<style>@keyframes sa-spin{to{transform:rotate(360deg)}}</style>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <span style="font-weight:600">Background agents (${running.length})</span>
+    </div>${rows}`;
+  panel.querySelectorAll('[data-sa-stop]').forEach(btn => {
+    btn.addEventListener('click', () => _stopSubagent(sid, btn.getAttribute('data-sa-stop'), btn));
+  });
+}
+
+async function _stopSubagent(sid, id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; btn.style.opacity = '.6'; }
+  try {
+    const body = new URLSearchParams({ session: sid, id: id });
+    await fetch(`${API_BASE}/api/subagent-stop`, { method: 'POST', body });
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Stop'; btn.style.opacity = ''; }
+  }
+  // The next poll tick reflects the cancellation (row drops off, result/cancel
+  // notice delivered into the chat).
 }
 
 export function clearResearching(sessionId) {

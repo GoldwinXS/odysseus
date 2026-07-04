@@ -130,8 +130,13 @@ _SUBAGENT_DISABLED = frozenset({
 
 
 async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
-    """Spawn a sub-agent that runs a full tool-using agent loop on a task and
-    returns its final result to the caller.
+    """Spawn a sub-agent that runs a full tool-using agent loop on a task IN THE
+    BACKGROUND and reports its result back into this chat when it finishes.
+
+    This returns immediately with an acknowledgement — it does NOT block the
+    current turn. The user (and you) can keep chatting while the sub-agent works;
+    its final result is posted into this session as a new message on completion
+    (or an error/timeout notice if it fails). Do not wait for or poll it.
 
     Content: the task/instructions for the sub-agent. An optional first line
     ``model: <name>`` overrides the model (defaults to this chat's model).
@@ -174,44 +179,111 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
     if not (url and model):
         return {"error": "Could not resolve a model for the sub-agent"}
 
-    collected: list = []
+    # Bind locals for the detached runner — spawn_agent returns before it runs,
+    # so it must not close over anything that could be rebound afterwards.
+    _url, _model, _headers, _owner, _task = url, model, headers, owner, task
+    _parent_session = session_id
+    _summary = _task.splitlines()[0][:120] if _task else ""
 
-    async def _drain():
-        async for chunk in stream_agent_loop(
-            url, model,
-            [{"role": "user", "content": task}],
-            headers=headers,
-            owner=owner,
-            session_id=None,                       # ephemeral — not persisted
-            disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
-            max_rounds=_SUBAGENT_MAX_ROUNDS,
-        ):
-            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
-                try:
-                    d = json.loads(chunk[6:])
-                except Exception:
-                    continue
-                # Accumulate visible answer text only (skip thinking tokens).
-                if "delta" in d and not d.get("thinking"):
-                    collected.append(d["delta"])
+    def _deliver(error: Optional[str], partial: str) -> None:
+        """Post the sub-agent's outcome as an assistant message into the parent
+        session. Persists immediately (add_message -> _persist_message commits),
+        so it renders on reload even if no client is currently connected."""
+        if not _parent_session:
+            return
+        try:
+            from core.models import ChatMessage
+            sm2 = get_session_manager()
+            if not sm2:
+                return
+            sess2 = sm2.get_session(_parent_session)
+            if error:
+                text = f"**Sub-agent failed** ({_model})\n\n{error}"
+                if partial:
+                    text += f"\n\nPartial output before it stopped:\n\n{partial}"
+            else:
+                text = f"**Sub-agent result** ({_model})\n\n" + (
+                    partial or "(sub-agent produced no text output)"
+                )
+            sess2.add_message(ChatMessage("assistant", text, metadata={"model": _model, "subagent": True}))
+        except Exception as e:
+            logger.error(f"spawn_agent delivery failed for session {_parent_session}: {e}")
 
-    try:
-        async with _SUBAGENT_SEMAPHORE:
-            await asyncio.wait_for(_drain(), timeout=_SUBAGENT_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        partial = "".join(collected).strip()
+    async def _run_subagent(deliver: bool) -> Dict:
+        """Run the leaf sub-agent to completion under the guardrails. When
+        ``deliver`` is set (background mode) the result is also posted into the
+        parent session; otherwise it is only returned (synchronous fallback)."""
+        collected: list = []
+
+        async def _drain():
+            async for chunk in stream_agent_loop(
+                _url, _model,
+                [{"role": "user", "content": _task}],
+                headers=_headers,
+                owner=_owner,
+                session_id=None,                        # ephemeral — not persisted
+                disabled_tools=set(_SUBAGENT_DISABLED),  # leaf worker: no recursion
+                max_rounds=_SUBAGENT_MAX_ROUNDS,
+            ):
+                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                    try:
+                        d = json.loads(chunk[6:])
+                    except Exception:
+                        continue
+                    # Accumulate visible answer text only (skip thinking tokens).
+                    if "delta" in d and not d.get("thinking"):
+                        collected.append(d["delta"])
+
+        error = None
+        try:
+            async with _SUBAGENT_SEMAPHORE:
+                await asyncio.wait_for(_drain(), timeout=_SUBAGENT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            error = f"Sub-agent timed out after {_SUBAGENT_TIMEOUT_S}s"
+        except asyncio.CancelledError:
+            # Deliver whatever it produced before cancellation, then propagate so
+            # the run manager records it as stopped/error and cleans up.
+            if deliver:
+                _deliver(error="Sub-agent was cancelled", partial="".join(collected).strip()[:8000])
+            raise
+        except Exception as e:
+            logger.error(f"spawn_agent run failed: {e}")
+            error = f"Sub-agent failed: {e}"
+
+        result = "".join(collected).strip()
+        if len(result) > 8000:
+            result = result[:8000] + "\n... (truncated)"
+        if deliver:
+            _deliver(error=error, partial=result)
+        if error:
+            return {"error": error, "partial_result": result[:4000]}
+        return {"model": _model, "result": result or "(sub-agent produced no text output)"}
+
+    # No parent session to deliver into (e.g. a direct/ephemeral call): fall back
+    # to synchronous execution so the result is still returned to the caller.
+    if not _parent_session:
+        return await _run_subagent(deliver=False)
+
+    # Background mode: register a detached run and return immediately so the main
+    # turn is not blocked. The result is delivered into this session on completion.
+    from src import subagent_runs
+    if not subagent_runs.can_start():
         return {
-            "error": f"Sub-agent timed out after {_SUBAGENT_TIMEOUT_S}s",
-            "partial_result": partial[:4000],
+            "error": (
+                f"Too many sub-agents already running (limit {subagent_runs._MAX_TOTAL}). "
+                "Wait for one to finish before spawning another."
+            )
         }
-    except Exception as e:
-        logger.error(f"spawn_agent failed: {e}")
-        return {"error": f"Sub-agent failed: {e}"}
-
-    result = "".join(collected).strip()
-    if len(result) > 8000:
-        result = result[:8000] + "\n... (truncated)"
-    return {"model": model, "result": result or "(sub-agent produced no text output)"}
+    rec = subagent_runs.start(_parent_session, _summary, _model, lambda: _run_subagent(deliver=True))
+    return {
+        "result": (
+            f"Sub-agent started in the background (id={rec['id']}, model={_model}). It will "
+            "post its result into this chat when it finishes — you do NOT need to wait for it "
+            "or poll it. Continue helping the user; do not re-spawn the same task."
+        ),
+        "background": True,
+        "subagent_id": rec["id"],
+    }
 
 
 async def list_models(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:

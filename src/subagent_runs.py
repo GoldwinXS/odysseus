@@ -1,0 +1,170 @@
+"""Background sub-agent run manager.
+
+``spawn_agent`` (src/agent_tools/model_interaction_tools.py) runs a sub-agent to
+completion in a DETACHED asyncio task so the main chat turn returns immediately —
+the user keeps chatting with the main agent while the sub-agent works. When the
+sub-agent finishes, its result is delivered as a message INTO the parent session
+(so it persists and renders on reload) AND recorded here as a per-session
+"pending update" that the frontend polls via ``GET /api/subagent-updates``.
+
+Why server-side state (not just a client flag): a browser that loads mid-run, or
+a second browser on the same account, still needs to learn that a sub-agent is
+active / has just produced a result. The client only holds a *seen* set for
+de-duping; the source of truth lives here.
+
+Safety (a runaway background task once leaked ~20GB and froze the machine): a
+GLOBAL cap on concurrently-tracked sub-agents (``_MAX_TOTAL``) sits on top of the
+``Semaphore(3)`` in model_interaction_tools. The semaphore only *queues* excess
+work; without a hard total cap a runaway main agent could enqueue unbounded
+tasks. depth-1 / no-recursion is enforced separately by the sub-agent's
+disabled-tools set. Records are evicted after a grace window to bound memory.
+
+Durability scope: in-memory, survives as long as the server process runs. It does
+NOT survive a server restart (a sub-agent's delivered message does, since that is
+persisted to the DB).
+"""
+import asyncio
+import logging
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Hard ceiling on sub-agents tracked/running at once across ALL sessions. This is
+# the runaway backstop — the per-spawn Semaphore(3) bounds *concurrent* execution,
+# this bounds the total that can be outstanding (running OR queued on the
+# semaphore) so a misbehaving agent can't pile up work without limit.
+_MAX_TOTAL = 6
+
+# How long a finished record (done/error) is retained so a poller that connects
+# late — page reload mid-run, a second browser — still sees the completion once.
+# After this it is evicted to keep _UPDATES from growing without bound.
+_EVICT_GRACE_S = 300
+
+_TASKS: set = set()                     # live asyncio.Tasks (running or queued)
+_UPDATES: Dict[str, List[dict]] = {}    # session_id -> [record, ...]
+_evict_tasks: Dict[str, asyncio.Task] = {}
+_counter = 0
+
+
+def _next_id() -> str:
+    global _counter
+    _counter += 1
+    return f"sub_{_counter}"
+
+
+def can_start() -> bool:
+    """Whether another sub-agent may be started without breaching the total cap."""
+    return len(_TASKS) < _MAX_TOTAL
+
+
+def active_count() -> int:
+    return len(_TASKS)
+
+
+def start(
+    session_id: str,
+    summary: str,
+    model: str,
+    runner: Callable[[], Awaitable[Dict]],
+) -> dict:
+    """Schedule a detached sub-agent.
+
+    ``runner`` is an async callable that runs the sub-agent to completion,
+    delivers its result into the parent session, and returns a dict — either
+    ``{"error": ...}`` or a success payload. This module only tracks status; it
+    does not touch the session (delivery lives with the caller, which owns the
+    session manager and message types).
+    """
+    rec = {
+        "id": _next_id(),
+        "status": "running",
+        "summary": (summary or "")[:200],
+        "model": model or "",
+        "started_at": time.time(),
+        "finished_at": None,
+        "error": None,
+        "_task": None,   # asyncio.Task — internal, never serialized (see get_updates)
+    }
+    _UPDATES.setdefault(session_id, []).append(rec)
+    task = asyncio.create_task(_run(session_id, rec, runner))
+    rec["_task"] = task
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
+    return rec
+
+
+def stop(session_id: str, subagent_id: str) -> bool:
+    """Cancel a still-running background sub-agent. Cancellation propagates into
+    the run (its CancelledError handler delivers a "cancelled" notice into the
+    session) and _run records the final status. Returns True if a running task
+    was found and cancelled."""
+    for rec in _UPDATES.get(session_id, []):
+        if rec["id"] == subagent_id:
+            task = rec.get("_task")
+            if task is not None and not task.done():
+                task.cancel()
+                return True
+            return False
+    return False
+
+
+async def _run(session_id: str, rec: dict, runner: Callable[[], Awaitable[Dict]]) -> None:
+    try:
+        out = await runner()
+        if isinstance(out, dict) and out.get("error"):
+            rec["status"] = "error"
+            rec["error"] = str(out.get("error"))[:1000]
+        else:
+            rec["status"] = "done"
+    except asyncio.CancelledError:
+        rec["status"] = "error"
+        rec["error"] = "Sub-agent was cancelled"
+        raise
+    except Exception as e:
+        logger.error("[subagent] %s failed: %s", rec["id"], e, exc_info=True)
+        rec["status"] = "error"
+        rec["error"] = str(e)[:1000]
+    finally:
+        rec["finished_at"] = time.time()
+        _schedule_evict(session_id, rec)
+
+
+def _schedule_evict(session_id: str, rec: dict) -> None:
+    async def _evict() -> None:
+        try:
+            await asyncio.sleep(_EVICT_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        lst = _UPDATES.get(session_id)
+        if lst and rec in lst:
+            lst.remove(rec)
+            if not lst:
+                _UPDATES.pop(session_id, None)
+        _evict_tasks.pop(rec["id"], None)
+
+    t = asyncio.create_task(_evict())
+    _evict_tasks[rec["id"]] = t
+
+
+def get_updates(session_id: str) -> Dict[str, Any]:
+    """Poll payload for a session: how many sub-agents are still running, and the
+    (running + recently-finished) records the client can render / de-dupe on."""
+    lst = _UPDATES.get(session_id, [])
+    active = sum(1 for r in lst if r["status"] == "running")
+    return {
+        "active": active,
+        "now": time.time(),   # server clock, so the client can show skew-free elapsed
+        "updates": [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "summary": r["summary"],
+                "model": r["model"],
+                "error": r["error"],
+                "started_at": r["started_at"],
+                "finished_at": r["finished_at"],
+            }
+            for r in lst
+        ],
+    }

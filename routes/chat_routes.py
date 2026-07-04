@@ -1488,6 +1488,28 @@ def setup_chat_routes(
         return rec
 
     # ------------------------------------------------------------------ #
+    # GET /api/subagent-updates — poll background sub-agent status/results for a
+    # session. Server-side state (see src/subagent_runs.py) so a browser that
+    # loads mid-run, or a second browser on the same account, still sees that a
+    # sub-agent is active / just finished. Delivered results also land as saved
+    # messages, so this is purely the "is there anything pending" signal.
+    # ------------------------------------------------------------------ #
+    @router.get("/api/subagent-updates")
+    async def subagent_updates(request: Request, session: str = Query(...)) -> Dict[str, Any]:
+        _verify_session_owner(request, session)
+        from src import subagent_runs
+        return subagent_runs.get_updates(session)
+
+    # ------------------------------------------------------------------ #
+    # POST /api/subagent-stop — kill a runaway/unwanted background sub-agent.
+    # ------------------------------------------------------------------ #
+    @router.post("/api/subagent-stop")
+    async def subagent_stop(request: Request, session: str = Form(...), id: str = Form(...)) -> Dict[str, Any]:
+        _verify_session_owner(request, session)
+        from src import subagent_runs
+        return {"stopped": subagent_runs.stop(session, id)}
+
+    # ------------------------------------------------------------------ #
     # POST /api/inject_context
     # ------------------------------------------------------------------ #
     @router.post("/api/inject_context/{session_id}")
