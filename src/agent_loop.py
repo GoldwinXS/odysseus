@@ -3674,6 +3674,7 @@ async def stream_agent_loop(
         # Execute each tool block
         tool_results = []
         tool_result_texts = []  # plain text for native tool role messages
+        round_screenshots = []  # data: URIs from browser screenshots this round
         budget_hit = False
         for i, block in enumerate(tool_blocks):
             # --- Tool budget check ---
@@ -3936,7 +3937,9 @@ async def stream_agent_loop(
             # Forward screenshots from browser tools (base64 images)
             if result.get("images"):
                 img = result["images"][0]
-                tool_output_data["screenshot"] = f"data:{img['mimeType']};base64,{img['data']}"
+                _shot = f"data:{img['mimeType']};base64,{img['data']}"
+                tool_output_data["screenshot"] = _shot  # for the UI bubble
+                round_screenshots.append(_shot)          # for the model's eyes (below)
             # Forward a file-write diff for inline before/after rendering
             if "diff" in result:
                 tool_output_data["diff"] = result["diff"]
@@ -4066,6 +4069,25 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        # Hand browser screenshots to the MODEL, not just the UI. The tool
+        # result text only says "[Screenshot captured]", so without this a
+        # multimodal model takes a screenshot it can never actually see (and
+        # tells the user to paste the image). A `tool` message can't reliably
+        # carry image parts across providers, so attach them to a follow-up
+        # `user` turn as OpenAI-style image_url content — the same multimodal
+        # shape llm_core already normalizes for vision models. Capped so a
+        # burst of screenshots can't blow up the context.
+        if round_screenshots:
+            _shots = round_screenshots[:4]
+            _img_content = [{
+                "type": "text",
+                "text": ("Screenshot(s) captured by the browser tool this turn "
+                         "(what the page actually looks like):"),
+            }]
+            for _uri in _shots:
+                _img_content.append({"type": "image_url", "image_url": {"url": _uri}})
+            messages.append({"role": "user", "content": _img_content})
 
         # Emit agent_step event
         yield (
