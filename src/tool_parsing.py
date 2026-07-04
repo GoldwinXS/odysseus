@@ -13,7 +13,6 @@ import re
 from typing import List, Optional, Tuple
 
 from src.agent_tools import ToolBlock, TOOL_TAGS
-from src.tool_security import BUILTIN_EMAIL_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -1032,14 +1031,19 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
                 continue
             tag, content = call
             if not content:
-                # An empty fence is still an unambiguous call for the email
-                # tools — ```list_email_accounts``` with no body is a shape
-                # local models really emit for no-arg tools. Dispatch with
-                # empty args and let the tool's own validation answer;
-                # silently dropping the call left models concluding email was
-                # broken. Other tags (bash, python, ...) keep skipping: empty
-                # content is nothing to run.
-                if tag in BUILTIN_EMAIL_TOOLS:
+                # An empty fence is still an unambiguous call for JSON-args
+                # tools — ```get_workspace``` / ```list_email_accounts``` with
+                # no body is a shape models really emit for no-arg tools
+                # (GLM-5 does it constantly for get_workspace). Dispatch with
+                # empty args and let the tool's own validation answer; when a
+                # tool does need args the validation error flows back to the
+                # model so it can retry with them. Silently dropping the call
+                # left the model repeating "let me look at the files…" with
+                # nothing happening — and was inconsistent with
+                # _strip_executed_fence, which already removes these fences
+                # from display as if they had run. Code tags (bash, python)
+                # keep skipping: empty content is nothing to run.
+                if tag not in _CODE_FENCE_TAGS:
                     blocks.append(ToolBlock(tag, ""))
                 continue
             # If a code block's content is an <invoke> XML call (some models wrap

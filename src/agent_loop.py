@@ -652,6 +652,10 @@ _API_HOSTS = frozenset([
     "api.perplexity.ai", "api.x.ai",
     "ollama.com", "api.venice.ai", "api.kimi.com",
     "api.githubcopilot.com",
+    # Zhipu GLM — OpenAI-compatible /paas/v4 surface with native tool_calls.
+    # Without this, GLM-5.x on Z.AI fell back to fenced-block prompting and
+    # routinely emitted empty ```get_workspace``` fences / bare intent text.
+    "api.z.ai", "open.bigmodel.cn",
 ])
 _MCP_KEYWORDS = frozenset(["mcp", "browse", "browser", "website", "calendar", "event", "email",
                            "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed"])
@@ -2700,7 +2704,7 @@ async def stream_agent_loop(
         # via vLLM's `--enable-auto-tool-choice`. Belt-and-suspenders
         # with the per-endpoint flag above.
         "minimax", "kimi", "yi-", "phi-3", "phi-4", "command-r",
-        "glm-4", "internlm", "hermes",
+        "glm-4", "glm-5", "internlm", "hermes",
         # deepseek-v2/v3/chat support tools via the cloud API; deepseek-r1
         # (reasoning model) does not — handled by the blocklist below.
         "deepseek-v", "deepseek-chat",

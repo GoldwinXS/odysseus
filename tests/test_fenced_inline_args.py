@@ -78,10 +78,21 @@ def test_empty_email_fence_is_an_executable_call():
     assert [(b.tool_type, b.content) for b in blocks] == [("list_email_accounts", "")]
 
 
-def test_empty_non_email_fence_still_skipped():
-    # Empty bash/python/other fences stay inert: empty content is nothing to run.
-    for tag in ("bash", "python", "manage_memory"):
+def test_empty_code_fence_still_skipped():
+    # Empty bash/python fences stay inert: empty code is nothing to run.
+    for tag in ("bash", "python"):
         assert parse_tool_blocks(f'```{tag}\n```') == []
+
+
+def test_empty_json_args_fence_is_an_executable_call():
+    # ```get_workspace``` with no body is a real shape models emit for no-arg
+    # tools (GLM-5 does it constantly). It must dispatch with empty args —
+    # silently dropping it left the model repeating "let me look at the
+    # files…" with nothing happening. Tools that do need args get their
+    # validation error back so the model can retry with them.
+    for tag in ("get_workspace", "manage_memory"):
+        blocks = parse_tool_blocks(f'```{tag}\n```')
+        assert [(b.tool_type, b.content) for b in blocks] == [(tag, "")]
 
 
 def test_empty_email_fence_is_stripped_from_display():
