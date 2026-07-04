@@ -39533,12 +39533,19 @@ body.theme-frosted .modal {
 }
 .ask-user-option {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+  /* Stack the label above its description. Previously row+wrap+align-center with
+     a rigid min-height let a long description overflow the button and overlap the
+     next option. Column layout lets the box grow to fit both. */
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
   width: 100%;
-  /* Match the height of the free-text input below (.styled-prompt-input). */
+  /* At least as tall as the free-text input (.styled-prompt-input); grows for
+     options that carry a description. `height: auto` is REQUIRED — a <button>
+     otherwise pins itself to min-height and lets the description overflow. */
   min-height: 39px;
+  height: auto;
   text-align: left;
   padding: 9px 12px;
   border: 1px solid var(--border);
