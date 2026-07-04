@@ -145,6 +145,26 @@ async def test_stop_cancels_running_subagent_and_delivers_notice(fake_env, monke
     assert subagent_runs.stop("stop-1", "nope") is False
 
 
+async def test_empty_result_delivers_informative_fallback(fake_env, monkeypatch):
+    # A sub-agent that only makes tool calls and hits the round cap (no final text)
+    # must deliver an INFORMATIVE note, not the bare "(no text output)".
+    async def toolonly_loop(*args, **kwargs):
+        yield _sse({"type": "tool_start", "tool": "read_file"})
+        yield _sse({"type": "tool_output", "tool": "read_file"})
+        yield _sse({"type": "tool_start", "tool": "grep"})
+        yield _sse({"type": "rounds_exhausted"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", toolonly_loop)
+    await mit.spawn_agent("do a thing", session_id="empty-1", owner="u")
+    upd = await _wait_done("empty-1")
+    assert upd["updates"][0]["status"] == "done"
+    assert len(fake_env.messages) == 1
+    content = fake_env.messages[0].content.lower()
+    assert "no text output" not in content
+    assert "round" in content and "tool call" in content  # names tools + round limit
+
+
 async def test_updates_payload_has_server_now(fake_env, monkeypatch):
     upd = subagent_runs.get_updates("whatever")
     assert isinstance(upd.get("now"), float)

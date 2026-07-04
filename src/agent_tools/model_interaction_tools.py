@@ -127,6 +127,21 @@ _SUBAGENT_DISABLED = frozenset({
     "spawn_agent", "create_session", "send_to_session", "list_sessions",
     "manage_session", "pipeline", "chat_with_model", "ask_teacher",
 })
+# Reported back to the dispatcher/user verbatim, so the sub-agent MUST end with a
+# written answer — otherwise a model that spends its whole round budget on tool
+# calls (common with Gemini, which emits no narration between calls) delivers an
+# empty "(no text output)" result. This is the #1 cause of "bizarre" empty/
+# truncated deliveries.
+_SUBAGENT_SYSTEM_PROMPT = (
+    "You are a background sub-agent dispatched to carry out ONE specific task and "
+    "report the result back. Work efficiently — you have a limited number of tool "
+    "rounds. When you have enough to answer (or you are running low on rounds), "
+    "STOP calling tools and write your final answer.\n\n"
+    "CRITICAL: your final written message is the ONLY thing reported back to whoever "
+    "dispatched you. If you end without writing a clear, self-contained summary of "
+    "what you found or did, they receive NOTHING. Always finish with that summary — "
+    "concise but complete, and understandable on its own without your tool history."
+)
 
 
 async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
@@ -228,11 +243,15 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         ``deliver`` is set (background mode) the result is also posted into the
         parent session; otherwise it is only returned (synchronous fallback)."""
         collected: list = []
+        stats = {"tools": 0, "hit_cap": False}
 
         async def _drain():
             async for chunk in stream_agent_loop(
                 _url, _model,
-                [{"role": "user", "content": _task}],
+                [
+                    {"role": "system", "content": _SUBAGENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": _task},
+                ],
                 headers=_headers,
                 owner=_owner,
                 session_id=None,                        # ephemeral — not persisted
@@ -244,6 +263,11 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
                         d = json.loads(chunk[6:])
                     except Exception:
                         continue
+                    _t = d.get("type")
+                    if _t == "tool_start":
+                        stats["tools"] += 1
+                    elif _t == "rounds_exhausted":
+                        stats["hit_cap"] = True
                     # Accumulate visible answer text only (skip thinking tokens).
                     if "delta" in d and not d.get("thinking"):
                         collected.append(d["delta"])
@@ -267,8 +291,24 @@ async def spawn_agent(content: str, session_id: Optional[str] = None, owner: Opt
         result = "".join(collected).strip()
         if len(result) > 8000:
             result = result[:8000] + "\n... (truncated)"
-        logger.info("[subagent-run] finished session=%s deliver=%s error=%r result_len=%d",
-                    _parent_session, deliver, error, len(result))
+        # Informative fallback when the model wrote no final answer — otherwise the
+        # user just sees "(no text output)" with no idea why (the #1 bizarre case).
+        if not result and not error:
+            if stats["hit_cap"]:
+                result = (
+                    f"(The sub-agent ran {stats['tools']} tool call(s) but hit its "
+                    f"{_SUBAGENT_MAX_ROUNDS}-round limit before writing a summary. "
+                    "Try a narrower task, or spawn it with an explicit fast model.)"
+                )
+            elif stats["tools"]:
+                result = (
+                    f"(The sub-agent ran {stats['tools']} tool call(s) but produced no "
+                    "written summary of what it found.)"
+                )
+            else:
+                result = "(The sub-agent produced no output.)"
+        logger.info("[subagent-run] finished session=%s deliver=%s error=%r tools=%d cap=%s result_len=%d",
+                    _parent_session, deliver, error, stats["tools"], stats["hit_cap"], len(result))
         if deliver:
             _deliver(error=error, partial=result)
         if error:
