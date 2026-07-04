@@ -2541,10 +2541,13 @@ function _startSubagentPolling() {
     for (const u of updates) {
       if (!u || u.status === 'running') continue;
       if (_subagentSeen.has(u.id)) continue;
-      // Don't consume a completion while a foreground stream is rendering into
-      // this session — a history reload would clobber it. Leave it unseen so the
-      // next tick (after the stream ends) picks it up.
-      if (window.chatModule && window.chatModule.hasActiveStream && window.chatModule.hasActiveStream(sid)) {
+      // Don't consume a completion while a LIVE foreground turn is streaming into
+      // this session — a history reload would clobber it. Use the aria-busy flag
+      // (true only during an active foreground turn), NOT hasActiveStream: that
+      // also reports stale detached/resuming streams and stays stuck true after a
+      // turn ends, which permanently blocked auto-resume.
+      var _ccEl = document.getElementById('chat-container');
+      if (_ccEl && _ccEl.getAttribute('aria-busy') === 'true') {
         continue;
       }
       _subagentSeen.add(u.id);
