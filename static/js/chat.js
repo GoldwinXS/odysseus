@@ -337,6 +337,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       submitBtn.dataset.phase = 'processing';
       isStreaming = true;
       _setForegroundChatBusy(true);
+      _setComposerPlaceholder(true);
       _startStallWatchdog();
     } else if (state === 'idle') {
       submitBtn.dataset.mode = '';
@@ -344,6 +345,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       submitBtn.classList.remove('recording');
       isStreaming = false;
       _setForegroundChatBusy(false);
+      _setComposerPlaceholder(false);
       _stopStallWatchdog();
       // Defer to global updater which handles mic/newchat/send modes
       if (window._updateSendBtnIcon) {
@@ -429,29 +431,73 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     return true;
   }
 
-  // Auto-resume: after a background sub-agent delivers its result, hand the MAIN
-  // agent a turn to react to it — the "agent gets its turn back when the sub-agent
-  // finishes" behavior. Reuses the normal send path (so it works for EVERY model),
-  // with the user bubble hidden. Guarded so it never clobbers a draft or interrupts
-  // an in-flight turn; the prompt discourages re-spawning (loop guard).
-  const SUBAGENT_RESUME_PROMPT = 'The background sub-agent you dispatched has finished — its result is in the message directly above. Review it, incorporate the findings, and continue: give me the outcome or the next step. Do not dispatch another sub-agent unless it is genuinely necessary.';
-  // `expectedSessionId` MUST be the session the sub-agent belonged to. Auto-resume
-  // only fires when the app is showing EXACTLY that session with no pending "new
-  // chat" — otherwise the normal send path would materialize a fresh default-model
-  // chat (e.g. qwen) or land the turn in the wrong conversation.
-  export function autoResumeAfterSubagent(expectedSessionId) {
+  // NOTE: client-side auto-resume after a sub-agent finishes was REMOVED — the
+  // backend now fires the parent-model reaction itself (mid-turn via the steering
+  // queue when the parent is busy, or a detached turn registered in agent_runs
+  // when idle). The subagent poller (sessions.js) no longer decides or fires a
+  // resume; it just refreshes history / pulses the sidebar so the server-started
+  // turn becomes visible and streams via the existing resume/attach machinery.
+
+  // ── Steering: inject a user message into the LIVE turn ──────────────────
+  // While the agent is streaming, a non-empty composer POSTs to /api/chat/steer
+  // so the text joins the in-flight loop instead of waiting for the next turn.
+  // The server echoes a `steering_injected` SSE event when the loop picks it up
+  // (used by other open clients to render the bubble in order). Optimistic
+  // bubbles rendered here are tracked so that echo doesn't duplicate them.
+  const _optimisticSteers = [];   // recent locally-rendered steer texts (this client)
+
+  // Render a user bubble ABOVE the currently-streaming assistant holder so the
+  // transcript reads user→(continued assistant). Falls back to a plain append
+  // when there's no live holder. Returns the element (or null).
+  function _renderSteerBubble(text) {
     try {
-      if (isStreaming || _sendInFlight) return false;       // a turn is already running
-      // A pending "New Chat" would be materialized (wrong session + default model).
-      if (sessionModule.hasPendingChat && sessionModule.hasPendingChat()) return false;
-      const cur = sessionModule.getCurrentSessionId();
-      if (!cur) return false;                                // no real session in view
-      if (expectedSessionId && cur !== expectedSessionId) return false;  // user navigated away
-      const input = uiModule.el('message');
-      if (input && input.value.trim()) return false;         // don't overwrite the user's draft
-      _hideUserBubble = true;                                 // hide the auto-continue user bubble
-      return _setComposerAndSend(SUBAGENT_RESUME_PROMPT);
-    } catch (_) { return false; }
+      const box = uiModule.el('chat-history');
+      if (!box) return null;
+      const el = addMessage('user', text, null, { _steer: true });
+      // addMessage appends to the bottom; move it just before the live reply
+      // holder so it precedes the assistant's continuation.
+      if (el && currentHolder && currentHolder.parentNode === box && el.parentNode === box) {
+        box.insertBefore(el, currentHolder);
+      }
+      uiModule.scrollHistory();
+      return el;
+    } catch (_) { return null; }
+  }
+
+  // Attempt to steer the live turn. Returns true when the server accepted the
+  // injection (200); false on 409 (no live run), 404 (older server), or any
+  // network error — the caller then falls back to the normal/queue path so the
+  // user's message is never lost.
+  async function _trySteer(sessionId, text) {
+    if (!sessionId || !text) return false;
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/steer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, text }),
+      });
+      if (!res.ok) return false;   // 409 no live run / 404 older server → fall back
+      return true;
+    } catch (_) {
+      return false;                // network error → fall back, don't drop the text
+    }
+  }
+
+  // Update the composer placeholder to advertise mid-turn steering, restoring
+  // it when the turn ends. Minimal + muted (uses the existing placeholder slot).
+  const _DEFAULT_COMPOSER_PLACEHOLDER = 'Message Odysseus…';
+  const _STEER_COMPOSER_PLACEHOLDER = 'Steer the reply — send to add mid-response…';
+  function _setComposerPlaceholder(streaming) {
+    const input = uiModule.el('message');
+    if (!input) return;
+    if (streaming) {
+      if (!input.dataset.basePlaceholder) {
+        input.dataset.basePlaceholder = input.getAttribute('placeholder') || _DEFAULT_COMPOSER_PLACEHOLDER;
+      }
+      input.setAttribute('placeholder', _STEER_COMPOSER_PLACEHOLDER);
+    } else {
+      input.setAttribute('placeholder', input.dataset.basePlaceholder || _DEFAULT_COMPOSER_PLACEHOLDER);
+    }
   }
 
   function _sendQueuedWhenIdle(item) {
@@ -532,7 +578,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       return;
     }
 
-    // If currently streaming, a non-empty composer means "queue this next".
+    // If currently streaming, a non-empty composer first tries to STEER the
+    // live turn (inject the text into the running loop). If the server has no
+    // live run to steer (409 / older-server 404 / network error), fall back to
+    // the previous "queue this next" behavior so the message is never lost.
     // Empty composer keeps the existing Stop behavior.
     if (isStreaming) {
       const queuedInput = uiModule.el('message');
@@ -542,11 +591,31 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           try { uiModule.showError && uiModule.showError('Finish the current response before queueing messages with attachments.'); } catch (_) {}
           return;
         }
-        if (_queueAgentRequest(queuedText)) {
-          queuedInput.value = '';
-          queuedInput.dispatchEvent(new Event('input', { bubbles: true }));
-          if (uiModule.autoResize) uiModule.autoResize(queuedInput);
-        }
+        // Try steering the in-flight turn. Capture the session now — the turn
+        // could end (isStreaming flips) while the POST is in flight; on 200 the
+        // text still joined the live loop, on non-200 we queue instead.
+        const _steerSid = sessionModule.getCurrentSessionId();
+        // Clear the composer immediately for responsiveness. The text is safely
+        // captured in `queuedText`, so whichever path resolves — steer-rendered
+        // or queued — the message is never lost even though the box is now empty.
+        queuedInput.value = '';
+        queuedInput.dispatchEvent(new Event('input', { bubbles: true }));
+        if (uiModule.autoResize) uiModule.autoResize(queuedInput);
+        _trySteer(_steerSid, queuedText).then((accepted) => {
+          if (accepted) {
+            // Render the user's bubble immediately (history is source of truth
+            // on reload). Track the text so the echoed steering_injected SSE
+            // event doesn't render a duplicate.
+            _optimisticSteers.push(queuedText);
+            if (_optimisticSteers.length > 20) _optimisticSteers.shift();
+            _renderSteerBubble(queuedText);
+            return;
+          }
+          // Fall back: queue for after this response (previous behavior).
+          _queueAgentRequest(queuedText);
+        }).catch(() => {
+          _queueAgentRequest(queuedText);
+        });
         return;
       }
       if (fileHandlerModule.isUploading && fileHandlerModule.isUploading()) {
@@ -2169,6 +2238,26 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // Update the model picker to reflect the new model
                 if (sessionModule && sessionModule.updateModelPicker) {
                   sessionModule.updateModelPicker();
+                }
+                continue;
+              } else if (json.type === 'steering_injected') {
+                // The live loop picked up a steered user message. This client
+                // may have already rendered it optimistically (see _trySteer's
+                // success path) — de-dupe on the most recent matching text so we
+                // don't double the bubble. Mainly this renders in-order for a
+                // SECOND open client that didn't do the optimistic insert.
+                // kind:"subagent" is a sub-agent RESULT the server steered into
+                // the live turn (model-facing context, framed as untrusted) —
+                // it is NOT user text and must never render as a user bubble;
+                // the result itself is already shown via the delivered message.
+                if (!_isBg && json.kind !== 'subagent') {
+                  const _steerText = (json.text || '').trim();
+                  const _optIdx = _steerText ? _optimisticSteers.lastIndexOf(_steerText) : -1;
+                  if (_optIdx >= 0) {
+                    _optimisticSteers.splice(_optIdx, 1);   // consume — already shown
+                  } else if (_steerText) {
+                    _renderSteerBubble(_steerText);
+                  }
                 }
                 continue;
               } else if (json.type === 'model_info') {
@@ -5227,7 +5316,6 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   const chatModule = {
     init,
     initListeners,
-    autoResumeAfterSubagent,
     openAttachment,
     addMessage: chatRenderer.addMessage,
     displayMetrics: chatRenderer.displayMetrics,

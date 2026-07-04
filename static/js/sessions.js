@@ -161,6 +161,17 @@ function _renderHistoryMessage(msg, modelName, opts) {
     displayContent = '';
   }
   if (msg.role === 'user') {
+    // Metadata-driven hide FIRST — the source of truth for a hidden prompt is
+    // the persisted marker, not the text. The server-fired sub-agent resume (and
+    // the client's own hidden auto-continue/auto-resume prompts) persist a
+    // hide-bubble flag; keying on it means a hidden prompt stays hidden even if
+    // the server's exact wording differs from the client's old constant. The
+    // text-prefix checks below remain as a fallback for older rows saved before
+    // the marker existed. Tolerant to whichever boolean key the backend chose.
+    if (meta && (meta.hidden || meta.hide_bubble || meta.hide_user_bubble ||
+                 meta.subagent_resume || meta.auto_resume || meta.no_bubble)) {
+      return null;
+    }
     displayContent = _stripUserVisionBlocks(displayContent);
     const trimmed = displayContent.trim();
     if (
@@ -358,45 +369,16 @@ let _researchPollTimer = null;
 const _subagentSessions = new Set();
 const _subagentSeen = new Set();               // LOCAL fast-path de-dupe (per page)
 let _subagentPollTimer = null;
-// Per-session consecutive auto-resume counter. Caps the spawn/finish/resume loop
-// so a down/rate-limited provider (which finishes as `status: error`) can't drive
-// an unbounded token-burning cycle. Reset to 0 on any manual user send.
-const _autoResumeCount = new Map();            // session_id -> consecutive auto-resumes
-const _SUBAGENT_AUTO_RESUME_CAP = 3;
 
-// Consume auto-resume budget for a session, returning false when the cap is hit.
-// A manual user send calls resetSubagentAutoResume() to clear the counter.
-function _canAutoResume(sid) {
-  return (_autoResumeCount.get(sid) || 0) < _SUBAGENT_AUTO_RESUME_CAP;
-}
-function _noteAutoResume(sid) {
-  _autoResumeCount.set(sid, (_autoResumeCount.get(sid) || 0) + 1);
-}
-export function resetSubagentAutoResume(sid) {
-  if (sid) _autoResumeCount.delete(sid);
-  else _autoResumeCount.clear();
-}
-
-// POST an ack so a completion fires auto-resume exactly once across reloads and
-// devices (server keeps records ~300s; the local _subagentSeen set only covers
-// this page). First caller wins: the returned `acked` list contains only ids
-// this call newly claimed. Falls back to the local set if the endpoint is
-// unavailable (older server), so behavior degrades to the previous per-page one.
-async function _ackSubagentRuns(sid, runIds) {
-  if (!runIds || !runIds.length) return [];
-  try {
-    const res = await fetch(`${API_BASE}/api/subagent/ack`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sid, run_ids: runIds }),
-    });
-    if (!res.ok) return runIds.slice();   // endpoint missing/failed → local fast-path wins
-    const data = await res.json();
-    return Array.isArray(data && data.acked) ? data.acked : [];
-  } catch (_) {
-    return runIds.slice();                // network error → don't lose the resume
-  }
-}
+// Sub-agent auto-resume is now SERVER-DRIVEN: the backend fires the parent-model
+// reaction when a sub-agent finishes (injecting via the steering queue when the
+// parent is busy, or starting a detached turn — registered in agent_runs — when
+// idle). The client no longer decides or fires resumes, so the per-page ack /
+// consecutive-resume-cap machinery is gone (the cap now lives server-side).
+// resetSubagentAutoResume is retained as an exported no-op: chat.js still calls
+// it on manual sends, and keeping a harmless stub avoids a hard dependency on
+// deploy ordering between the two files.
+export function resetSubagentAutoResume(_sid) { /* no-op: cap lives server-side now */ }
 
 // Session list keyboard navigation state
 let _sessionListFocused = false;
@@ -1969,8 +1951,9 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     if (msgInput) {
       msgInput.disabled = false;
       // Preserve the user's draft when the poller re-selects the CURRENT session
-      // (auto-resume after a sub-agent). Wiping it here would race, and lose,
-      // the draft check in autoResumeAfterSubagent 900ms later.
+      // (a sub-agent result landed and we refresh history in place). Wiping it
+      // here would clobber whatever the user is typing — including a message
+      // they're composing to steer the live turn.
       if (!(preserveComposer && prevSessionId === id)) {
         msgInput.value = '';
         msgInput.style.height = '';
@@ -2622,18 +2605,19 @@ function _startSubagentPolling() {
       return;   // a foreground turn owns the view — try again next tick
     }
 
-    // Freshly-finished sub-agents this page hasn't handled yet. Split success
-    // from failure: only successes are eligible for auto-resume ("review and
-    // continue"). A provider that's down/rate-limited finishes as `error`;
-    // resuming on those would drive an unbounded spawn/fail/resume token loop.
+    // Freshly-finished sub-agents this page hasn't handled yet. The server now
+    // fires the parent-model reaction itself (mid-turn via the steering queue if
+    // the parent is busy, or a detached turn — registered in agent_runs — when
+    // idle), so the client NEVER auto-resumes. All this loop does with a
+    // completion is: pulse the sidebar (if the user moved on) or refresh history
+    // (if viewing) so the delivered message and any server-started resume turn
+    // become visible; the existing resume/attach machinery streams the latter.
     let sawCompletion = false;
-    const okRunIds = [];   // done runs eligible to ack + auto-resume
     for (const u of updates) {
       if (!u || u.status === 'running') continue;
       if (_subagentSeen.has(u.id)) continue;
       _subagentSeen.add(u.id);   // local fast-path de-dupe
       sawCompletion = true;
-      if (u.status !== 'error' && !u.acked) okRunIds.push(u.id);
     }
 
     if (!sawCompletion) return;
@@ -2646,36 +2630,12 @@ function _startSubagentPolling() {
 
     // Viewing the session — reload history so the delivered message (result OR
     // failure notice) renders. Result messages are persisted server-side, so we
-    // refresh regardless of ack/auto-resume state. preserveComposer keeps the
-    // user's draft when re-selecting the current session (auto-resume's own
-    // draft check runs 900ms later).
+    // refresh regardless of state. preserveComposer keeps the user's draft when
+    // re-selecting the current session. selectSession re-checks the server for
+    // an active stream, so a server-started detached resume turn attaches and
+    // streams via the existing machinery. The `server_resume` flag on the
+    // payload (when present) simply confirms this — no client action needed.
     selectSession(sid, { preserveComposer: true });
-
-    if (!okRunIds.length) return;   // only failures — render them, don't resume
-
-    // Claim these completions server-side so the resume fires exactly once
-    // across reloads / a second device. Only ids THIS call newly acked (first
-    // caller wins) may drive auto-resume.
-    const acked = await _ackSubagentRuns(sid, okRunIds);
-    if (!acked.length) return;
-    if (currentSessionId !== sid) return;   // user navigated during the ack
-    if (!_canAutoResume(sid)) return;       // cap hit — a manual send resets it
-
-    // The just-spawned turn takes a moment to settle (isStreaming), so RETRY
-    // until autoResume actually fires (it returns false while a turn is in
-    // flight or the user is mid-draft) — otherwise a brief settling window
-    // silently swallows the auto-resume.
-    var _arTries = 0;
-    var _tryAutoResume = function() {
-      if (currentSessionId !== sid) return;   // user navigated away — abandon
-      // Pass the sub-agent's session id so auto-resume refuses to fire into a
-      // different / pending chat (guards against the "turn moved to a new qwen
-      // chat" bug).
-      if (window.chatModule && window.chatModule.autoResumeAfterSubagent &&
-          window.chatModule.autoResumeAfterSubagent(sid)) { _noteAutoResume(sid); return; }
-      if (++_arTries < 8) setTimeout(_tryAutoResume, 1000);
-    };
-    setTimeout(_tryAutoResume, 900);
   }, 3000);
 }
 
