@@ -148,6 +148,16 @@ def _resolve_model(spec: str, owner: Optional[str] = None) -> Tuple[str, str, Di
                 except Exception:
                     model_ids = []
 
+                # Admin-pinned model ids may not appear in the provider's
+                # /v1/models — e.g. OpenAI does not list gpt-image-1 / dall-e-3
+                # there. Fold them in so pinned image (and other) models resolve.
+                try:
+                    for pm in json.loads(ep.pinned_models or "[]"):
+                        if pm and pm not in model_ids:
+                            model_ids.append(pm)
+                except Exception:
+                    pass
+
                 # Exact match first
                 for mid in model_ids:
                     if mid.lower() == model_name.lower():

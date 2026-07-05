@@ -886,29 +886,19 @@ async function initImageSettings() {
   try {
     const modelsRes = await fetch('/api/models', { credentials: 'same-origin' });
     const modelsData = await modelsRes.json();
-    // Inpaint-compat allowlist — image gen here is scoped to inpainting only,
-    // so DALL-E / GPT-Image-1 (no inpaint API) are excluded. Currently:
-    //   - any model with 'inpaint' in the id
-    //   - Stable Diffusion 3.5 Medium (inpaint via diffusers pipeline)
-    const _isInpaintModel = (mid) => {
-      const lower = String(mid || '').toLowerCase();
-      return lower.includes('inpaint')
-        || lower.includes('3.5-medium')
-        || lower.includes('3-5-medium')
-        || lower.includes('sd-3.5-med');
-    };
+    // List every model served by an image-type endpoint — local diffusion
+    // (SDXL, etc.) AND cloud (gpt-image-1, dall-e-3), which are pinned so they
+    // appear even though OpenAI omits image models from /v1/models. The old
+    // build scoped this to an inpaint-only allowlist, which hid the actual
+    // generation models (including gpt-image-1 and plain SDXL).
     const imageModels = [];
     (modelsData.items || []).forEach(item => {
-      (item.models || []).forEach(mid => {
-        if (_isInpaintModel(mid)) imageModels.push(mid);
+      if ((item.model_type || 'llm') !== 'image') return;
+      [...(item.models || []), ...(item.models_extra || [])].forEach(mid => {
+        if (mid && !imageModels.includes(mid)) imageModels.push(mid);
       });
     });
     sortModelIds(imageModels).forEach(mid => { const opt = document.createElement('option'); opt.value = mid; opt.textContent = mid; modelSel.appendChild(opt); });
-    // Hardcoded fallbacks shown as "(not detected)" so users know what to
-    // download/serve to enable inpaint here.
-    ['stable-diffusion-3.5-medium', 'stable-diffusion-inpainting'].forEach(mid => {
-      if (!imageModels.includes(mid)) { const opt = document.createElement('option'); opt.value = mid; opt.textContent = mid + ' (not detected)'; modelSel.appendChild(opt); }
-    });
   } catch (e) { console.warn('Failed to load models for image settings', e); }
   try {
     const settingsRes = await fetch('/api/auth/settings', { credentials: 'same-origin' });
