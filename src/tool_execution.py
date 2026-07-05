@@ -552,8 +552,15 @@ async def _direct_fallback(
         if tool in TOOL_HANDLERS:
             return await TOOL_HANDLERS[tool](content, ctx)
 
+    except asyncio.CancelledError:
+        # Never swallow a cancel — let it propagate for teardown.
+        raise
     except Exception as e:
-        return {"error": f"{tool}: {e}", "exit_code": 1}
+        # Include the exception TYPE and log the traceback. `str(e)` alone is
+        # empty for a bare KeyError/AttributeError, which surfaced as "bash: "
+        # with no cause — the model (and user) got a mystery blank error.
+        logger.exception("Tool handler raised in _direct_fallback for tool=%s", tool)
+        return {"error": f"{tool} failed: {type(e).__name__}: {e}", "exit_code": 1}
 
     return None
 
@@ -604,6 +611,22 @@ async def execute_tool_block(
             relevant_tools=relevant_tools,
         )
         return output
+    except asyncio.CancelledError:
+        # A cancel (sub-agent stop / turn timeout) must propagate so the caller
+        # can tear the tool task down — never turn it into a tool result.
+        raise
+    except Exception as e:
+        # A handler that raised previously re-raised all the way out of
+        # stream_agent_loop, killing the SSE stream with no `event: error`
+        # (the #1 "turn silently died" complaint). Convert it into a tool
+        # result the MODEL sees, so it can recover next round instead of the
+        # user getting a dead/blank stream.
+        _tool = getattr(block, "tool_type", "tool")
+        logger.exception("Tool handler raised for tool=%s — surfacing as tool error", _tool)
+        return (
+            f"{_tool}: failed",
+            {"error": f"{_tool} failed: {type(e).__name__}: {e}", "exit_code": 1},
+        )
     finally:
         _active_workspace.reset(token)
 

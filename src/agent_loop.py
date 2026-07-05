@@ -8,6 +8,7 @@ The LLM decides when to use tools by writing fenced code blocks.
 
 import asyncio
 import collections
+import difflib
 import json
 import re
 import time
@@ -485,7 +486,7 @@ If `dtend` omitted, defaults to dtstart+1h (or +1d when `all_day: true`). \
 For a RECURRING event pass `rrule` as an iCalendar RRULE string, e.g. `"FREQ=WEEKLY;BYDAY=MO"` (every Monday), `"FREQ=DAILY;COUNT=10"`, or `"FREQ=MONTHLY;BYMONTHDAY=1"` — create ONE event with the rrule, do not loop creating many events. Do not pass `rrule` for "next Wednesday only", "just this once", or any single occurrence. \
 If the user asks for a reminder/alarm before the event, pass `reminder_minutes` as an integer; do not write reminder text into the event description and do NOT also call `manage_notes` for the same reminder because calendar reminders are routed through Notes automatically. \
 `calendar` accepts a name ("Main") or short-id prefix.""",
-    "spawn_agent": "- ```spawn_agent``` — Spawn/dispatch a sub-agent that runs a full tool-using loop on a self-contained task IN THE BACKGROUND and delivers its result back into the chat when done (returns immediately — do NOT wait for it). Content = the task (optional first line `model: <name>`). The sub-agent has files/shell/browser tools but CANNOT spawn more agents. Use to dispatch/delegate a focused subtask, e.g. `spawn_agent` then `screenshot localhost:1338 and list what looks visually wrong`.",
+    "spawn_agent": "- ```spawn_agent``` — Spawn/dispatch a sub-agent that runs a full tool-using loop on a self-contained task IN THE BACKGROUND and delivers its result back into the chat when done (returns immediately — do NOT wait for it). Content = the task. Do NOT add a `model:` line — a default sub-agent model is configured and the harness routes it; only pin `model: <name>` for a specific reason (e.g. the task needs vision and the default can't see images), and if so call `list_models` first to get a real vision-capable name rather than guessing. The sub-agent has files/shell/browser tools but CANNOT spawn more agents. Use to dispatch/delegate a focused subtask, e.g. `spawn_agent` then `screenshot localhost:1338 and list what looks visually wrong`.",
     "manage_agents": "- ```manage_agents``` — See which background sub-agents are running in this chat, or cancel one. Content: empty/`list` to list them (id, model, elapsed), or `stop <id>` (e.g. `stop sub_3`) to cancel a running sub-agent.",
     "search_tools": "- ```search_tools``` — Discover tools NOT shown this turn. Only the tools relevant to this turn are listed; many more exist. Content = a plain-text query for the capability you need (e.g. `send an email`, `add a calendar event`, `serve a model`), or empty to browse the full catalog. The matched tools become callable on your NEXT turn — then just call them normally.",
     "create_session": "- ```create_session``` — Create a new chat. Line 1 = chat name, line 2 = model name. Use for background/parallel work.",
@@ -2000,6 +2001,30 @@ def _build_base_prompt(
 
 
 
+def _unknown_tool_call_error(name: str) -> str:
+    """Build a recoverable, tool_result-style error for a tool call that the
+    parser/converter couldn't map to a real tool.
+
+    Dropping such a call silently left the model waiting forever on a result
+    that never came (its own history shows an attempted call, no answer). Feed
+    THIS back as the call's result instead, with a difflib close-match hint and
+    a pointer to search_tools, so the model self-corrects next round.
+    """
+    name = (name or "").strip() or "(unnamed)"
+    suggestion = ""
+    try:
+        from src.tool_policy import known_tool_names
+        matches = difflib.get_close_matches(name, sorted(known_tool_names()), n=1, cutoff=0.6)
+        if matches:
+            suggestion = f" (did you mean {matches[0]}?)"
+    except Exception:
+        pass
+    return (
+        f"Couldn't run tool call '{name}': not a known tool{suggestion}. "
+        "Call search_tools to find the right tool name."
+    )
+
+
 def _resolve_tool_blocks(
     round_response: str,
     native_tool_calls: list,
@@ -2007,9 +2032,16 @@ def _resolve_tool_blocks(
     is_api_model: bool = False,
     allow_fenced_for_api: bool = False,
 ):
-    """Choose native function calls or fenced code block parsing. Returns (tool_blocks, used_native)."""
+    """Choose native function calls or fenced code block parsing.
+
+    Returns (tool_blocks, used_native, converted_calls, failed_call_names).
+    failed_call_names = native calls that could NOT be converted to a tool
+    block — the caller synthesizes a visible error result for each so the model
+    isn't left waiting on a dropped call (FIX 2).
+    """
     used_native = False
     converted_calls = []  # native calls that converted, ALIGNED with tool_blocks
+    failed_call_names: list = []  # native calls that failed to convert
     if native_tool_calls:
         tool_blocks = []
         for tc in native_tool_calls:
@@ -2021,6 +2053,7 @@ def _resolve_tool_blocks(
                 converted_calls.append(tc)
                 logger.info(f"  -> converted: {tc_name} -> {block.tool_type}")
             else:
+                failed_call_names.append(tc_name)
                 logger.warning(f"  -> FAILED to convert native call: {tc_name} args={tc_args[:200]}")
         if tool_blocks:
             used_native = True
@@ -2048,7 +2081,7 @@ def _resolve_tool_blocks(
                 f"{len(native_tool_calls)} native calls, "
                 f"{len(tool_blocks)} tool blocks. Preview: {resp_preview}")
 
-    return tool_blocks, used_native, converted_calls
+    return tool_blocks, used_native, converted_calls, failed_call_names
 
 
 def _append_tool_results(
@@ -2287,6 +2320,9 @@ def _empty_response_fallback(
     full_response: str,
     round_reasoning: str,
     tool_events: list,
+    no_output_reason: Optional[str] = None,
+    reason_detail: str = "",
+    timeout_seconds: Optional[float] = None,
 ) -> tuple:
     """Return (final_response, sse_chunk_or_none) for the end-of-loop empty-response guard.
 
@@ -2294,6 +2330,12 @@ def _empty_response_fallback(
     content=""), full_response is empty but round_reasoning has content.
     The reasoning was already streamed as {thinking:true} chunks — do not
     re-emit it as a normal delta.  Just persist it and yield nothing.
+
+    `no_output_reason` (FIX 4) distinguishes WHY there is no output so the user
+    gets an accurate message instead of a blanket "empty response, switch model":
+      - "timeout"  → the model timed out (offer Continue, don't suggest switching)
+      - "provider" → an upstream provider error (surface the real reason)
+      - None/other → a genuinely empty model reply (try again / switch model)
 
     Returns:
         (final_response: str, chunk: str | None)
@@ -2303,7 +2345,21 @@ def _empty_response_fallback(
         return full_response, None
     if round_reasoning.strip():
         return round_reasoning, None
-    _error_msg = "The model returned an empty response. Please try again or switch to a different model."
+    if no_output_reason == "timeout":
+        _secs = f" after {int(timeout_seconds)}s" if timeout_seconds else ""
+        _error_msg = (
+            f"The model timed out{_secs} before producing a response. "
+            "Use Continue to resume, or try again."
+        )
+    elif no_output_reason == "provider":
+        _detail = (reason_detail or "").strip()
+        _error_msg = (
+            f"The model provider returned an error: {_detail}"
+            if _detail
+            else "The model provider returned an error. Please try again."
+        )
+    else:
+        _error_msg = "The model returned an empty response. Please try again or switch to a different model."
     return _error_msg, f'data: {json.dumps({"delta": _error_msg})}\n\n'
 
 
@@ -3180,6 +3236,14 @@ async def stream_agent_loop(
     # so the user can resume instead of the turn silently stalling.
     _exhausted_rounds = False
 
+    # FIX 4: track WHY a round produced no output so the terminal empty-response
+    # guard emits an accurate message (timeout vs provider error vs truly empty)
+    # instead of always telling the user to switch models. Reset per round; the
+    # last round's value is what the guard reads if the turn ends output-less.
+    _no_output_reason = None   # "timeout" | "provider" | None
+    _no_output_detail = ""      # upstream error text for the "provider" case
+    _last_round_timeout_s = None
+
     # Browser screenshots are attached to `messages` as OpenAI image_url parts so a
     # vision model can actually SEE the page. Two guards: (1) only for vision models
     # — a non-vision model 400s on image parts in the next round; (2) keep only the
@@ -3202,6 +3266,9 @@ async def stream_agent_loop(
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
+        # FIX 4: reset the no-output cause for this round.
+        _no_output_reason = None
+        _no_output_detail = ""
         # Reset doc streaming state per round
         _doc_acc = ""
         _doc_opened = False
@@ -3316,12 +3383,17 @@ async def stream_agent_loop(
                     "error" if chunk.startswith("event: error") else "data",
                 )
             if time.time() > _round_deadline:
+                _deadline_s = max(agent_stream_timeout * 4, 1200)
                 logger.warning(
                     "[agent-timing] round_deadline round=%s elapsed=%.3fs deadline_s=%s",
                     round_num,
                     time.time() - _round_start,
-                    max(agent_stream_timeout * 4, 1200),
+                    _deadline_s,
                 )
+                # FIX 4: remember this was a TIMEOUT, not an empty reply, so the
+                # terminal guard doesn't tell the user to switch models.
+                _no_output_reason = "timeout"
+                _last_round_timeout_s = _deadline_s
                 break
             # Forward error events from stream_llm to the frontend
             if chunk.startswith("event: error"):
@@ -3331,6 +3403,15 @@ async def stream_agent_loop(
                     time.time() - _round_start,
                     chunk[:500],
                 )
+                # FIX 4: remember this round hit an upstream provider error and
+                # capture its reason, so an output-less turn reports the REAL
+                # cause instead of a generic "empty response".
+                _no_output_reason = "provider"
+                try:
+                    _err_body = chunk.split("data: ", 1)[1] if "data: " in chunk else ""
+                    _no_output_detail = str(json.loads(_err_body).get("error", "")) if _err_body.strip() else ""
+                except Exception:
+                    _no_output_detail = ""
                 yield chunk
                 continue
             if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
@@ -3494,6 +3575,10 @@ async def stream_agent_loop(
                     elif data.get("error"):
                         err_msg = data.get("error", "unknown")
                         logger.error(f"Agent round {round_num}: stream error: {err_msg}")
+                        # FIX 4: record the provider error so an output-less turn
+                        # surfaces this real cause, not a generic empty-response.
+                        _no_output_reason = "provider"
+                        _no_output_detail = str(err_msg)
                         yield f'data: {json.dumps({"delta": chr(10) + chr(10) + "*[Stream error: " + str(err_msg) + "]*"})}\n\n'
                 except json.JSONDecodeError:
                     if round_num == 1:
@@ -3520,7 +3605,7 @@ async def stream_agent_loop(
             if _ody_doc_finetune_mode
             else round_response
         )
-        tool_blocks, used_native, converted_calls = _resolve_tool_blocks(
+        tool_blocks, used_native, converted_calls, _failed_tool_calls = _resolve_tool_blocks(
             _normalized_doc_round,
             native_tool_calls,
             round_num,
@@ -3636,6 +3721,37 @@ async def stream_agent_loop(
         # on reload (#3222 follow-up).
         cleaned_round = strip_tool_blocks(round_response, skip_fenced=(_is_api_model and not used_native and not guide_only)).strip()
         round_texts.append(cleaned_round)
+
+        # ── FIX 2: unconvertible tool calls must not vanish ──────────────
+        # A native tool call that failed function_call_to_tool_block() was
+        # dropped from tool_blocks while the model believes it invoked a tool —
+        # it then waits forever on a result that never comes. Feed a synthesized
+        # tool_result-style error back for each dropped call (with a close-match
+        # suggestion + a search_tools pointer) so the model self-corrects. Skip
+        # on force-answer rounds, where we've told it to stop calling tools.
+        # The mixed case (some converted, some failed) is threaded through
+        # `_pending_failed_call_notes` and appended AFTER _append_tool_results,
+        # so it never splits the native assistant→tool message protocol.
+        _pending_failed_call_notes = []
+        if _failed_tool_calls and not _force_answer:
+            _pending_failed_call_notes = [_unknown_tool_call_error(_n) for _n in _failed_tool_calls]
+            for _fn in _failed_tool_calls:
+                logger.info(f"[agent] surfacing unconvertible tool call {_fn!r} to model as recoverable error")
+            # If EVERY call failed there are no results to feed back — don't let
+            # the turn end silently. Inject the errors now and loop so the model
+            # retries with a real tool name.
+            if not tool_blocks and round_num < max_rounds:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Some tool calls could not be executed this round:\n- "
+                        + "\n- ".join(_pending_failed_call_notes)
+                        + "\n\nUse a valid tool name (call search_tools if unsure), then continue."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                full_response += "\n\n"
+                continue
 
         if not tool_blocks:
             # ── Completion verifier (mechanism 3a) ────────────────────
@@ -4306,6 +4422,19 @@ async def stream_agent_loop(
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
 
+        # FIX 2 (mixed case): some calls converted and ran, some didn't. The
+        # ran-results are now in history (above); append the dropped-call errors
+        # AFTER them so the native assistant→tool protocol block stays intact.
+        if _pending_failed_call_notes:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Some tool calls could not be executed this round:\n- "
+                    + "\n- ".join(_pending_failed_call_notes)
+                    + "\n\nUse a valid tool name (call search_tools if unsure), then continue."
+                ),
+            })
+
         # Hand browser screenshots to the MODEL, not just the UI. The tool
         # result text only says "[Screenshot captured]", so without this a
         # multimodal model takes a screenshot it can never actually see (and
@@ -4361,7 +4490,10 @@ async def stream_agent_loop(
     # If the response is completely empty and no tools were executed,
     # yield a fallback message so the user is not left hanging.
     full_response, _fallback_chunk = _empty_response_fallback(
-        full_response, round_reasoning, tool_events
+        full_response, round_reasoning, tool_events,
+        no_output_reason=_no_output_reason,
+        reason_detail=_no_output_detail,
+        timeout_seconds=_last_round_timeout_s,
     )
     if _fallback_chunk:
         yield _fallback_chunk

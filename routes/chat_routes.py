@@ -1430,6 +1430,17 @@ def setup_chat_routes(
                     except Exception:
                         logger.exception("Failed to save partial response on disconnect (session %s)", session)
                     raise
+                except Exception as e:
+                    # Belt-and-suspenders for FIX 1: any exception that still
+                    # escapes the agent loop (or this consumer) would otherwise
+                    # end the SSE stream with no frame — the user sees a hang or
+                    # blank. Surface it as a visible `event: error`, mirroring the
+                    # rewrite path (~stream_rewrite) and the server-resume path
+                    # (chat_flows._resume_stream). CancelledError/GeneratorExit
+                    # are BaseExceptions handled above, so they never reach here.
+                    logger.exception("Agent stream error (session %s)", session)
+                    yield f'event: error\ndata: {json.dumps({"error": str(e) or type(e).__name__, "status": 500})}\n\n'
+                    yield "data: [DONE]\n\n"
                 finally:
                     _active_streams.pop(session, None)
 

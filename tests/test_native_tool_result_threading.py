@@ -17,7 +17,7 @@ def test_resolve_returns_converted_calls_aligned():
         {"name": "bogus_unknown_tool", "arguments": "{}", "id": "A"},
         {"name": "web_search", "arguments": '{"query": "hello"}', "id": "B"},
     ]
-    tool_blocks, used_native, converted = al._resolve_tool_blocks("", native, 1)
+    tool_blocks, used_native, converted, _failed = al._resolve_tool_blocks("", native, 1)
     assert used_native is True
     assert len(tool_blocks) == 1           # only web_search converted
     assert [c["name"] for c in converted] == ["web_search"]
