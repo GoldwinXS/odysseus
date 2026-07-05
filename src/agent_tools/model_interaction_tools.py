@@ -167,6 +167,25 @@ _SUBAGENT_SYSTEM_PROMPT = (
 )
 
 
+def _looks_complete(text: str) -> bool:
+    """Heuristic: does this read like a finished summary, or narration cut off
+    mid-write? Used only to decide whether a round-cap sub-agent needs a wrap-up
+    summary round. Truncated narration ends without terminal punctuation and/or
+    trails a "Now Edit N: ..." / "Next, ..." step it never finished. Bias toward
+    treating short unpunctuated tails as truncated — a needless summary round is
+    cheaper than delivering "...Now Edit 6: remove the unused var"."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    _tail = t.rsplit("\n", 1)[-1].strip()
+    # A finished thought ends on terminal punctuation or a closing fence/quote.
+    if t[-1] in ".!?)]\"'`" or t.endswith("```"):
+        return True
+    # Otherwise it's an unpunctuated tail — likely a step announced but not done
+    # (e.g. "Now Edit 6: remove the unused var"). Treat as incomplete.
+    return False
+
+
 async def spawn_agent(
     content: str,
     session_id: Optional[str] = None,
@@ -407,12 +426,69 @@ async def spawn_agent(
             subagent_runs.set_resume_running(_parent_session, False)
             logger.error("[subagent-resume] could not schedule resume turn for %s: %s", _parent_session, _e)
 
+    async def _summary_round(truncated: str, tools: int, last_tool: Optional[str]) -> str:
+        """One final tool-free round so a sub-agent that burned all its rounds on
+        tool calls still delivers a real summary instead of raw truncated
+        narration. Mirrors the main loop's force-answer round (agent_loop.py:
+        _force_answer -> tools=[]); here we get the same effect by running a
+        fresh stream_agent_loop with an empty relevant-tools set and every tool
+        disabled, so the model can only write prose. Returns the summary text, or
+        "" if the round produced nothing (caller falls back to a synth header)."""
+        _bits: list = []
+        _prompt = (
+            "You are wrapping up a background task you were already working on. You have "
+            "hit your tool-round limit, so you can no longer call tools — write your final "
+            "summary now.\n\n"
+            f"Original task:\n{_task}\n\n"
+            f"You ran {tools} tool call(s)"
+            + (f" (last: {last_tool})" if last_tool else "")
+            + ". Your work-in-progress notes so far were:\n"
+            f"{truncated or '(no narration captured)'}\n\n"
+            "In a few sentences, state plainly what you COMPLETED and what (if anything) "
+            "REMAINS. Do not ask questions; do not call tools. This summary is the only "
+            "thing reported back."
+        )
+        try:
+            async def _drain_summary():
+                async for _chunk in stream_agent_loop(
+                    _url, _model,
+                    [
+                        {"role": "system", "content": _SUBAGENT_SYSTEM_PROMPT},
+                        {"role": "user", "content": _prompt},
+                    ],
+                    headers=_headers,
+                    owner=_owner,
+                    session_id=None,
+                    disabled_tools=set(_disabled) | set(_sub_tools),  # bar every tool
+                    relevant_tools=set(),                              # no tools offered
+                    workspace=_workspace,
+                    max_rounds=1,
+                    max_tokens=_max_tokens,
+                    fallbacks=_fallbacks,
+                ):
+                    if _chunk.startswith("data: ") and not _chunk.startswith("data: [DONE]"):
+                        try:
+                            _d = json.loads(_chunk[6:])
+                        except Exception:
+                            continue
+                        if "delta" in _d and not _d.get("thinking"):
+                            _bits.append(_d["delta"])
+            # Bound the wrap-up so a wedged summary round can't hang the run.
+            await asyncio.wait_for(_drain_summary(), timeout=_SUBAGENT_TIMEOUT_S)
+        except Exception as _sum_err:
+            logger.warning("[subagent-run] summary round failed: %s", _sum_err)
+            return ""
+        _txt = "".join(_bits).strip()
+        if _txt == "The model returned an empty response. Please try again or switch to a different model.":
+            return ""
+        return _txt
+
     async def _run_subagent(deliver: bool) -> Dict:
         """Run the leaf sub-agent to completion under the guardrails. When
         ``deliver`` is set (background mode) the result is also posted into the
         parent session; otherwise it is only returned (synchronous fallback)."""
         collected: list = []
-        stats = {"tools": 0, "hit_cap": False, "error": None}
+        stats = {"tools": 0, "hit_cap": False, "error": None, "last_tool": None}
 
         async def _drain():
             async for chunk in stream_agent_loop(
@@ -453,6 +529,10 @@ async def spawn_agent(
                     _t = d.get("type")
                     if _t == "tool_start":
                         stats["tools"] += 1
+                        # Remember the last tool that ran so the round-cap
+                        # summary/header can name it (see the exhaustion path).
+                        if d.get("tool"):
+                            stats["last_tool"] = d["tool"]
                     elif _t == "rounds_exhausted":
                         stats["hit_cap"] = True
                     # Accumulate visible answer text only (skip thinking tokens).
@@ -480,6 +560,28 @@ async def spawn_agent(
         # it so the real reason (captured below) surfaces instead.
         if result == "The model returned an empty response. Please try again or switch to a different model.":
             result = ""
+
+        # Round-cap wrap-up: a sub-agent that spent all its rounds on tool calls
+        # delivers whatever text happened to accumulate — often truncated
+        # mid-edit ("...Now Edit 6: remove the unused var"), so the parent/user
+        # never learn the edits succeeded. When it hit the cap with pending work,
+        # run ONE tool-free summary round and deliver THAT instead. If the summary
+        # round yields nothing, prepend a synthesized header so the truncation is
+        # at least labelled. (Skipped on error paths — those report their own
+        # reason; the empty+cap case below already explains itself.)
+        if stats["hit_cap"] and not error and result and not _looks_complete(result):
+            _summary = await _summary_round(result, stats["tools"], stats["last_tool"])
+            if _summary:
+                result = _summary
+            else:
+                _hdr = (
+                    f"(Hit the {_SUBAGENT_MAX_ROUNDS}-round limit; {stats['tools']} tool "
+                    f"call(s) ran"
+                    + (f", last: {stats['last_tool']}" if stats["last_tool"] else "")
+                    + ". Work happened but the summary was cut off mid-write.)\n\n"
+                )
+                result = _hdr + result
+
         # Cap generously so the PARENT model receives the sub-agent's FULL answer
         # (the delivered message IS the parent's context on auto-resume); only
         # genuinely huge outputs get trimmed, with a clear marker.
@@ -605,8 +707,18 @@ async def list_models(content: str, session_id: Optional[str] = None, owner: Opt
                 except Exception:
                     model_ids = ["(endpoint offline)"]
 
+            # Normalize to strings before any filtering/rendering. cached_models
+            # (and, defensively, a malformed /models payload) can carry None or
+            # non-string entries; the keyword filter's `m.lower()` would raise
+            # AttributeError on those, and the except-guard turns a single bad
+            # entry into a whole-tool failure ({"error": ...}) that hides every
+            # other endpoint's models. Coerce + drop empties so one junk row
+            # can't take down the listing.
+            model_ids = [str(m).strip() for m in model_ids if m]
+
             if keyword:
-                model_ids = [m for m in model_ids if keyword in m.lower() or keyword in (ep.name or "").lower()]
+                _ep_name = (ep.name or "").lower()
+                model_ids = [m for m in model_ids if keyword in m.lower() or keyword in _ep_name]
 
             if model_ids:
                 result_lines.append(f"\n**{ep.name or base}** ({provider}):")

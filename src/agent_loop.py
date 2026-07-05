@@ -2502,6 +2502,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     _is_teacher_run: bool = False,
     suppress_low_signal: bool = False,
+    tool_events_sink: Optional[list] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -2512,6 +2513,12 @@ async def stream_agent_loop(
       - data: {"type": "agent_step", "round": N}            (next round)
       - data: {"type": "metrics", "data": {...}}            (final metrics)
       - data: [DONE]                                        (end)
+
+    If tool_events_sink is provided, the per-round tool_event dicts are appended
+    to it live (same objects as the final metrics' tool_events). A caller can
+    hold this list to recover the in-progress tool history if the stream is
+    interrupted before the final metrics event arrives (partial-save on
+    client disconnect), so the model doesn't re-do already-completed tool calls.
     """
 
     mcp_mgr = get_mcp_manager()
@@ -3088,7 +3095,13 @@ async def stream_agent_loop(
     total_start = time.time()
     time_to_first_token = None
     first_token_received = False
-    tool_events = []   # Persist tool executions for history reload
+    # Persist tool executions for history reload. When the caller passes a
+    # sink, reuse it as the accumulator so appends are visible to the caller
+    # live (used by the partial-save path to preserve tool history across an
+    # interrupt). Clear it first so a reused list starts empty for this turn.
+    tool_events = tool_events_sink if tool_events_sink is not None else []
+    if tool_events_sink is not None:
+        tool_events.clear()
     round_texts = []   # Cleaned text per round for history reload
     # Completion-verifier state (mechanism 3a). _effectful_used flips on when
     # a tool that produces a checkable artifact runs; the verifier only fires

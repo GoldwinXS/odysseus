@@ -192,6 +192,84 @@ async def test_empty_result_delivers_informative_fallback(fake_env, monkeypatch)
     assert "round" in content and "tool call" in content  # names tools + round limit
 
 
+async def test_round_cap_truncated_text_gets_summary_round(fake_env, monkeypatch):
+    # A sub-agent that applied its edits but hit the round cap mid-narration
+    # ("...Now Edit 6: remove the unused var") must NOT deliver that raw truncated
+    # text. Instead a final tool-free summary round runs and THAT is delivered.
+    calls = {"n": 0}
+
+    async def two_phase_loop(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Main run: ran tools, then got cut off mid-sentence at the cap.
+            yield _sse({"type": "tool_start", "tool": "edit_file"})
+            yield _sse({"delta": "Applied edits 1-5. Now Edit 6: remove the unused var"})
+            yield _sse({"type": "rounds_exhausted"})
+            yield "data: [DONE]\n\n"
+        else:
+            # Summary round: tool-free, writes a real completion summary.
+            yield _sse({"delta": "Done. All 6 edits applied; the unused var was removed."})
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", two_phase_loop)
+    await mit.spawn_agent("refactor the module", session_id="cap-sum-1", owner="u")
+    upd = await _wait_done("cap-sum-1")
+    assert upd["updates"][0]["status"] == "done"
+    assert calls["n"] == 2                                  # summary round DID run
+    content = fake_env.messages[0].content
+    assert "All 6 edits applied" in content                 # delivered the summary...
+    assert "Now Edit 6" not in content                      # ...not the truncated tail
+
+
+async def test_round_cap_synth_header_when_summary_empty(fake_env, monkeypatch):
+    # If the wrap-up summary round produces nothing, the delivered truncated text
+    # gets a synthesized one-line header so the parent/user know work happened and
+    # was cut off (names the tool count + last tool).
+    calls = {"n": 0}
+
+    async def two_phase_loop(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield _sse({"type": "tool_start", "tool": "edit_file"})
+            yield _sse({"type": "tool_start", "tool": "edit_file"})
+            yield _sse({"delta": "Editing files. Next I will remove the unused var"})
+            yield _sse({"type": "rounds_exhausted"})
+            yield "data: [DONE]\n\n"
+        else:
+            # Summary round yields the empty-response placeholder → treated as empty.
+            yield _sse({"delta": "The model returned an empty response. Please try again or switch to a different model."})
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", two_phase_loop)
+    await mit.spawn_agent("refactor the module", session_id="cap-hdr-1", owner="u")
+    upd = await _wait_done("cap-hdr-1")
+    assert upd["updates"][0]["status"] == "done"
+    content = fake_env.messages[0].content
+    assert "round limit" in content.lower() or "round-cap" in content.lower() or "-round limit" in content.lower()
+    assert "2 tool call" in content                         # names the tool count
+    assert "edit_file" in content                           # names the last tool
+    assert "remove the unused var" in content               # truncated text preserved
+
+
+async def test_round_cap_complete_text_skips_summary_round(fake_env, monkeypatch):
+    # A sub-agent that hit the cap but DID finish with a proper summary (terminal
+    # punctuation) is delivered as-is — no needless second round.
+    calls = {"n": 0}
+
+    async def loop(*args, **kwargs):
+        calls["n"] += 1
+        yield _sse({"type": "tool_start", "tool": "grep"})
+        yield _sse({"delta": "Searched the tree; found 3 matches in main.py."})
+        yield _sse({"type": "rounds_exhausted"})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", loop)
+    await mit.spawn_agent("search the tree", session_id="cap-ok-1", owner="u")
+    await _wait_done("cap-ok-1")
+    assert calls["n"] == 1                                  # no summary round needed
+    assert "found 3 matches" in fake_env.messages[0].content
+
+
 async def test_upstream_error_surfaced_not_empty(fake_env, monkeypatch):
     # A 429 / spend-cap failure must be reported as the REAL reason, not the
     # generic "empty response" placeholder the loop emits after an error.

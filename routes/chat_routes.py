@@ -1261,6 +1261,11 @@ def setup_chat_routes(
                 _answered_by = None  # set if the selected model failed and a fallback answered
                 _requested_model = sess.model
                 _actual_model = None
+                # Live accumulator the agent loop appends each round's tool_event
+                # to. On a normal finish, tool_events reach us via the final
+                # metrics event; but an interrupt fires before that event, so
+                # hold the sink here to preserve tool history on partial-save.
+                _tool_events_sink: list = []
                 try:
                     from src.settings import get_setting
                     from src.agent_tools import MAX_AGENT_ROUNDS as _DEFAULT_ROUNDS
@@ -1307,6 +1312,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        tool_events_sink=_tool_events_sink,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1394,15 +1400,29 @@ def setup_chat_routes(
                     # outer finally from running and left _active_streams
                     # with a stale entry).
                     try:
-                        if full_response:
-                            logger.info("Client disconnected mid-stream for session %s, saving partial response (%d chars)", session, len(full_response))
+                        # Preserve tool history so the reloaded chat AND the next
+                        # model turn both SEE the tool calls that already ran this
+                        # turn — otherwise the model reads its own bare narration,
+                        # concludes it did nothing, and re-does completed work.
+                        # tool_events reach the success path via the final metrics
+                        # event, which never arrives on an interrupt; read the live
+                        # sink the agent loop appended to instead.
+                        _partial_tool_events = list(_tool_events_sink)
+                        if full_response or _partial_tool_events:
+                            logger.info(
+                                "Client disconnected mid-stream for session %s, saving partial response (%d chars, %d tool events)",
+                                session, len(full_response), len(_partial_tool_events),
+                            )
+                            _stopped_md_base = {
+                                "stopped": True,
+                                "model": _actual_model or _answered_by or _requested_model,
+                                "requested_model": _requested_model,
+                            }
+                            if _partial_tool_events:
+                                _stopped_md_base["tool_events"] = _partial_tool_events
                             _stopped_content2, _stopped_md2 = clean_thinking_for_save(
                                 full_response,
-                                {
-                                    "stopped": True,
-                                    "model": _actual_model or _answered_by or _requested_model,
-                                    "requested_model": _requested_model,
-                                },
+                                _stopped_md_base,
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
                             if not incognito:
