@@ -43,12 +43,14 @@ _ENDPOINT_SETTING_FIELDS = {
     "utility_endpoint_id":  ("utility_model",   "Utility Model"),
     "research_endpoint_id": ("research_model",  "Deep Research"),
     "task_endpoint_id":     ("task_model",       "Background Tasks"),
+    "subagent_endpoint_id": ("subagent_model",  "Sub-agents"),
 }
 
 _ENDPOINT_FALLBACK_FIELDS = {
     "default_model_fallbacks": "Default Model Fallbacks",
     "utility_model_fallbacks": "Utility Model Fallbacks",
     "vision_model_fallbacks":  "Vision Model Fallbacks",
+    "subagent_model_fallbacks": "Sub-agent Model Fallbacks",
 }
 
 

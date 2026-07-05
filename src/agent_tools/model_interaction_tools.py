@@ -289,13 +289,20 @@ async def spawn_agent(
     _parent_session = session_id
     _summary = _task.splitlines()[0][:120] if _task else ""
 
-    # Give the sub-agent the SAME fallback chain the main chat uses, so a
-    # rate-limited / spend-capped primary (e.g. Gemini 429 "exceeded monthly
-    # spending cap") falls back to another model instead of failing with an
-    # empty result. Best-effort — an empty chain just means no fallback.
+    # Fallback chain if the primary sub-agent model fails (rate-limit / spend
+    # cap / provider error). Prefer a sub-agent-specific chain when the user
+    # configured one in Settings → Sub-agents (subagent_model_fallbacks);
+    # otherwise reuse the main chat's chain. Best-effort — empty = no fallback.
     try:
-        from src.endpoint_resolver import resolve_chat_fallback_candidates
-        _fallbacks = await asyncio.to_thread(resolve_chat_fallback_candidates, _owner)
+        from src.endpoint_resolver import (
+            resolve_subagent_fallback_candidates, resolve_chat_fallback_candidates,
+        )
+        from src.settings import get_setting as _gs
+        _sub_fb_cfg = _gs("subagent_model_fallbacks", []) or []
+        if _sub_fb_cfg:
+            _fallbacks = await asyncio.to_thread(resolve_subagent_fallback_candidates, _owner)
+        else:
+            _fallbacks = await asyncio.to_thread(resolve_chat_fallback_candidates, _owner)
     except Exception:
         _fallbacks = []
 

@@ -438,6 +438,12 @@ def resolve_vision_fallback_candidates(owner: Optional[str] = None) -> list:
     return _resolve_fallback_candidates("vision_model_fallbacks", owner=owner)
 
 
+def resolve_subagent_fallback_candidates(owner: Optional[str] = None) -> list:
+    """Configured fallback chain for spawn_agent sub-agents
+    (`subagent_model_fallbacks`)."""
+    return _resolve_fallback_candidates("subagent_model_fallbacks", owner=owner)
+
+
 def _resolve_fallback_candidates(setting_key: str, owner: Optional[str] = None) -> list:
     out = []
     try:

@@ -1475,6 +1475,30 @@
             </div>
           </div>
           <div class="admin-card">
+            <h2 style="display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:1px;opacity:0.6;flex-shrink:0"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>Sub-agents</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Model for background sub-agents (spawn_agent). A cheap model is fine; leave blank to inherit the chat's model.</div>
+            <div class="settings-col">
+              <div class="settings-row">
+                <label class="settings-label">Endpoint</label>
+                <span class="adm-model-logo" id="set-subagentEpSelect-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
+                <select id="set-subagentEpSelect" class="settings-select"><option value="">—</option></select>
+              </div>
+              <div class="settings-row">
+                <label class="settings-label">Model</label>
+                <span class="adm-model-logo" id="set-subagentModelSelect-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
+                <select id="set-subagentModelSelect" class="settings-select"><option value="">—</option></select>
+              </div>
+              <div class="settings-row" style="align-items:flex-start;">
+                <label class="settings-label" style="margin-top:6px;">Fallbacks</label>
+                <div style="flex:1;display:flex;flex-direction:column;gap:6px;">
+                  <div id="set-subagentFallbacks" class="settings-fallbacks"></div>
+                  <button type="button" class="settings-fallback-add" id="set-subagentAddFallback" title="Add a model to try if the sub-agent model fails">+ Add fallback</button>
+                </div>
+              </div>
+              <div id="set-subagentChatMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
+            </div>
+          </div>
+          <div class="admin-card">
             <h2 style="display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:1px;opacity:0.6;flex-shrink:0"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>Vision<span style="flex:1"></span><label class="admin-switch" title="Analyze images with a vision-capable model"><input type="checkbox" id="set-visionEnabledToggle" checked><span class="admin-slider"></span></label></h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">Analyze images with a vision-capable model.</div>
             <div style="display:flex;flex-direction:column;gap:0.5rem;">
