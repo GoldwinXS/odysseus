@@ -51,6 +51,96 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     } catch (_) {}
   }
   let _pendingContinue = null; // Stores the stopped AI element to merge with new response
+
+  // ── Active plan / TODO tracking ─────────────────────────────────────────
+  // The agent's `update_plan` tool emits a `plan_update` SSE carrying the full
+  // checklist markdown. We keep it here (in-memory) so it can be (a) rendered
+  // into a lightweight visible checklist near the chat and (b) sent back as
+  // `approved_plan` on the next request, so `build_active_plan_note` re-pins it
+  // into the model's context each turn and the thread stays coherent.
+  let _storedPlan = '';
+
+  function _getStoredPlan() { return _storedPlan; }
+
+  // Parse markdown checklist lines ("- [ ] step" / "- [x] step") into
+  // {done, text} rows. Lines that aren't checklist items are shown as plain
+  // headings/notes so a free-form plan still renders sensibly.
+  function _parsePlanLines(plan) {
+    const rows = [];
+    (plan || '').split('\n').forEach((raw) => {
+      const line = raw.replace(/\s+$/, '');
+      if (!line.trim()) return;
+      const m = line.match(/^\s*[-*]\s*\[([ xX])\]\s*(.*)$/);
+      if (m) {
+        rows.push({ done: m[1].toLowerCase() === 'x', text: m[2], item: true });
+      } else {
+        rows.push({ done: false, text: line.trim(), item: false });
+      }
+    });
+    return rows;
+  }
+
+  function _renderPlanPanel() {
+    let panel = document.getElementById('agent-plan-panel');
+    if (!_storedPlan || !_storedPlan.trim()) {
+      if (panel) panel.remove();
+      return;
+    }
+    const container = document.getElementById('chat-container') || document.body;
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'agent-plan-panel';
+      // Reuse existing theme vars (no new CSS vars / no emoji). Lightweight
+      // docked checklist pinned bottom-right of the chat area.
+      panel.style.cssText = [
+        'position:absolute', 'right:16px', 'bottom:96px', 'z-index:20',
+        'max-width:320px', 'max-height:45vh', 'overflow:auto',
+        'background:var(--panel)', 'border:1px solid var(--border)',
+        'border-radius:8px', 'padding:10px 12px',
+        'font-size:12px', 'line-height:1.5', 'color:var(--fg)',
+        'box-shadow:0 2px 10px rgba(0,0,0,0.3)',
+      ].join(';');
+      container.appendChild(panel);
+    }
+    const rows = _parsePlanLines(_storedPlan);
+    const items = rows.filter((r) => r.item);
+    const done = items.filter((r) => r.done).length;
+    const total = items.length;
+    const head = document.createElement('div');
+    head.style.cssText = 'font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px;align-items:center;';
+    const title = document.createElement('span');
+    title.textContent = 'Plan';
+    const count = document.createElement('span');
+    count.style.cssText = 'opacity:0.7;font-weight:400;';
+    if (total) count.textContent = `${done}/${total}`;
+    head.appendChild(title); head.appendChild(count);
+    const list = document.createElement('div');
+    rows.forEach((r) => {
+      const row = document.createElement('div');
+      if (r.item) {
+        row.style.cssText = 'display:flex;gap:6px;align-items:flex-start;padding:1px 0;';
+        const box = document.createElement('span');
+        box.textContent = r.done ? '[x]' : '[ ]';
+        box.style.cssText = 'font-family:var(--mono,monospace);opacity:0.85;flex:0 0 auto;';
+        const txt = document.createElement('span');
+        txt.textContent = r.text;
+        if (r.done) txt.style.cssText = 'opacity:0.55;text-decoration:line-through;';
+        row.appendChild(box); row.appendChild(txt);
+      } else {
+        row.style.cssText = 'font-weight:600;margin-top:6px;';
+        row.textContent = r.text;
+      }
+      list.appendChild(row);
+    });
+    panel.replaceChildren(head, list);
+  }
+
+  // Persist + render the current plan. Called from the `plan_update` SSE
+  // handler. Defined here so the handler no longer throws a ReferenceError.
+  function _setStoredPlan(plan) {
+    _storedPlan = (plan || '').toString();
+    try { _renderPlanPanel(); } catch (e) { console.warn('plan render failed', e); }
+  }
   // ── Auto-recovery: when a turn's stream silently dies (connection drop) or
   // goes quiet while the connection is alive, re-engage the model with a
   // completion handshake instead of leaving it hung. Capped so it can't loop.
@@ -1223,6 +1313,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       fd.append('message', _finalMsgWithInject);
       fd.append('session', streamSessionId);
       if (ids.length) fd.append('attachments', JSON.stringify(ids));
+      // Re-inject the active plan so build_active_plan_note pins it into the
+      // system context this turn and the model keeps the thread. Only sent
+      // when a plan is actually active (kept small).
+      try {
+        const _plan = _getStoredPlan();
+        if (_plan && _plan.trim()) fd.append('approved_plan', _plan);
+      } catch (_e) { /* best-effort */ }
       // Auto-save & send active doc ID so the backend sees latest content
       if (documentModule && activeDocIdForSend) {
         try { await documentModule.saveDocument({ silent: true }); } catch (_e) { /* best-effort */ }

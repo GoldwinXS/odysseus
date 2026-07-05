@@ -2,12 +2,95 @@ import asyncio
 import json
 import os
 import re
+import sys
 import difflib
 import fnmatch
 import shutil
+import subprocess
 from typing import Optional, Dict, Any, Tuple
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
+
+# Post-edit syntax gate: after a successful edit_file/write_file we run a cheap
+# by-extension syntax/parse check on the written file so an edit that broke
+# syntax comes back to the model as a visible error to fix next round (turning
+# edit-blind into edit-then-check). Best-effort and NON-FATAL — the file is
+# already saved; this only augments the success dict and never raises.
+_SYNTAX_CHECK_TIMEOUT = 8  # seconds; syntax/parse only, never runs tests
+
+
+def _syntax_check_written_file(path: str) -> Optional[str]:
+    """Return an error string if the written file fails a cheap syntax/parse
+    check for its extension, else None. Dispatches by extension:
+      .py            -> `python -m py_compile` (same interpreter the app runs).
+      .js/.mjs/.cjs  -> `node --check` IF node is on PATH; skip if node missing.
+      .json          -> json.loads.
+      anything else  -> no check (None).
+    Never raises: any failure to RUN the checker is swallowed and returns None
+    (the check is best-effort; it must not turn a saved edit into an error)."""
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".py":
+            try:
+                p = subprocess.run(
+                    [sys.executable, "-m", "py_compile", path],
+                    capture_output=True, text=True, timeout=_SYNTAX_CHECK_TIMEOUT,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if p.returncode != 0:
+                return (p.stderr or p.stdout or "py_compile failed").strip()
+            return None
+        if ext in (".js", ".mjs", ".cjs"):
+            node = shutil.which("node")
+            if not node:
+                return None  # node not installed — silently skip
+            try:
+                p = subprocess.run(
+                    [node, "--check", path],
+                    capture_output=True, text=True, timeout=_SYNTAX_CHECK_TIMEOUT,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if p.returncode != 0:
+                return (p.stderr or p.stdout or "node --check failed").strip()
+            return None
+        if ext == ".json":
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                return f"JSON parse error: {e}"
+            except OSError:
+                return None
+            return None
+        return None
+    except Exception:
+        # Best-effort: any unexpected failure must not break the edit result.
+        return None
+
+
+def _augment_with_syntax_check(result: dict, path: str) -> dict:
+    """Run the post-edit syntax check (if enabled via the
+    `agent_post_edit_syntax_check` setting, default True) and, on failure,
+    append the checker's error to the success `result` under `syntax_warning`
+    plus a trailing note in `output` so the model SEES it. Non-fatal: on any
+    problem the result is returned unchanged."""
+    try:
+        from src.settings import get_setting
+        if not get_setting("agent_post_edit_syntax_check", True):
+            return result
+        err = _syntax_check_written_file(path)
+        if err:
+            err = err[:MAX_OUTPUT_CHARS]
+            result["syntax_warning"] = err
+            base = result.get("output") or ""
+            result["output"] = (
+                base + f"\n\nSyntax check FAILED after this edit — fix it next:\n{err}"
+            ).strip()
+    except Exception:
+        pass
+    return result
 
 _CODENAV_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "__pycache__",
@@ -128,7 +211,7 @@ class EditFileTool:
         diff = _unified_diff(original, updated, path)
         if diff:
             result["diff"] = diff
-        return result
+        return _augment_with_syntax_check(result, path)
 
 class ReadFileTool:
     async def execute(self, content: str, ctx: dict) -> dict:
@@ -228,7 +311,7 @@ class WriteFileTool:
         result = {"output": f"Wrote {size} bytes to {path}", "exit_code": 0}
         if diff:
             result["diff"] = diff
-        return result
+        return _augment_with_syntax_check(result, path)
 
 class LsTool:
     async def execute(self, content: str, ctx: dict) -> dict:

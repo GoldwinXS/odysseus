@@ -127,6 +127,15 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     "agent_stream_timeout_seconds": 300,
+    # After a successful edit_file / write_file, run a cheap by-extension
+    # syntax/parse check on the written file (py_compile for .py, `node
+    # --check` for .js/.mjs/.cjs when node is on PATH, json.loads for .json)
+    # and, on failure, append the checker's error to the tool result so the
+    # model sees it and fixes it next round. Best-effort and non-fatal: the
+    # file is already saved; the check only augments the success result and
+    # never blocks or raises. Default ON (the reliability win); set False to
+    # disable if it ever gets noisy.
+    "agent_post_edit_syntax_check": True,
     # Extra directory roots that read_file / write_file may access, in
     # addition to the built-in project data/ and system temp dirs. Each
     # entry is an absolute path. Sensitive subpaths (.ssh, .gnupg, shell
@@ -154,6 +163,14 @@ DEFAULT_SETTINGS = {
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
+    # Default model for background sub-agents (spawn_agent). When a spawn_agent
+    # call doesn't pin a model, the harness routes to this instead of the
+    # inherited chat model — a cheap model is fine for routine background work.
+    # Blank means "inherit the parent chat's model". Mirrors the utility role:
+    # endpoint + model + ordered fallback chain.
+    "subagent_endpoint_id": "",
+    "subagent_model": "",
+    "subagent_model_fallbacks": [],
     "teacher_model": "",
     "teacher_enabled": False,
     "teacher_tier2_enabled": False,
@@ -275,6 +292,7 @@ _PER_USER_KEYS = {
     "default_endpoint_id", "default_model", "default_model_fallbacks",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
     "research_endpoint_id", "research_model",
+    "subagent_endpoint_id", "subagent_model", "subagent_model_fallbacks",
 }
 
 
