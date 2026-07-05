@@ -3977,7 +3977,9 @@ async function initUnifiedIntegrations() {
       if (!nameValue) { el('uf-api-msg').textContent = 'Name required'; el('uf-api-msg').style.color = 'var(--red)'; return; }
       if (!urlValue) { el('uf-api-msg').textContent = 'Base URL required'; el('uf-api-msg').style.color = 'var(--red)'; return; }
       const body = { name: nameValue, base_url: urlValue, auth_type: auth.value, auth_header: header.value, preset: presetKey };
-      if (key.value) body.api_key = key.value;
+      // Trim the key — mobile paste often appends a newline/space, which would
+      // be saved verbatim and produce a confusing 401 (Bearer "<token>\n").
+      if (key.value.trim()) body.api_key = key.value.trim();
       try {
         const u = _editId ? `/api/auth/integrations/${_editId}` : '/api/auth/integrations';
         const m = _editId ? 'PUT' : 'POST';
