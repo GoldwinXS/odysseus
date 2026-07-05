@@ -1112,7 +1112,7 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                 return {"error": "Image API returned unexpected format (no b64_json or url)"}
 
             return {
-                "results": f"Generated image for: {prompt[:100]}",
+                "results": f"Generated image for: {' '.join(str(prompt).split())}",
                 "image_url": image_url,
                 "image_id": image_id,
                 "image_prompt": prompt,

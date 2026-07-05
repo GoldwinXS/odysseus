@@ -154,8 +154,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             # "Direct link:" rather than an "image_url:" label — small models copied the
             # label token ("image_url") into the link href, producing a broken link.
+            # Echo the FULL prompt (whitespace collapsed to one line so the
+            # `_promote_image_fields` regex, which captures to end-of-line,
+            # picks up all of it). Previously truncated to [:100], which made
+            # the prompt shown back in the UI look cut off even though the
+            # image was generated from the complete prompt.
+            _prompt_echo = " ".join(str(prompt).split())
             result = (
-                f"Generated image for: {prompt[:100]}\n"
+                f"Generated image for: {_prompt_echo}\n"
                 f"Direct link: {image_url}\n"
                 f"model: {model_id}\nsize: {size}"
             )

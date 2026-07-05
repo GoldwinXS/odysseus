@@ -359,7 +359,20 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
 
 
 def _parse_generate_image(content: str) -> Dict:
-    lines = content.strip().split("\n")
+    content = content.strip()
+    # JSON form (matches the native tool schema) is the robust path — it
+    # survives multi-line prompts intact. Prefer it whenever the content looks
+    # like a JSON object. The legacy positional format below splits on newlines
+    # and keeps only line 1 as the prompt, which silently drops a multi-line
+    # prompt's remaining lines (or misreads them as model/size/quality).
+    if content.startswith("{"):
+        try:
+            d = json.loads(content)
+            if isinstance(d, dict) and str(d.get("prompt", "")).strip():
+                return {k: d[k] for k in ("prompt", "model", "size", "quality") if k in d}
+        except (json.JSONDecodeError, TypeError):
+            pass
+    lines = content.split("\n")
     args = {"prompt": lines[0].strip() if lines else ""}
     for i, key in enumerate(["model", "size", "quality"], 1):
         if len(lines) > i and lines[i].strip():
