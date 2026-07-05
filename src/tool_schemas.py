@@ -1454,16 +1454,25 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
                 content += "\n" + value
     elif tool_type == "manage_memory":
         action = args.get("action", "")
+        # Models routinely pass the memory text/query under a plausible-but-wrong
+        # key (content/query/value/q/memory) instead of "text" — accept any of
+        # them so a good call doesn't fail on the field name alone.
+        def _mem_text():
+            for k in ("text", "content", "query", "value", "q", "memory"):
+                v = args.get(k)
+                if v:
+                    return str(v)
+            return ""
         if action == "add":
-            content = "add\n" + args.get("text", "")
+            content = "add\n" + _mem_text()
             if args.get("category"):
                 content += "\n" + args["category"]
         elif action == "edit":
-            content = "edit\n" + args.get("memory_id", "") + "\n" + args.get("text", "")
+            content = "edit\n" + args.get("memory_id", "") + "\n" + _mem_text()
         elif action == "delete":
             content = "delete\n" + args.get("memory_id", "")
         elif action == "search":
-            content = "search\n" + args.get("text", "")
+            content = "search\n" + _mem_text()
         elif action == "list":
             content = "list"
             if args.get("category"):

@@ -120,7 +120,20 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
 # bounded, each run is round- and time-limited.
 _SUBAGENT_SEMAPHORE = asyncio.Semaphore(3)   # max concurrent sub-agents
 _SUBAGENT_MAX_ROUNDS = 12                     # tool-loop rounds per sub-agent
-_SUBAGENT_TIMEOUT_S = 240                     # wall-clock cap per sub-agent
+_SUBAGENT_TIMEOUT_S = 600                     # default wall-clock cap per sub-agent
+                                              # (was 240 — real coding sub-agents
+                                              # routinely exceeded it; tunable via
+                                              # the subagent_timeout_seconds setting)
+
+def _subagent_timeout() -> int:
+    """Live per-sub-agent wall-clock cap. Tunable so a slow model/task can be
+    given more headroom without a code change; falls back to the default."""
+    try:
+        from src.settings import get_setting
+        v = int(get_setting("subagent_timeout_seconds", _SUBAGENT_TIMEOUT_S) or _SUBAGENT_TIMEOUT_S)
+        return v if v > 0 else _SUBAGENT_TIMEOUT_S
+    except Exception:
+        return _SUBAGENT_TIMEOUT_S
 _SUBAGENT_RESULT_CAP = 30000                  # max chars of result delivered (the
                                               # parent sees this verbatim — keep it
                                               # generous so answers aren't truncated)
@@ -474,7 +487,7 @@ async def spawn_agent(
                         if "delta" in _d and not _d.get("thinking"):
                             _bits.append(_d["delta"])
             # Bound the wrap-up so a wedged summary round can't hang the run.
-            await asyncio.wait_for(_drain_summary(), timeout=_SUBAGENT_TIMEOUT_S)
+            await asyncio.wait_for(_drain_summary(), timeout=_subagent_timeout())
         except Exception as _sum_err:
             logger.warning("[subagent-run] summary round failed: %s", _sum_err)
             return ""
@@ -540,11 +553,12 @@ async def spawn_agent(
                         collected.append(d["delta"])
 
         error = None
+        _timeout_s = _subagent_timeout()
         try:
             async with _SUBAGENT_SEMAPHORE:
-                await asyncio.wait_for(_drain(), timeout=_SUBAGENT_TIMEOUT_S)
+                await asyncio.wait_for(_drain(), timeout=_timeout_s)
         except asyncio.TimeoutError:
-            error = f"Sub-agent timed out after {_SUBAGENT_TIMEOUT_S}s"
+            error = f"Sub-agent timed out after {_timeout_s}s"
         except asyncio.CancelledError:
             # Deliver whatever it produced before cancellation, then propagate so
             # the run manager records it as stopped/error and cleans up.

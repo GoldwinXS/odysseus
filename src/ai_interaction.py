@@ -316,6 +316,17 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
 
     action = lines[0].strip().lower()
 
+    # Tolerate "action query" on one line (e.g. `search webrts`, `add buy milk`)
+    # — the model naturally writes the verb and its argument together instead of
+    # splitting them across two lines. Peel the leading known action off and push
+    # the remainder down as line 2, so it hits the normal per-action parsing.
+    _KNOWN = ("list", "add", "edit", "delete", "search")
+    if action not in _KNOWN and " " in action:
+        _verb, _rest = action.split(" ", 1)
+        if _verb in _KNOWN and _rest.strip():
+            action = _verb
+            lines = [_verb, _rest.strip()] + lines[1:]
+
     if action == "list":
         category_filter = lines[1].strip().lower() if len(lines) > 1 and lines[1].strip() else None
         memories = _memory_manager.load(owner=owner)
