@@ -100,6 +100,40 @@ _BUILTIN_NPX_SERVERS = {
 MCP_DISABLED = os.environ.get("ODYSSEUS_DISABLE_MCP", "").lower() in ("1", "true", "yes")
 
 
+def _iter_remote_env_servers():
+    """Yield remote (SSE/HTTP) MCP servers declared in the environment.
+
+    Lets a user wire a token-authed remote MCP server — e.g. Home Assistant's
+    `/mcp_server/sse` endpoint — entirely from .env, so the long-lived token
+    lives alongside their other secrets and never has to be typed into chat or
+    stored via the API. Numbered so you can add several:
+
+        MCP_REMOTE_1_NAME=Home Assistant
+        MCP_REMOTE_1_URL=http://192.168.2.57:8123/mcp_server/sse
+        MCP_REMOTE_1_TOKEN=<long-lived access token>
+        MCP_REMOTE_1_TRANSPORT=sse        # sse (default) | http
+
+    Iteration stops at the first index whose *_URL is unset.
+    """
+    i = 1
+    while True:
+        url = os.environ.get(f"MCP_REMOTE_{i}_URL", "").strip()
+        if not url:
+            break
+        name = os.environ.get(f"MCP_REMOTE_{i}_NAME", "").strip() or f"Remote MCP {i}"
+        token = os.environ.get(f"MCP_REMOTE_{i}_TOKEN", "").strip()
+        transport = (os.environ.get(f"MCP_REMOTE_{i}_TRANSPORT", "").strip() or "sse").lower()
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        yield {
+            "server_id": f"remote_{i}",
+            "name": name,
+            "transport": transport if transport in ("sse", "http") else "sse",
+            "url": url,
+            "headers": headers,
+        }
+        i += 1
+
+
 # Strong references to the fire-and-forget startup tasks scheduled below.
 # asyncio only keeps weak references to tasks created via create_task, so
 # without this the GC can collect a task mid-execution and the server
@@ -150,6 +184,29 @@ async def register_builtin_servers(mcp_manager):
             logger.warning(f"Built-in MCP server script not found: {script_path}")
             continue
         _spawn_bg(_connect_python_server(server_id, script_path, name))
+
+    # Remote (SSE/HTTP) MCP servers declared via .env — e.g. a token-authed
+    # Home Assistant MCP endpoint. Static-header auth, so no browser OAuth flow.
+    async def _connect_remote_server(cfg: dict):
+        try:
+            ok = await mcp_manager.connect_server(
+                server_id=cfg["server_id"],
+                name=cfg["name"],
+                transport=cfg["transport"],
+                url=cfg["url"],
+                headers=cfg["headers"],
+            )
+            if ok:
+                logger.info(f"Remote MCP server registered: {cfg['name']} ({cfg['transport']})")
+            else:
+                logger.warning(f"Remote MCP server failed to connect: {cfg['name']} — {cfg['url']}")
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:
+            logger.warning(f"Remote MCP server {cfg['name']} error: {type(e).__name__}: {e}")
+
+    for _cfg in _iter_remote_env_servers():
+        _spawn_bg(_connect_remote_server(_cfg))
 
     # Register NPX-based servers in the background (they take longer to start)
     npx_path = _find_npx()
