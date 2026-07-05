@@ -650,8 +650,13 @@ export function mdToHtml(src, opts) {
         return placeholder;
       } catch (e) { return match; }
     });
-    // Inline math: $...$  (not preceded/followed by $ or digit, not spanning multiple lines)
-    s = s.replace(/(?<!\$)\$(?!\$)([^\$\n]+?)\$(?!\$)/g, (match, math) => {
+    // Inline math: $...$  (single-line). The opener must NOT be followed by a
+    // digit or whitespace, and the closer must NOT be followed by a digit —
+    // otherwise currency ("$0.435/M ... maybe $0.01") gets swallowed as math,
+    // rendering the whole span between two prices in italic KaTeX. Real inline
+    // math ($x$, $\frac{a}{b}$) starts with a letter/backslash, not a digit.
+    // (The old regex claimed this guard in a comment but never enforced it.)
+    s = s.replace(/(?<!\$)\$(?![\$\d])([^\$\n]+?)\$(?![\$\d])/g, (match, math) => {
       try {
         const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
