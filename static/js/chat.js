@@ -116,13 +116,21 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     const total = items.length;
     const collapsed = _planBarIsCollapsed();
     const dim = 'var(--text-secondary,#9a9aa2)';
+    const allDone = total > 0 && done === total;
     const chevron = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex:0 0 auto;transform:rotate(${collapsed ? 0 : 90}deg);transition:transform .15s"><polyline points="9 6 15 12 9 18"/></svg>`;
+    const checkIcon = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto"><polyline points="20 6 9 17 4 12"/></svg>`;
+    const xIcon = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+    const countColor = allDone ? 'var(--color-success,#3fb950)' : dim;
     const header = `<div data-plan-toggle role="button" tabindex="0"
         title="${collapsed ? 'Show plan' : 'Hide plan'}"
         style="display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;user-select:none;font-size:12px;color:var(--text-primary,#e8e8ea)">
         <span style="font-weight:600">Plan</span>
-        ${total ? `<span style="color:${dim};font-variant-numeric:tabular-nums">· ${done}/${total}</span>` : ''}
-        <span style="margin-left:auto;color:${dim};display:inline-flex">${chevron}</span>
+        ${total ? `<span style="color:${countColor};font-variant-numeric:tabular-nums;display:inline-flex;align-items:center;gap:3px">· ${done}/${total}${allDone ? ` ${checkIcon} done` : ''}</span>` : ''}
+        <span style="margin-left:auto;display:inline-flex;align-items:center;gap:2px;color:${dim}">
+          <button data-plan-dismiss type="button" title="Dismiss plan"
+            style="background:transparent;border:0;color:inherit;cursor:pointer;padding:3px;display:inline-flex;align-items:center;border-radius:5px">${xIcon}</button>
+          <span style="display:inline-flex;padding:0 2px">${chevron}</span>
+        </span>
       </div>`;
     let body = '';
     if (!collapsed) {
@@ -146,6 +154,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       const toggle = () => { _setPlanBarCollapsed(!_planBarIsCollapsed()); _renderPlanPanel(); };
       hdr.addEventListener('click', toggle);
       hdr.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    }
+    const dismissBtn = bar.querySelector('[data-plan-dismiss]');
+    if (dismissBtn) {
+      // Clear the plan: hides the bar AND stops re-pinning it as approved_plan
+      // next turn. User-initiated, so losing the plan context is intended.
+      dismissBtn.addEventListener('click', (e) => { e.stopPropagation(); _setStoredPlan(''); });
     }
   }
 
@@ -5518,6 +5532,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     continueFrom,
     _appendViewReportLink,
     hasActiveStream,
+    // Clear the active-plan bar (used on session switch so a finished/other
+    // session's plan doesn't linger into the next chat).
+    clearPlan: () => _setStoredPlan(''),
   };
 
   // Single delegated handler for tool-call fold/expand. One listener on

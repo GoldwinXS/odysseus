@@ -1919,6 +1919,11 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     } catch (e) {}
     const meta = sessions.find(s => s.id === id);
 
+    // Clear the active-plan bar so the previous session's plan doesn't linger
+    // into this one (the plan is client-side/in-memory; a live run in the new
+    // session will repopulate it via plan_update).
+    try { if (window.chatModule && window.chatModule.clearPlan) window.chatModule.clearPlan(); } catch (e) {}
+
     // Detach any in-flight stream to background instead of aborting
     try {
       if (window.chatModule) {
