@@ -6,6 +6,7 @@ Consolidates the 4+ copies of normalize_base / resolve_endpoint logic into one p
 
 import json
 import logging
+import os
 import socket
 import subprocess
 from typing import Optional, Tuple, Dict
@@ -86,6 +87,19 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
         creds = resolve_runtime_credentials(auth_id, owner=owner)
         base = normalize_base(creds.get("base_url") or base)
         api_key = creds.get("api_key")
+    if not api_key:
+        # Fall back to a provider env var when no key is stored on the row.
+        # Lets users keep the secret in .env instead of the endpoint form —
+        # handy on mobile, or when the UI offers no edit-key flow.
+        host = (urlparse(base).hostname or "").lower()
+        env_name = {
+            "api.openai.com": "OPENAI_API_KEY",
+            "api.deepseek.com": "DEEPSEEK_API_KEY",
+            "openrouter.ai": "OPENROUTER_API_KEY",
+            "api.anthropic.com": "ANTHROPIC_API_KEY",
+        }.get(host)
+        if env_name:
+            api_key = os.getenv(env_name) or api_key
     return base, api_key
 
 
