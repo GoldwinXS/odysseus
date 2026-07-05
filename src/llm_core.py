@@ -1187,10 +1187,24 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
         # instead of re-billing it. Skip caching tiny one-off prompts, where the
         # cache-WRITE premium wouldn't pay back (no reuse). Presence of `tools`
         # means an agentic/multi-round call, where the prefix is always reused.
-        system_block = {"type": "text", "text": system_text}
-        if tools or len(system_text) > 4000:
-            system_block["cache_control"] = {"type": "ephemeral"}
-        payload["system"] = [system_block]
+        # Split at the "## Available tools" boundary the prompt assembler
+        # guarantees: everything BEFORE it (preamble + rules) is byte-stable
+        # across turns, everything after varies with per-turn tool selection.
+        # Caching the stable block separately means the frozen core keeps
+        # hitting even on turns where the tool tail changed; when the tail is
+        # unchanged too, the messages breakpoint still covers the whole prefix.
+        _SPLIT = "\n\n## Available tools"
+        _idx = system_text.find(_SPLIT)
+        if _idx > 0 and (tools or len(system_text) > 4000):
+            stable = {"type": "text", "text": system_text[:_idx],
+                      "cache_control": {"type": "ephemeral"}}
+            volatile = {"type": "text", "text": system_text[_idx:].lstrip("\n")}
+            payload["system"] = [stable, volatile]
+        else:
+            system_block = {"type": "text", "text": system_text}
+            if tools or len(system_text) > 4000:
+                system_block["cache_control"] = {"type": "ephemeral"}
+            payload["system"] = [system_block]
     if stream:
         payload["stream"] = True
     # Convert OpenAI-format tools to Anthropic format
