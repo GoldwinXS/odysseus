@@ -886,16 +886,23 @@ async function initImageSettings() {
   try {
     const modelsRes = await fetch('/api/models', { credentials: 'same-origin' });
     const modelsData = await modelsRes.json();
-    // List every model served by an image-type endpoint — local diffusion
-    // (SDXL, etc.) AND cloud (gpt-image-1, dall-e-3), which are pinned so they
-    // appear even though OpenAI omits image models from /v1/models. The old
-    // build scoped this to an inpaint-only allowlist, which hid the actual
-    // generation models (including gpt-image-1 and plain SDXL).
+    // List image-GENERATION models served by image-type endpoints — local
+    // diffusion (SDXL, etc.) AND cloud (gpt-image-1, dall-e-3). A keyed OpenAI
+    // endpoint caches its whole chat catalog (gpt-4o, o1, …), so match on
+    // known image-gen name patterns to keep those out of the picker. The old
+    // build instead used an inpaint-only allowlist that hid the real models.
+    const _isImageGenModel = (mid) => {
+      const l = String(mid || '').toLowerCase();
+      return l.includes('gpt-image') || l.includes('dall-e') || l.includes('dalle')
+        || l.includes('stable-diffusion') || l.includes('sdxl') || l.includes('sd3') || l.includes('sd-3')
+        || l.includes('flux') || l.includes('imagen') || l.includes('diffusion')
+        || l.includes('kandinsky') || l.includes('pixart') || l.includes('playground-v');
+    };
     const imageModels = [];
     (modelsData.items || []).forEach(item => {
       if ((item.model_type || 'llm') !== 'image') return;
       [...(item.models || []), ...(item.models_extra || [])].forEach(mid => {
-        if (mid && !imageModels.includes(mid)) imageModels.push(mid);
+        if (mid && _isImageGenModel(mid) && !imageModels.includes(mid)) imageModels.push(mid);
       });
     });
     sortModelIds(imageModels).forEach(mid => { const opt = document.createElement('option'); opt.value = mid; opt.textContent = mid; modelSel.appendChild(opt); });
