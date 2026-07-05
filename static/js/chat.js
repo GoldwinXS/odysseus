@@ -80,59 +80,73 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     return rows;
   }
 
+  // Plan bar collapse state (localStorage-backed; default expanded — the plan is
+  // useful to see, but it's capped-height + collapsible so a long list never
+  // dominates or overlaps the composer on mobile).
+  let _planBarCollapsed = null;
+  function _planBarIsCollapsed() {
+    if (_planBarCollapsed === null) {
+      try { _planBarCollapsed = localStorage.getItem('odysseus-plan-collapsed') === '1'; }
+      catch (_) { _planBarCollapsed = false; }
+    }
+    return _planBarCollapsed;
+  }
+  function _setPlanBarCollapsed(v) {
+    _planBarCollapsed = v;
+    try { localStorage.setItem('odysseus-plan-collapsed', v ? '1' : '0'); } catch (_) {}
+  }
+
+  // Render the active plan as a collapsible in-flow bar between chat and the
+  // composer (#agent-plan-bar), mirroring #subagent-bar — NOT the old absolute
+  // floating panel, which overlapped the text input on mobile.
   function _renderPlanPanel() {
-    let panel = document.getElementById('agent-plan-panel');
+    // Retire any stale floating panel from the old implementation.
+    const _stale = document.getElementById('agent-plan-panel');
+    if (_stale) _stale.remove();
+    const bar = document.getElementById('agent-plan-bar');
+    if (!bar) return;
     if (!_storedPlan || !_storedPlan.trim()) {
-      if (panel) panel.remove();
+      if (!bar.hidden) { bar.hidden = true; bar.innerHTML = ''; }
       return;
     }
-    const container = document.getElementById('chat-container') || document.body;
-    if (!panel) {
-      panel = document.createElement('div');
-      panel.id = 'agent-plan-panel';
-      // Reuse existing theme vars (no new CSS vars / no emoji). Lightweight
-      // docked checklist pinned bottom-right of the chat area.
-      panel.style.cssText = [
-        'position:absolute', 'right:16px', 'bottom:96px', 'z-index:20',
-        'max-width:320px', 'max-height:45vh', 'overflow:auto',
-        'background:var(--panel)', 'border:1px solid var(--border)',
-        'border-radius:8px', 'padding:10px 12px',
-        'font-size:12px', 'line-height:1.5', 'color:var(--fg)',
-        'box-shadow:0 2px 10px rgba(0,0,0,0.3)',
-      ].join(';');
-      container.appendChild(panel);
-    }
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     const rows = _parsePlanLines(_storedPlan);
     const items = rows.filter((r) => r.item);
     const done = items.filter((r) => r.done).length;
     const total = items.length;
-    const head = document.createElement('div');
-    head.style.cssText = 'font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px;align-items:center;';
-    const title = document.createElement('span');
-    title.textContent = 'Plan';
-    const count = document.createElement('span');
-    count.style.cssText = 'opacity:0.7;font-weight:400;';
-    if (total) count.textContent = `${done}/${total}`;
-    head.appendChild(title); head.appendChild(count);
-    const list = document.createElement('div');
-    rows.forEach((r) => {
-      const row = document.createElement('div');
-      if (r.item) {
-        row.style.cssText = 'display:flex;gap:6px;align-items:flex-start;padding:1px 0;';
-        const box = document.createElement('span');
-        box.textContent = r.done ? '[x]' : '[ ]';
-        box.style.cssText = 'font-family:var(--mono,monospace);opacity:0.85;flex:0 0 auto;';
-        const txt = document.createElement('span');
-        txt.textContent = r.text;
-        if (r.done) txt.style.cssText = 'opacity:0.55;text-decoration:line-through;';
-        row.appendChild(box); row.appendChild(txt);
-      } else {
-        row.style.cssText = 'font-weight:600;margin-top:6px;';
-        row.textContent = r.text;
-      }
-      list.appendChild(row);
-    });
-    panel.replaceChildren(head, list);
+    const collapsed = _planBarIsCollapsed();
+    const dim = 'var(--text-secondary,#9a9aa2)';
+    const chevron = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="flex:0 0 auto;transform:rotate(${collapsed ? 0 : 90}deg);transition:transform .15s"><polyline points="9 6 15 12 9 18"/></svg>`;
+    const header = `<div data-plan-toggle role="button" tabindex="0"
+        title="${collapsed ? 'Show plan' : 'Hide plan'}"
+        style="display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;user-select:none;font-size:12px;color:var(--text-primary,#e8e8ea)">
+        <span style="font-weight:600">Plan</span>
+        ${total ? `<span style="color:${dim};font-variant-numeric:tabular-nums">· ${done}/${total}</span>` : ''}
+        <span style="margin-left:auto;color:${dim};display:inline-flex">${chevron}</span>
+      </div>`;
+    let body = '';
+    if (!collapsed) {
+      const list = rows.map((r) => {
+        if (r.item) {
+          const box = r.done ? '[x]' : '[ ]';
+          const st = r.done ? 'opacity:.5;text-decoration:line-through' : '';
+          return `<div style="display:flex;gap:6px;align-items:flex-start;padding:1px 0;font-size:12px">
+            <span style="font-family:var(--mono,monospace);opacity:.85;flex:0 0 auto">${box}</span>
+            <span style="${st}">${esc(r.text)}</span></div>`;
+        }
+        return `<div style="font-weight:600;margin-top:6px;font-size:12px">${esc(r.text)}</div>`;
+      }).join('');
+      body = `<div style="border-top:1px solid var(--border,#3a3a42);max-height:40vh;overflow:auto;padding:6px 12px 8px;line-height:1.5;color:var(--fg)">${list}</div>`;
+    }
+    bar.hidden = false;
+    bar.style.cssText = 'max-width:800px;width:100%;margin:0 auto 6px;box-sizing:border-box';
+    bar.innerHTML = `<div style="background:var(--panel,#1e1e24);border:1px solid var(--border,#3a3a42);border-radius:10px;overflow:hidden">${header}${body}</div>`;
+    const hdr = bar.querySelector('[data-plan-toggle]');
+    if (hdr) {
+      const toggle = () => { _setPlanBarCollapsed(!_planBarIsCollapsed()); _renderPlanPanel(); };
+      hdr.addEventListener('click', toggle);
+      hdr.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    }
   }
 
   // Persist + render the current plan. Called from the `plan_update` SSE
