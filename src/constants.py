@@ -79,6 +79,10 @@ MAX_DIFF_LINES = 400            # cap for edit_file unified-diff display
 WEB_FETCH_SOFT_MAX_BYTES = 2_000_000    # default download budget (2 MB)
 WEB_FETCH_HARD_MAX_BYTES = 20_000_000   # absolute ceiling, even with override (20 MB)
 
+# search_tools (tool-discovery) cap: max tools returned for a query so the
+# lean one-line-per-tool list stays token-cheap. Matches the RAG default k.
+SEARCH_TOOLS_MAX_RESULTS = 8
+
 # API Configuration
 MAX_CONTEXT_MESSAGES = 90
 REQUEST_TIMEOUT = 20

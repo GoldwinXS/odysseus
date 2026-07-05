@@ -51,6 +51,11 @@ ALWAYS_AVAILABLE = frozenset({
     # Checking on / cancelling a running sub-agent can follow any message
     # ("is it done yet?", "stop the agent"); keep it reachable alongside spawn.
     "manage_agents",
+    # Tool discovery. RAG only surfaces ~8 tools per turn; the rest are
+    # invisible to the model. search_tools lets the model look up and unlock a
+    # capability it needs that wasn't RAG-selected, so it must be reachable
+    # every turn regardless of topic.
+    "search_tools",
 })
 
 # Tools that the Personal Assistant always has access to during scheduled
@@ -146,6 +151,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "app_api": "Generic loopback to allowed Odysseus internal endpoints. Use this when the user wants something the UI can do but there's no named tool for it. Covers calendar, gallery, library/documents, memory, notes, tasks, settings, research, compare, cookbook GPUs/state — allowed UI buttons hit /api/* endpoints and you can hit them too. Sensitive auth/user/admin/shell paths and host-control Cookbook mutation routes are blocked; do NOT use app_api for shell commands, package installs, engine rebuilds, or PID signalling. Use named command tooling for shell commands. action='endpoints' with filter=<keyword> lists available endpoints. action='call' takes method+path+body. Hits same routes the UI uses — auth flows free. NOTE: themes are NOT an API endpoint — use the ui_control tool (create_theme / set_theme), not app_api. SESSIONS/CHATS: do NOT use app_api for these — GET /api/sessions returns EMPTY for tool calls (it's owner-filtered and tool calls authenticate as a different identity). EMAIL ACCOUNTS: do NOT use /api/email/accounts via app_api; use list_email_accounts, list_emails, and read_email instead. To list/rename/archive/delete/fork chats use the list_sessions and manage_session tools instead.",
     "edit_image": "Edit an image in the gallery: upscale (increase resolution), remove background (rembg), inpaint (fill selected area), or harmonize (blend edits). Specify image ID and action.",
     "trigger_research": "Start a deep research job on any topic — appears in the Deep Research sidebar, streams progress, produces a detailed report. Use for 'research X', 'look into Y', 'do deep research on Z', 'investigate'. NOT a scheduled task — it runs now and surfaces in the sidebar.",
+    "search_tools": "Discover tools that aren't in this turn's small RAG-selected set. Only ~8 relevant tools are shown per turn; many more exist. Call search_tools with a query describing the capability you need (e.g. 'send an email', 'add a calendar event', 'serve a model') to get the best-matching tools; call it with an empty query to browse the full catalog. The matched tools become callable on the next round — just call them normally.",
     "manage_bg_jobs": "Inspect and control detached background `bash` jobs (the ones started with a `#!bg` marker). action='list' shows this chat's jobs (id/status/age/command); action='output' returns a job's captured output so far (check on a long-running job, or re-read a finished one); action='kill' stops a runaway job by id. Use for 'is the background job done', 'check on that job', 'show the build output', 'kill the background job', 'stop the bg task'. output/kill need a job_id from list.",
 }
 
@@ -594,6 +600,183 @@ class ToolIndex:
         if contact_only_signal and "manage_contact" in base:
             base.discard("manage_memory")
         return base
+
+
+# ── search_tools: model-facing tool discovery ──
+#
+# RAG only surfaces ~8 tools per turn; the rest are invisible to the model.
+# search_tools lets a model look up a capability it needs and unlock the
+# matching tools for the next round. Two matching paths, always MERGED:
+#   1. embedding retrieve() (semantic) — used when the tool index is healthy.
+#   2. a keyword/substring/token-overlap scan over the catalog names +
+#      descriptions — ALWAYS run, so discovery still works when the embeddings
+#      endpoint is down (retrieve() returns []). This is the mandatory fallback.
+
+# Tokens too generic to carry signal in the keyword scan.
+_SEARCH_STOPWORDS = frozenset({
+    "a", "an", "the", "to", "of", "for", "and", "or", "in", "on", "with",
+    "my", "me", "i", "is", "are", "it", "this", "that", "how", "do", "can",
+    "please", "want", "need", "get", "some", "any", "tool", "tools", "use",
+    "using", "help", "about", "what", "which", "find", "search",
+})
+
+
+def _tokenize(text: str) -> List[str]:
+    return [t for t in re.findall(r"[a-z0-9_]+", (text or "").lower()) if t]
+
+
+def _search_catalog() -> Dict[str, str]:
+    """Name -> description catalog used for tool discovery.
+
+    Built from BUILTIN_TOOL_DESCRIPTIONS plus any connected MCP tools (so a
+    model can discover MCP capabilities too). Embedding-independent — safe to
+    call when the vector index is down.
+    """
+    catalog: Dict[str, str] = dict(BUILTIN_TOOL_DESCRIPTIONS)
+    try:
+        from src.tool_utils import get_mcp_manager
+        mcp = get_mcp_manager()
+        if mcp:
+            text = mcp.get_tool_descriptions_for_prompt({}) or ""
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("- ") and ":" in line:
+                    name, desc = line[2:].split(":", 1)
+                    name = name.strip()
+                    if name and name not in catalog:
+                        catalog[name] = desc.strip()
+    except Exception:
+        pass
+    return catalog
+
+
+def _keyword_match(query: str, catalog: Dict[str, str]) -> List[str]:
+    """Rank catalog tools by keyword/substring/token overlap against a query.
+
+    Returns names best-first. Deterministic and embedding-free — this is the
+    fallback that keeps search_tools useful when retrieve() returns [].
+    """
+    ql = (query or "").lower().strip()
+    if not ql:
+        return []
+    q_tokens = [t for t in _tokenize(ql) if t not in _SEARCH_STOPWORDS]
+    scored = []
+    for name, desc in catalog.items():
+        name_l = name.lower()
+        desc_l = (desc or "").lower()
+        haystack = name_l + " " + desc_l
+        score = 0.0
+        # Whole-phrase substring hit — strongest signal.
+        if ql in haystack:
+            score += 5.0
+        name_tokens = set(_tokenize(name_l))
+        for tok in q_tokens:
+            if tok in name_tokens:
+                score += 3.0          # token appears in the tool NAME
+            elif re.search(rf"\b{re.escape(tok)}\b", desc_l):
+                score += 1.5          # whole-word hit in description
+            elif tok in haystack:
+                score += 0.5          # loose substring hit
+        if score > 0:
+            scored.append((score, name))
+    # Highest score first, then name for stable ordering.
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    return [name for _score, name in scored]
+
+
+def search_tools_catalog(
+    query: str = "",
+    limit: int = 8,
+    exclude: Optional[Set[str]] = None,
+    disabled: Optional[Set[str]] = None,
+) -> List[str]:
+    """Return tool NAMES matching ``query`` for discovery/unlock.
+
+    - query given: embedding retrieve() (if available) MERGED with a keyword
+      scan, deduped, capped at ``limit``.
+    - query empty: the full catalog, sorted by name (browse mode) — not capped.
+    Excludes ``exclude`` (already loaded this turn) and ``disabled``
+    (admin-disabled) names in both modes. Never raises.
+    """
+    exclude = {n for n in (exclude or set())}
+    disabled = {n for n in (disabled or set())}
+    # search_tools is always available; never list itself as a discovery result.
+    exclude.add("search_tools")
+    catalog = _search_catalog()
+
+    def _drop(names):
+        seen = set()
+        out = []
+        for n in names:
+            if n in seen or n in exclude or n in disabled or n not in catalog:
+                continue
+            seen.add(n)
+            out.append(n)
+        return out
+
+    if not (query or "").strip():
+        # Browse mode: everything, alphabetical.
+        return _drop(sorted(catalog.keys()))
+
+    ordered: List[str] = []
+    # 1. Semantic retrieve() — best-effort; empty when embeddings are down.
+    try:
+        idx = get_tool_index()
+        if idx is not None:
+            ordered.extend(idx.retrieve(query, k=max(limit * 2, limit)))
+    except Exception as e:
+        logger.debug(f"search_tools retrieve() failed, using keyword only: {e}")
+    # 2. Keyword scan — ALWAYS run and merged in (mandatory fallback).
+    ordered.extend(_keyword_match(query, catalog))
+
+    return _drop(ordered)[:limit]
+
+
+def format_search_tools_result(
+    query: str = "",
+    limit: int = 8,
+    exclude: Optional[Set[str]] = None,
+    disabled: Optional[Set[str]] = None,
+) -> Dict:
+    """Run search_tools_catalog and format a lean, model-facing result.
+
+    Returns {"output": <text>, "tools": [names], "exit_code": 0}. The "tools"
+    list is what the agent loop unions into the next round's tool set; the
+    text is one line per tool (name + one-liner, NO param schemas) to stay
+    token-cheap — the real schema arrives when the tool loads next round.
+    """
+    exclude = {n for n in (exclude or set())}
+    disabled = {n for n in (disabled or set())}
+    catalog = _search_catalog()
+    names = search_tools_catalog(query, limit=limit, exclude=exclude, disabled=disabled)
+
+    def _oneliner(desc: str) -> str:
+        # First sentence / first clause, trimmed — keep it to one short line.
+        text = " ".join((desc or "").split())
+        for sep in (". ", "; "):
+            i = text.find(sep)
+            if 0 < i < 160:
+                return text[:i]
+        return text[:160]
+
+    lines = [f"- {n} — {_oneliner(catalog.get(n, ''))}" for n in names]
+    if (query or "").strip():
+        header = (
+            f"Tools matching '{query.strip()}':" if names
+            else f"No tools matched '{query.strip()}'. Call search_tools with an "
+                 f"empty query to browse the full catalog."
+        )
+    else:
+        header = f"All available tools ({len(names)}):"
+
+    footer = (
+        "These tools are now available — just call them normally on your next "
+        "turn (their full parameters arrive with them). No need to call "
+        "search_tools again for them."
+    ) if names else ""
+
+    body = "\n".join(x for x in [header, "\n".join(lines), footer] if x)
+    return {"output": body, "tools": names, "exit_code": 0}
 
 
 # ── Singleton ──

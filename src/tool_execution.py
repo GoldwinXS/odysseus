@@ -523,6 +523,7 @@ async def _direct_fallback(
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
     disabled_tools: Optional[set] = None,
+    relevant_tools: Optional[set] = None,
 ) -> Optional[Dict]:
     _subproc_env = {
         **os.environ,
@@ -542,6 +543,9 @@ async def _direct_fallback(
             # spawn_agent can propagate it to the sub-agent (a child must not regain
             # a tool the parent turn had disabled — see SpawnAgentTool.execute).
             "disabled_tools": disabled_tools,
+            # This turn's already-selected tool set, so search_tools can exclude
+            # tools the model can already call from its discovery results.
+            "relevant_tools": relevant_tools,
         }
 
         from src.agent_tools import TOOL_HANDLERS
@@ -580,6 +584,7 @@ async def execute_tool_block(
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     workspace: Optional[str] = None,
     tool_policy: Optional[Any] = None,
+    relevant_tools: Optional[set] = None,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -596,6 +601,7 @@ async def execute_tool_block(
             owner=owner,
             progress_cb=progress_cb,
             tool_policy=tool_policy,
+            relevant_tools=relevant_tools,
         )
         return output
     finally:
@@ -609,6 +615,7 @@ async def _execute_tool_block_impl(
     owner: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
     tool_policy: Optional[Any] = None,
+    relevant_tools: Optional[set] = None,
 ) -> Tuple[str, Dict]:
     """Execute a single tool block. Returns (description, result_dict).
 
@@ -957,6 +964,7 @@ async def _execute_tool_block_impl(
             tool, content, progress_cb=progress_cb,
             session_id=session_id, owner=owner,
             disabled_tools=disabled_tools,
+            relevant_tools=relevant_tools,
         )
 
         if isinstance(res, tuple):

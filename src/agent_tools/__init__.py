@@ -26,6 +26,7 @@ from .document_tools import CreateDocumentTool, UpdateDocumentTool, EditDocument
 from .interaction_tools import AskUserTool, UpdatePlanTool
 from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool, SpawnAgentTool, ManageAgentsTool
 from .bg_job_tools import ManageBgJobsTool
+from .discovery_tools import SearchToolsTool
 from .session_tools import CreateSessionTool, ListSessionsTool, SendToSessionTool, ManageSessionTool
 from .admin_tools import (
     ADMIN_TOOL_HANDLERS,
@@ -58,6 +59,7 @@ TOOL_HANDLERS = {
     "manage_agents": ManageAgentsTool().execute,
     "list_models": ListModelsTool().execute,
     "manage_bg_jobs": ManageBgJobsTool().execute,
+    "search_tools": SearchToolsTool().execute,
     "create_session": CreateSessionTool().execute,
     "list_sessions": ListSessionsTool().execute,
     "send_to_session": SendToSessionTool().execute,
@@ -76,7 +78,7 @@ PYTHON_TIMEOUT = 30
 
 # Tool types that trigger execution
 TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_file", "edit_file",
-             "grep", "glob", "ls", "get_workspace", "manage_bg_jobs",
+             "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "search_tools",
              "create_document", "update_document", "edit_document",
              "search_chats",
              "chat_with_model", "spawn_agent", "manage_agents",

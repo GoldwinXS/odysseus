@@ -53,6 +53,31 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_tools",
+            "description": (
+                "Discover tools that are NOT in this turn's small selected set. "
+                "Only the tools relevant to this turn are shown; many more exist. "
+                "Call this with a `query` describing the capability you need "
+                "(e.g. 'send an email', 'add a calendar event', 'serve a model') "
+                "to get the best-matching tools, or with an empty query to browse "
+                "the full catalog. The matched tools become callable on your NEXT "
+                "turn — then just call them normally."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What capability you need. Empty to list the full catalog.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Quick single web lookup for a fact or current event mid-task. NOT for 'research X' / 'do research on X' — those are deep-research jobs; use trigger_research instead.",
             "parameters": {
@@ -1413,6 +1438,16 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = "\n".join(blocks)
     elif tool_type == "update_document":
         content = args.get("content", "")
+    elif tool_type == "search_tools":
+        # The handler parses {"query": ...} (or a bare string). Normalise any
+        # plausible key so a native call with query/q/search all reach it.
+        _q = ""
+        for _k in ("query", "q", "search", "text", "description"):
+            _v = args.get(_k)
+            if isinstance(_v, str) and _v.strip():
+                _q = _v.strip()
+                break
+        content = json.dumps({"query": _q})
     elif tool_type == "search_chats":
         content = args.get("query", "")
     elif tool_type == "chat_with_model":

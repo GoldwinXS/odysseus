@@ -188,6 +188,7 @@ _AGENT_RULES = """\
 - Only claim what a tool result proves. Say "done"/"fixed"/"sent" only when a tool result this turn shows it; if a step failed or was skipped, say so plainly.
 - Do what was asked, then stop. No unrequested extras (sending, deleting, installing, reorganizing) — suggest follow-ups instead of doing them.
 - If a needed tool/domain is missing from this turn, say what is missing briefly instead of pretending.
+- You are shown only the tools relevant to this turn; more exist. If you need a capability you don't see, call `search_tools` with a short description of it — the matching tools become callable next turn.
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
@@ -203,6 +204,7 @@ _API_AGENT_RULES = """\
 - Only claim what a tool result proves. Say "done"/"fixed"/"sent" only when a tool result this turn shows it; if a step failed or was skipped, say so plainly.
 - Do what was asked, then stop. No unrequested extras (sending, deleting, installing, reorganizing) — suggest follow-ups instead of doing them.
 - If a needed tool/domain is missing from this turn, say what is missing briefly instead of pretending.
+- You are shown only the tools relevant to this turn; more exist. If you need a capability you don't see, call `search_tools` with a short description of it — the matching tools become callable next turn.
 - Keep answers concise unless the user asks for depth.
 - After a tool succeeds, do not second-guess it; reply with one short confirmation unless more work remains.
 - After a tool fails, retry with a concrete fix or state what is blocking you.
@@ -485,6 +487,7 @@ If the user asks for a reminder/alarm before the event, pass `reminder_minutes` 
 `calendar` accepts a name ("Main") or short-id prefix.""",
     "spawn_agent": "- ```spawn_agent``` — Spawn/dispatch a sub-agent that runs a full tool-using loop on a self-contained task IN THE BACKGROUND and delivers its result back into the chat when done (returns immediately — do NOT wait for it). Content = the task (optional first line `model: <name>`). The sub-agent has files/shell/browser tools but CANNOT spawn more agents. Use to dispatch/delegate a focused subtask, e.g. `spawn_agent` then `screenshot localhost:1338 and list what looks visually wrong`.",
     "manage_agents": "- ```manage_agents``` — See which background sub-agents are running in this chat, or cancel one. Content: empty/`list` to list them (id, model, elapsed), or `stop <id>` (e.g. `stop sub_3`) to cancel a running sub-agent.",
+    "search_tools": "- ```search_tools``` — Discover tools NOT shown this turn. Only the tools relevant to this turn are listed; many more exist. Content = a plain-text query for the capability you need (e.g. `send an email`, `add a calendar event`, `serve a model`), or empty to browse the full catalog. The matched tools become callable on your NEXT turn — then just call them normally.",
     "create_session": "- ```create_session``` — Create a new chat. Line 1 = chat name, line 2 = model name. Use for background/parallel work.",
     "list_sessions": "- ```list_sessions``` — List chats sorted MOST-RECENT FIRST (the UI calls them 'chats') with clickable chat-title links. Output includes a relative \"last active\" timestamp per row, so the first row is the user's most recent chat. Content = optional filter keyword (matches chat name). When answering, preserve the `[title](#session-id)` links exactly; do not convert them into plain text.",
     "send_to_session": "- ```send_to_session``` — Send a message to another session. Line 1 = session_id, rest = message. Use for orchestrating work across sessions.",
@@ -662,7 +665,11 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
         hint = ", ".join(sample)
         if len(not_shown) > 5:
             hint += f", ... ({len(not_shown) - 5} more)"
-        parts.append(f"(Other tools available when needed: {hint})")
+        parts.append(
+            f"({len(not_shown)} more tools exist (e.g. {hint}). "
+            f"Call `search_tools` with what you need to make the matching ones "
+            f"callable next turn.)"
+        )
 
     parts.extend(_domain_rules_for_tools(included))
     return "\n\n".join(parts)
@@ -3894,6 +3901,7 @@ async def stream_agent_loop(
                             owner=owner,
                             progress_cb=_push_progress,
                             workspace=workspace,
+                            relevant_tools=_relevant_tools,
                         )
                     finally:
                         # Sentinel so the drainer knows to stop.
@@ -3965,6 +3973,29 @@ async def stream_agent_loop(
                                 break
                     except Exception as _e:
                         logger.debug(f"skill requires_toolsets unlock skipped: {_e}")
+
+            # search_tools discovered tools the model asked for that weren't
+            # RAG-selected this turn. Mirror the skill-unlock block above: union
+            # the returned names into the selection so the NEXT round's native
+            # schema filter (~3228/3247) and the fenced prompt assembly both
+            # offer them. Respect disabled_tools — never unlock an admin-off
+            # tool — and skip names already selected (idempotent on repeat calls).
+            if (
+                block.tool_type == "search_tools"
+                and _relevant_tools is not None
+                and not result.get("error")
+            ):
+                _st_tools = result.get("tools") or []
+                _st_new = {
+                    t for t in _st_tools
+                    if t and t not in _relevant_tools and t not in (disabled_tools or set())
+                }
+                if _st_new:
+                    _relevant_tools.update(_st_new)
+                    logger.info(
+                        "[tool-rag] search_tools unlocked tools for next round: %s",
+                        sorted(_st_new),
+                    )
 
             # Extract structured web sources from web_search tool output.
             # web_search returns {"output": ..., "exit_code": 0}; check "output"
