@@ -23,6 +23,23 @@
 
 ---
 
+## What is this fork(ing) doing here?
+
+Fair question. This is a friendly fork of [pewdiepie-archdaemon/odysseus](https://github.com/pewdiepie-archdaemon/odysseus) — the same app at its core, but I've been living in it daily and fixing the things that annoyed me until it felt trustworthy rather than just capable.
+
+The gist of what's different here, roughly, and without promising it'll stay exactly this list:
+
+- **Fewer surprises.** A lot of work went into making failures *loud and recoverable* instead of silent — turns that used to quietly die, tool calls that vanished, and errors that showed up as a blank message now surface something you (or the model) can act on.
+- **Real background agents.** Sub-agents you can dispatch, watch, steer, and that actually report back into the chat — plus a configurable (cheap) default model just for them, so routine work doesn't cost frontier-model money.
+- **Steer mid-reply.** Type while the agent is working and your message joins the turn instead of waiting for it to finish.
+- **The model can find its own tools** instead of being stuck with whatever was pre-selected, and it fails gracefully when it reaches for something that isn't loaded.
+- **Cheaper by default.** Prompt caching, per-role model routing, and local-model friendliness so you can run most of it for near-free and only spend on the hard parts.
+- **Assorted polish** — steadier long tasks, saner timeouts, and a pile of small UI fixes I hit while using it.
+
+None of this is meant to drift away from upstream — the plan is to contribute the good bits back. If you just want to run it, everything below works the same as upstream. If you're curious what actually changed, the commit history is chatty on purpose.
+
+---
+
 ## Quick Start
 
 > `dev` is the default branch and gets the newest changes first. Use [`main`](https://github.com/pewdiepie-archdaemon/odysseus/tree/main) if you want the more curated branch.
