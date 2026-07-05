@@ -127,6 +127,10 @@ async def start_server_resume_turn(
                 session_id=session_id,
                 owner=owner,
                 fallbacks=_fallbacks,
+                # A resume prompt reads as low-signal (no domain keywords), but
+                # it must run the full loop with history so the model reports
+                # the sub-agent's work instead of collapsing to a "Hey." stub.
+                suppress_low_signal=True,
             ):
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     try:

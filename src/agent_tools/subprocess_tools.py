@@ -5,7 +5,20 @@ import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from src.constants import MAX_OUTPUT_CHARS
 
-DEFAULT_BASH_TIMEOUT = 60 * 60     # 1 hour
+# A hung foreground command (e.g. a dev server the model forgot to background)
+# freezes the whole turn until this fires — at 1 hour that reads as a silent
+# stall. Default to 10 minutes (covers real builds/installs) and make it
+# tunable via the `agent_bash_timeout_seconds` setting. Progress SSE events
+# still stream every PROGRESS_INTERVAL_S so long-but-live commands stay visible.
+def _bash_timeout() -> int:
+    try:
+        from src.settings import get_setting
+        v = int(get_setting("agent_bash_timeout_seconds", 600) or 600)
+        return v if v > 0 else 600
+    except Exception:
+        return 600
+
+DEFAULT_BASH_TIMEOUT = 60 * 60     # kept for import compatibility; live value via _bash_timeout()
 DEFAULT_PYTHON_TIMEOUT = 60 * 60
 
 PROGRESS_INTERVAL_S = 2.0
@@ -112,13 +125,14 @@ class BashTool:
             env=_subproc_env,
             cwd=agent_cwd(),
         )
+        _bash_to = _bash_timeout()
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,
-            timeout=DEFAULT_BASH_TIMEOUT,
+            timeout=_bash_to,
             progress_cb=progress_cb,
         )
         if timed_out:
-            return {"error": f"bash: timed out after {DEFAULT_BASH_TIMEOUT}s — process killed", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
+            return {"error": f"bash: timed out after {_bash_to}s — process killed. If this is a long-running server, background it (append ` &`) or write output to a file and tail it.", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
         output = stdout.rstrip()
         err = stderr.rstrip()
         if err:
