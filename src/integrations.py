@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from core.atomic_io import atomic_write_json
 from core.platform_compat import safe_chmod
 from src.secret_storage import decrypt, encrypt, is_encrypted
-from src.constants import DATA_DIR, INTEGRATIONS_FILE, SETTINGS_FILE
+from src.constants import DATA_DIR, INTEGRATIONS_FILE, SETTINGS_FILE, INTEGRATION_API_MAX_RESPONSE_CHARS
 
 log = logging.getLogger(__name__)
 
@@ -461,12 +461,24 @@ async def execute_api_call(
         content_type = response.headers.get("content-type", "")
         status = response.status_code
 
+        # Response body cap. Some endpoints (Home Assistant GET /api/states)
+        # return every item in one unpaginated array; without a cap a single
+        # call could bury the context window. Configurable via
+        # INTEGRATION_API_MAX_RESPONSE_CHARS. Whenever we cut, we tell the model
+        # HOW to get the rest so it doesn't silently reason over a partial slice.
+        limit = INTEGRATION_API_MAX_RESPONSE_CHARS
+        trunc_hint = (
+            f"capped at {limit} chars — narrow the request (filter/paginate or "
+            f"fetch specific items by id/path), or raise "
+            f"INTEGRATION_API_MAX_RESPONSE_CHARS"
+        )
+
         # Format response body
         if "application/json" in content_type:
             try:
                 data = response.json()
                 full = json.dumps(data, indent=2, ensure_ascii=False)
-                if len(full) > 12000:
+                if len(full) > limit:
                     if isinstance(data, list):
                         # Binary-search for the largest prefix such that the
                         # final array (prefix + sentinel) fits within the limit.
@@ -475,6 +487,7 @@ async def execute_api_call(
                             "_truncated": True,
                             "total_items": len(data),
                             "shown_items": 0,
+                            "_note": trunc_hint,
                         }
                         # Overhead: the sentinel appears as an extra array element.
                         # Add a conservative padding for the separating comma,
@@ -482,7 +495,7 @@ async def execute_api_call(
                         sentinel_overhead = len(
                             json.dumps(sentinel_placeholder, indent=2, ensure_ascii=False)
                         ) + 6
-                        budget = 12000 - sentinel_overhead
+                        budget = limit - sentinel_overhead
                         lo, hi = 0, len(data)
                         while lo < hi:
                             mid = (lo + hi + 1) // 2
@@ -497,6 +510,7 @@ async def execute_api_call(
                             "_truncated": True,
                             "total_items": len(data),
                             "shown_items": lo,
+                            "_note": trunc_hint,
                         }
                         formatted = json.dumps(
                             data[:lo] + [sentinel], indent=2, ensure_ascii=False
@@ -504,41 +518,41 @@ async def execute_api_call(
                     elif isinstance(data, dict):
                         # Truncate dict entries until the result fits, then add
                         # the _truncated marker.  Walk keys in insertion order.
-                        DICT_LIMIT = 12000
                         kept: dict = {}
                         for k, v in data.items():
                             candidate = json.dumps(
-                                {**kept, k: v, "_truncated": True},
+                                {**kept, k: v, "_truncated": True, "_note": trunc_hint},
                                 indent=2,
                                 ensure_ascii=False,
                             )
-                            if len(candidate) <= DICT_LIMIT:
+                            if len(candidate) <= limit:
                                 kept[k] = v
                             else:
                                 break
                         formatted = json.dumps(
-                            {**kept, "_truncated": True}, indent=2, ensure_ascii=False
+                            {**kept, "_truncated": True, "_note": trunc_hint},
+                            indent=2, ensure_ascii=False,
                         )
                     else:
                         total = len(full)
-                        formatted = full[:12000] + f"\n... (truncated, {total} chars total)"
+                        formatted = full[:limit] + f"\n... [truncated, {total} chars total — {trunc_hint}]"
                 else:
                     formatted = full
             except (json.JSONDecodeError, ValueError):
                 formatted = response.text
-                if len(formatted) > 12000:
+                if len(formatted) > limit:
                     total = len(formatted)
-                    formatted = formatted[:12000] + f"\n... (truncated, {total} chars total)"
+                    formatted = formatted[:limit] + f"\n... [truncated, {total} chars total — {trunc_hint}]"
         elif "text/html" in content_type:
             formatted = _strip_html_tags(response.text)
-            if len(formatted) > 12000:
+            if len(formatted) > limit:
                 total = len(formatted)
-                formatted = formatted[:12000] + f"\n... (truncated, {total} chars total)"
+                formatted = formatted[:limit] + f"\n... [truncated, {total} chars total — {trunc_hint}]"
         else:
             formatted = response.text
-            if len(formatted) > 12000:
+            if len(formatted) > limit:
                 total = len(formatted)
-                formatted = formatted[:12000] + f"\n... (truncated, {total} chars total)"
+                formatted = formatted[:limit] + f"\n... [truncated, {total} chars total — {trunc_hint}]"
 
         output = f"HTTP {status}\n{formatted}"
 

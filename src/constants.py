@@ -27,6 +27,12 @@ AUTH_FILE = os.path.join(DATA_DIR, "auth.json")
 USER_PREFS_FILE = os.path.join(DATA_DIR, "user_prefs.json")
 PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
 INTEGRATIONS_FILE = os.path.join(DATA_DIR, "integrations.json")
+# Max characters of an integration api_call response body fed back to the model.
+# Big collection endpoints (e.g. Home Assistant GET /api/states dumps every
+# entity in one unpaginated array) can be tens/hundreds of KB — capped so a
+# single call can't blow the context window. Raise it if you run large-context
+# models and want fuller dumps; the model is told when a response was capped.
+INTEGRATION_API_MAX_RESPONSE_CHARS = int(os.getenv("INTEGRATION_API_MAX_RESPONSE_CHARS", "16000"))
 CONTACTS_FILE = os.path.join(DATA_DIR, "contacts.json")
 APP_KEY_FILE = os.path.join(DATA_DIR, ".app_key")
 EMBEDDING_ENDPOINT_FILE = os.path.join(DATA_DIR, "embedding_endpoint.json")
