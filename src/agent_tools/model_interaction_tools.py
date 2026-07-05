@@ -257,6 +257,24 @@ async def spawn_agent(
                 url, model, headers = await asyncio.to_thread(_resolve_model, model, owner=owner)
             except ValueError:
                 pass
+    # Configured default sub-agent model. When the caller did NOT pin a model,
+    # a `subagent_model` setting (e.g. a cheap DeepSeek for routine background
+    # work) overrides the inherited parent model. This is what stops the model
+    # from wasting rounds guessing/hallucinating a model name to assign — by
+    # default it specifies NO model and the harness routes to this one.
+    # Explicit `model:` still wins (e.g. a vision task where the default can't
+    # see images). Falls through to the inherited parent if unset/unresolvable.
+    if not model_spec:
+        try:
+            from src.settings import get_setting
+            _default_sub = (get_setting("subagent_model", "") or "").strip()
+        except Exception:
+            _default_sub = ""
+        if _default_sub:
+            try:
+                url, model, headers = await asyncio.to_thread(_resolve_model, _default_sub, owner=owner)
+            except ValueError:
+                pass  # keep the inherited parent model as fallback
     if model_spec:
         try:
             url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)

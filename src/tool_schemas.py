@@ -327,7 +327,7 @@ FUNCTION_TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "The complete task/instructions for the sub-agent to carry out and report back on."},
-                    "model": {"type": "string", "description": "Optional model (or model@endpoint) for the sub-agent. Defaults to this chat's model."}
+                    "model": {"type": "string", "description": "OPTIONAL and rarely needed — leave it out. A default sub-agent model is configured, so omit this and let the harness route the model. Only set it for a specific reason, e.g. the task must analyze images and the default model has no vision. In that case do NOT guess a name — call list_models first to see the real vision-capable options, then pin one here."}
                 },
                 "required": ["task"]
             }
