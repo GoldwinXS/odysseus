@@ -4253,6 +4253,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         updateSubmitButton('idle', _submitBtn);
         var _msgInput = document.getElementById('message');
         if (_msgInput) _msgInput.disabled = false;
+
+        // Reconnect to the session. The server run is DETACHED — it keeps
+        // generating and saves the full response even though this SSE reader
+        // died in the background. Without this, the bubble stays frozen at the
+        // partial forever. selectSession re-runs _checkServerStream/resumeStream,
+        // which live-resumes the still-running run or reloads the saved full
+        // response. Mirrors the document.wasDiscarded path below.
+        var _sid = sessionModule && sessionModule.getCurrentSessionId();
+        if (_sid) sessionModule.selectSession(_sid);
       }, 2000); // 2 second grace period
     });
 
