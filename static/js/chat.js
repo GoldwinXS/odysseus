@@ -581,6 +581,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
   // Update the composer placeholder to advertise mid-turn steering, restoring
   // it when the turn ends. Minimal + muted (uses the existing placeholder slot).
+  // Display preference (localStorage, like theme/UI-scale): when on, the
+  // agent's reasoning renders COLLAPSED — the "Thinking…" bar shows but the
+  // content stays hidden until the user clicks it. Default off = current
+  // behavior (live reasoning expanded).
+  function _collapseReasoningOn() {
+    try { return localStorage.getItem('collapse_reasoning') === '1'; }
+    catch (e) { return false; }
+  }
   const _DEFAULT_COMPOSER_PLACEHOLDER = 'Message Odysseus…';
   const _STEER_COMPOSER_PLACEHOLDER_FULL = 'Steer the reply — send to add mid-response…';
   const _STEER_COMPOSER_PLACEHOLDER_SHORT = 'Steer the reply…';
@@ -2076,15 +2084,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   var thinkContent = _ensureStreamLayout(thinkBody);
                   thinkContent.style.minHeight = '';
                   _liveThinkDomId = 'live-think-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+                  // Respect the collapse-reasoning preference: keep the live
+                  // thinking content collapsed (the header/spinner still show).
+                  var _exp = _collapseReasoningOn() ? '' : ' expanded';
                   thinkContent.innerHTML = `
                     <div class="thinking-section">
                       <div class="thinking-header" data-thinking-id="${_liveThinkDomId}">
                         <div class="thinking-header-left"><span class="live-think-header-text">Thinking\u2026</span></div>
                         <span class="live-think-spinner-slot" style="flex-shrink:0;margin-left:auto;"></span>
                         <span class="live-think-timer" style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;margin-left:6px;margin-right:5px;"></span>
-                        <span class="thinking-toggle live-think-toggle expanded" id="${_liveThinkDomId}-toggle"></span>
+                        <span class="thinking-toggle live-think-toggle${_exp}" id="${_liveThinkDomId}-toggle"></span>
                       </div>
-                      <div class="thinking-content expanded" id="${_liveThinkDomId}">
+                      <div class="thinking-content${_exp}" id="${_liveThinkDomId}">
                         <div class="thinking-content-inner live-think-inner"></div>
                       </div>
                     </div>`;

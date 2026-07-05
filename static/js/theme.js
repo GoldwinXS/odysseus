@@ -1211,6 +1211,19 @@ export function initThemeUI() {
     });
   }
 
+  // Collapse-reasoning: a pure display pref (localStorage, like frosted/scale).
+  // When on, the agent's thinking renders collapsed by default — chat.js reads
+  // the same key at render time. Only affects future turns; no re-render needed.
+  const collapseReasoningToggle = document.getElementById('collapse-reasoning-toggle');
+  if (collapseReasoningToggle) {
+    let _cr = false;
+    try { _cr = localStorage.getItem('collapse_reasoning') === '1'; } catch (e) {}
+    collapseReasoningToggle.checked = _cr;
+    collapseReasoningToggle.addEventListener('change', () => {
+      try { localStorage.setItem('collapse_reasoning', collapseReasoningToggle.checked ? '1' : '0'); } catch (e) {}
+    });
+  }
+
   // --- Color Harmony Generator (inside Advanced section) ---
   const harmonyGenBtnEl = document.getElementById('harmony-generate-btn');
   const harmonyAccentEl = document.getElementById('harmony-accent');

@@ -8951,6 +8951,19 @@ body.fullwidth-chat .chat-history {
   opacity: 0.9;
   line-height: 1.5;
 }
+/* Reasoning should read as subdued, uniform notes. The default chat markdown
+   paints list markers and headings in the bright syntax-accent colors (e.g.
+   var(--hl-function) on li::marker), which clash hard against the muted
+   thinking text. Neutralize those accents inside thinking bubbles so a
+   numbered list in the model's reasoning doesn't render its 1./2. in loud
+   purple. */
+.thinking-content-inner li::marker { color: inherit; opacity: 0.55; }
+.thinking-content-inner h1,
+.thinking-content-inner h2,
+.thinking-content-inner h3,
+.thinking-content-inner h4,
+.thinking-content-inner strong { color: inherit; }
+.thinking-content-inner th { color: inherit; opacity: 0.85; }
 .live-reply-content {
   animation: fadeSlideIn 0.3s ease-out;
 }
