@@ -348,7 +348,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     } else if (state === 'idle') {
       submitBtn.dataset.mode = '';
       delete submitBtn.dataset.phase;
-      submitBtn.classList.remove('recording');
+      submitBtn.classList.remove('recording', 'steer-compass');
       isStreaming = false;
       _setForegroundChatBusy(false);
       _setComposerPlaceholder(false);
@@ -492,7 +492,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
   // Update the composer placeholder to advertise mid-turn steering, restoring
   // it when the turn ends. Minimal + muted (uses the existing placeholder slot).
   const _DEFAULT_COMPOSER_PLACEHOLDER = 'Message Odysseus…';
-  const _STEER_COMPOSER_PLACEHOLDER = 'Steer the reply — send to add mid-response…';
+  const _STEER_COMPOSER_PLACEHOLDER_FULL = 'Steer the reply — send to add mid-response…';
+  const _STEER_COMPOSER_PLACEHOLDER_SHORT = 'Steer the reply…';
+  // Narrow screens can't fit the full hint — the placeholder overflows/clips on
+  // mobile. Pick by viewport width at set-time.
+  function _steerPlaceholder() {
+    return (window.innerWidth || 9999) < 640
+      ? _STEER_COMPOSER_PLACEHOLDER_SHORT
+      : _STEER_COMPOSER_PLACEHOLDER_FULL;
+  }
   function _setComposerPlaceholder(streaming) {
     const input = uiModule.el('message');
     if (!input) return;
@@ -500,7 +508,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (!input.dataset.basePlaceholder) {
         input.dataset.basePlaceholder = input.getAttribute('placeholder') || _DEFAULT_COMPOSER_PLACEHOLDER;
       }
-      input.setAttribute('placeholder', _STEER_COMPOSER_PLACEHOLDER);
+      input.setAttribute('placeholder', _steerPlaceholder());
     } else {
       input.setAttribute('placeholder', input.dataset.basePlaceholder || _DEFAULT_COMPOSER_PLACEHOLDER);
     }
@@ -524,9 +532,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       const icons = window._odysseusBtnIcons;
       if (icons && icons.send) btn.innerHTML = icons.send;
       btn.title = 'Send — steers the current reply';
+      // The send arrow points up (north); the compass-sway class makes it hunt
+      // side to side like a needle seeking north — reads as "steering".
+      btn.classList.add('steer-compass');
     } else {
       btn.innerHTML = _STOP_SVG;
       btn.title = 'Stop generation';
+      btn.classList.remove('steer-compass');
     }
   }
   // Keep the icon honest as the user types/clears while a turn streams.

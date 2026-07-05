@@ -2644,6 +2644,25 @@ body.bg-pattern-sparkles {
     }
     /* Send button icon transitions — send mode forces no animation */
     .send-btn[data-mode="send"] svg { animation: none !important; }
+    /* Steer mode: the send arrow (which points up = north) sways side to side
+       like a compass needle hunting for north. Class selector + !important so it
+       overrides the streaming siren pulse defined below. Pivot at centre so the
+       tip swings; uneven decaying swings read as "seeking + settling", not a
+       metronome, then it repeats — never quite settling, i.e. still steering. */
+    .send-btn.steer-compass svg {
+      transform-origin: 50% 50%;
+      animation: steer-compass-sway 2.8s ease-in-out infinite !important;
+    }
+    @keyframes steer-compass-sway {
+      0%   { transform: rotate(0deg); }
+      12%  { transform: rotate(-12deg); }
+      30%  { transform: rotate(9deg); }
+      46%  { transform: rotate(-6deg); }
+      60%  { transform: rotate(4deg); }
+      74%  { transform: rotate(-2.5deg); }
+      88%  { transform: rotate(1.5deg); }
+      100% { transform: rotate(0deg); }
+    }
     /* Spin out: + rotates away, then arrow spins in via anim-spin */
     .send-btn.anim-spin-swap svg { animation: btn-spin-out 0.15s ease-in forwards; }
     .send-btn.anim-spin-swap .send-btn-label { opacity: 0; transition: opacity 0.1s; }
