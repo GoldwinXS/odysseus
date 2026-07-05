@@ -35,7 +35,15 @@ import src.tool_index as ti  # noqa: E402
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # A fresh loop per call. asyncio.get_event_loop() can hand back a CLOSED
+    # loop once another test file has closed the process-wide loop, which made
+    # these tests pass alone but fail under full-suite ordering with
+    # "RuntimeError: Event loop is closed". A dedicated loop is isolation-proof.
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _no_embeddings(monkeypatch):
