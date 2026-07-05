@@ -143,6 +143,10 @@ DEFAULT_SETTINGS = {
     "tool_path_extra_roots": [],
     "task_endpoint_id": "",
     "task_model": "",
+    # Ordered fallback chain for the Background Task model (auto-memory,
+    # auto-skill extraction, auto-naming, etc.). Each entry is
+    # {"endpoint_id": "...", "model": "..."}. Mirrors the sub-agent role.
+    "task_model_fallbacks": [],
     "default_endpoint_id": "",
     "default_model": "",
     # Optional prose style used only for normal document writing/editing.
@@ -292,6 +296,7 @@ _PER_USER_KEYS = {
     "default_endpoint_id", "default_model", "default_model_fallbacks",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
     "research_endpoint_id", "research_model",
+    "task_endpoint_id", "task_model", "task_model_fallbacks",
     "subagent_endpoint_id", "subagent_model", "subagent_model_fallbacks",
 }
 

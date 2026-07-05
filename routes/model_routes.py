@@ -50,6 +50,7 @@ _ENDPOINT_FALLBACK_FIELDS = {
     "default_model_fallbacks": "Default Model Fallbacks",
     "utility_model_fallbacks": "Utility Model Fallbacks",
     "vision_model_fallbacks":  "Vision Model Fallbacks",
+    "task_model_fallbacks":     "Background Task Model Fallbacks",
     "subagent_model_fallbacks": "Sub-agent Model Fallbacks",
 }
 

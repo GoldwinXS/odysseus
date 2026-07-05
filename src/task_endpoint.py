@@ -3,6 +3,7 @@
 from src.endpoint_resolver import (
     resolve_chat_fallback_candidates,
     resolve_endpoint,
+    resolve_task_fallback_candidates,
     resolve_utility_fallback_candidates,
 )
 from src.llm_core import llm_call_async_with_fallback
@@ -29,10 +30,11 @@ def resolve_task_candidates(
 
     Order:
     1. configured Background Tasks endpoint/model, or caller fallback
-    2. Utility endpoint/model
-    3. Default endpoint/model
-    4. Utility fallback chain
-    5. Default fallback chain
+    2. Background-task fallback chain (task_model_fallbacks, set in the UI card)
+    3. Utility endpoint/model
+    4. Default endpoint/model
+    5. Utility fallback chain
+    6. Default fallback chain
     """
     candidates = []
 
@@ -45,6 +47,11 @@ def resolve_task_candidates(
         candidates.append((url, model, headers or {}))
 
     _append(*resolve_task_endpoint(fallback_url, fallback_model, fallback_headers, owner=owner))
+    # User-configured task fallbacks (from the Background/Task model card) are
+    # tried right after the primary task model, before the generic utility/
+    # default chains. Empty by default, so this is a no-op unless configured.
+    for url, model, headers in resolve_task_fallback_candidates(owner=owner):
+        _append(url, model, headers)
     _append(*resolve_endpoint("utility", owner=owner))
     _append(*resolve_endpoint("default", owner=owner))
     for url, model, headers in resolve_utility_fallback_candidates(owner=owner):

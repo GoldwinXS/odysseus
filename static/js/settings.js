@@ -707,6 +707,74 @@ async function initSubagentModel() {
   });
 }
 
+/* ── Background / Task Model ── */
+// Model for background jobs (auto-memory, auto-skill extraction, auto-naming).
+// Mirrors the Sub-agents card exactly: endpoint + model + ordered fallback
+// chain, blank means "inherit the chat's model". Persists task_endpoint_id /
+// task_model / task_model_fallbacks via the shared /api/auth/settings endpoint.
+async function initTaskModel() {
+  var epSel = el('set-taskEpSelect');
+  var modelSel = el('set-taskModelSelect');
+  var msg = el('set-taskChatMsg');
+  var _endpoints = [];
+  var fallbackWidget = null;
+  if (epSel && epSel.options[0]) epSel.options[0].textContent = 'Same as chat';
+  if (modelSel && modelSel.options[0]) modelSel.options[0].textContent = 'Same as chat';
+
+  try {
+    _endpoints = await _fetchModelEndpoints();
+    _fillEndpointSelect(epSel, _endpoints, epSel.value, true);
+  } catch (e) { console.warn('Failed to load endpoints for task model', e); }
+
+  function refreshModels(selectedModel) {
+    var epId = epSel.value;
+    var ep = _endpoints.find(function(e) { return e.id === epId; });
+    _fillModelSelect(modelSel, ep ? ep.models : [], selectedModel, true);
+  }
+
+  try {
+    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    var settings = await res.json();
+    if (settings.task_endpoint_id) epSel.value = settings.task_endpoint_id;
+    refreshModels(settings.task_model || '');
+    fallbackWidget = _bindFallbackWidget({
+      containerId: 'set-taskFallbacks',
+      addBtnId: 'set-taskAddFallback',
+      endpoints: function() { return _endpoints; },
+      settingKey: 'task_model_fallbacks',
+      initial: Array.isArray(settings.task_model_fallbacks)
+        ? settings.task_model_fallbacks.map(function(f) { return { endpoint_id: (f && f.endpoint_id) || '', model: (f && f.model) || '' }; })
+        : [],
+    });
+  } catch (e) { console.warn('Failed to load task model settings', e); }
+
+  // Persist whatever's currently selected. Empty endpoint or model → backend
+  // transparently falls back to the chat model (mirrors the sub-agent panel).
+  async function saveTask() {
+    try {
+      await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_endpoint_id: epSel.value || '',
+          task_model: modelSel.value || ''
+        })
+      });
+      msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
+      setTimeout(function() { msg.textContent = ''; }, 1500);
+    } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+  }
+
+  epSel.addEventListener('change', function() { refreshModels(''); saveTask(); });
+  modelSel.addEventListener('change', saveTask);
+
+  _registerAiEndpointRefresh(function(endpoints) {
+    _endpoints = endpoints;
+    _fillEndpointSelect(epSel, _endpoints, epSel.value, true);
+    refreshModels(modelSel.value);
+    if (fallbackWidget && fallbackWidget.refresh) fallbackWidget.refresh();
+  });
+}
+
 /* ── Teacher Model ── */
 // SOTA model called automatically when a self-hosted student model
 // fails an agent-mode task. Stored as a single `teacher_model` string
@@ -2395,6 +2463,7 @@ function initAll() {
   initTeacherModel();
   initUtilityModel();
   initSubagentModel();
+  initTaskModel();
   initImageSettings();
   initVisionSettings();
   initTtsSettings();

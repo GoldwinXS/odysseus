@@ -1506,6 +1506,30 @@
             </div>
           </div>
           <div class="admin-card">
+            <h2 style="display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:1px;opacity:0.6;flex-shrink:0"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Background / Task model</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Model for background jobs (auto-memory, auto-skill extraction, auto-naming). A small but capable model is ideal; leave blank to inherit the chat's model.</div>
+            <div class="settings-col">
+              <div class="settings-row">
+                <label class="settings-label">Endpoint</label>
+                <span class="adm-model-logo" id="set-taskEpSelect-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
+                <select id="set-taskEpSelect" class="settings-select"><option value="">—</option></select>
+              </div>
+              <div class="settings-row">
+                <label class="settings-label">Model</label>
+                <span class="adm-model-logo" id="set-taskModelSelect-logo" style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;flex-shrink:0;opacity:0.9;color:var(--fg);"></span>
+                <select id="set-taskModelSelect" class="settings-select"><option value="">—</option></select>
+              </div>
+              <div class="settings-row" style="align-items:flex-start;">
+                <label class="settings-label" style="margin-top:6px;">Fallbacks</label>
+                <div style="flex:1;display:flex;flex-direction:column;gap:6px;">
+                  <div id="set-taskFallbacks" class="settings-fallbacks"></div>
+                  <button type="button" class="settings-fallback-add" id="set-taskAddFallback" title="Add a model to try if the background task model fails">+ Add fallback</button>
+                </div>
+              </div>
+              <div id="set-taskChatMsg" style="font-size:11px;color:color-mix(in srgb, var(--fg) 45%, transparent);"></div>
+            </div>
+          </div>
+          <div class="admin-card">
             <h2 style="display:flex;align-items:center;gap:6px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:1px;opacity:0.6;flex-shrink:0"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>Vision<span style="flex:1"></span><label class="admin-switch" title="Analyze images with a vision-capable model"><input type="checkbox" id="set-visionEnabledToggle" checked><span class="admin-slider"></span></label></h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">Analyze images with a vision-capable model.</div>
             <div style="display:flex;flex-direction:column;gap:0.5rem;">

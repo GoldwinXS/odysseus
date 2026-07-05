@@ -438,6 +438,11 @@ def resolve_vision_fallback_candidates(owner: Optional[str] = None) -> list:
     return _resolve_fallback_candidates("vision_model_fallbacks", owner=owner)
 
 
+def resolve_task_fallback_candidates(owner: Optional[str] = None) -> list:
+    """Configured fallback chain for background tasks (`task_model_fallbacks`)."""
+    return _resolve_fallback_candidates("task_model_fallbacks", owner=owner)
+
+
 def resolve_subagent_fallback_candidates(owner: Optional[str] = None) -> list:
     """Configured fallback chain for spawn_agent sub-agents
     (`subagent_model_fallbacks`)."""
