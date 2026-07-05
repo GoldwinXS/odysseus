@@ -331,9 +331,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         void submitBtn.offsetWidth;
         submitBtn.classList.add('anim-land');
         submitBtn.addEventListener('animationend', () => submitBtn.classList.remove('anim-land'), { once: true });
+        // If the user already typed steer text during the launch animation,
+        // re-sync so the stop square doesn't clobber the send/steer icon.
+        submitBtn.dataset.steerIcon = '';
+        submitBtn.title = 'Stop generation';
+        _syncStreamingBtnIcon();
       }, 300);
       submitBtn.title = 'Stop generation';
       submitBtn.dataset.mode = 'streaming';
+      submitBtn.dataset.steerIcon = '';   // fresh turn — icon state resets
       submitBtn.dataset.phase = 'processing';
       isStreaming = true;
       _setForegroundChatBusy(true);
@@ -498,7 +504,35 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     } else {
       input.setAttribute('placeholder', input.dataset.basePlaceholder || _DEFAULT_COMPOSER_PLACEHOLDER);
     }
+    _syncStreamingBtnIcon();
   }
+
+  // While streaming, the submit button doubles as Stop (empty composer) and
+  // Steer/Send (composer has text) — handleChatSubmit already branches on the
+  // text, but the ICON must say which action a click performs, or nobody dares
+  // press a stop square to send a message. Morph live as the user types.
+  const _STOP_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+  function _syncStreamingBtnIcon() {
+    const btn = document.querySelector('.send-btn');
+    if (!btn || btn.dataset.mode !== 'streaming') return;
+    const input = uiModule.el('message');
+    const hasText = !!(input && input.value.trim());
+    const wantSend = hasText ? '1' : '';
+    if (btn.dataset.steerIcon === wantSend) return;   // no change — avoid churn
+    btn.dataset.steerIcon = wantSend;
+    if (hasText) {
+      const icons = window._odysseusBtnIcons;
+      if (icons && icons.send) btn.innerHTML = icons.send;
+      btn.title = 'Send — steers the current reply';
+    } else {
+      btn.innerHTML = _STOP_SVG;
+      btn.title = 'Stop generation';
+    }
+  }
+  // Keep the icon honest as the user types/clears while a turn streams.
+  document.addEventListener('input', (e) => {
+    if (e.target && e.target.id === 'message') _syncStreamingBtnIcon();
+  });
 
   function _sendQueuedWhenIdle(item) {
     if (!item) return;
