@@ -1050,6 +1050,21 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "view_image",
+            "description": "Look at an image so you can see it (vision). Give either a gallery/generated image id (image_id, e.g. from generate_image) OR a workspace file path. The image is attached to your view. Use it to inspect, describe, critique, or iterate on an image — e.g. review an image you just generated. Requires a vision-capable model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_id": {"type": "string", "description": "Gallery/generated image id (as returned by generate_image)."},
+                    "path": {"type": "string", "description": "Path to an image file in the workspace (png/jpg/webp/gif/bmp)."},
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "trigger_research",
             "description": "Start a deep research task on a topic. Returns a task ID for tracking.",
             "parameters": {
