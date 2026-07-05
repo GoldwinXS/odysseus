@@ -4231,6 +4231,19 @@ async def stream_agent_loop(
             elif "error" in result:
                 output_text = _truncate(result["error"])
 
+            # If a tool produced images but the current model can't see them,
+            # the pixels get dropped below (the `_vision_ok` gate). Say so in the
+            # tool text — otherwise a blind model that was told "image attached"
+            # will confidently CONFABULATE a description (e.g. deepseek-v4-flash
+            # inventing an identical "camera icon" for every image it can't see).
+            if result.get("images") and not _vision_ok:
+                output_text += (
+                    "\n\n[NOTE: the image(s) were NOT shown to you — the current model "
+                    "is not vision-capable, so it received no pixels. Do NOT describe or "
+                    "guess their contents. Tell the user to switch to a vision-capable "
+                    "model (e.g. Claude Opus, Gemini, or GPT-4o) to view images.]"
+                )
+
             # Emit tool_output (include ui_event data if present)
             tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code")}
             if is_doc_tool and "action" in result:
