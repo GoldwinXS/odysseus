@@ -56,6 +56,35 @@ def get_chroma_client():
             f"CHROMADB_PORT to point at a running instance."
         )
 
+    # The TCP probe above can pass while the service is a black hole: Docker's
+    # port proxy accepts connections even when the engine/container behind it
+    # is wedged, and the chromadb client's own heartbeat() has no request
+    # timeout — observed freezing app startup at import indefinitely with the
+    # process at 0 CPU. Probe the HTTP layer with a hard deadline before
+    # constructing the client (v2 heartbeat, falling back to v1 for older
+    # servers).
+    _hb_timeout = _CONNECT_TIMEOUT + 3.0
+    _hb_ok = False
+    _hb_err = None
+    try:
+        import httpx
+        for _path in ("/api/v2/heartbeat", "/api/v1/heartbeat"):
+            try:
+                _r = httpx.get(f"http://{host}:{port}{_path}", timeout=_hb_timeout)
+                if _r.status_code == 200:
+                    _hb_ok = True
+                    break
+            except Exception as e:
+                _hb_err = e
+    except ImportError:
+        _hb_ok = True  # httpx missing: skip the probe rather than block RAG
+    if not _hb_ok:
+        raise RuntimeError(
+            f"ChromaDB at {host}:{port} accepted the TCP connection but did "
+            f"not answer a heartbeat within {_hb_timeout:.0f}s — the service "
+            f"(or the Docker engine behind it) is unhealthy."
+        ) from _hb_err
+
     client = chromadb.HttpClient(host=host, port=port)
 
     # Health check before caching — if the port is open but the service isn't

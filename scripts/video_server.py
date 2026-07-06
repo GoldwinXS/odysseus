@@ -47,7 +47,15 @@ DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": to
 
 @asynccontextmanager
 async def lifespan(application):
-    load_model()
+    # LAZY LOAD: do NOT load the model at startup. The container auto-starts
+    # with Docker, and eagerly loading a multi-GB video model at every boot
+    # thrashed the whole host (observed 2026-07-06: RAM exhaustion so severe
+    # the Docker engine itself returned 500s). The first generation request
+    # pays the load cost instead; an idle sidecar stays near-zero RAM.
+    global _model_id
+    if _args is not None:
+        _model_id = Path(_args.model).name
+    logger.info("Video server up (model loads lazily on first request)")
     yield
 
 
@@ -104,6 +112,20 @@ class VideoRequest(BaseModel):
     fps: int = 24
     image_url: str = ""            # optional source image for image-to-video
     response_format: str = "b64_json"
+
+
+_load_lock = __import__("threading").Lock()
+
+
+def _ensure_model():
+    """Load the pipeline on first use. Endpoints run in the threadpool, so a
+    plain lock serializes concurrent first requests; later calls are free."""
+    global _pipe
+    if _pipe is not None:
+        return
+    with _load_lock:
+        if _pipe is None:
+            load_model()
 
 
 def load_model():
@@ -177,8 +199,9 @@ def list_models():
 
 @app.post("/v1/videos/generations")
 def generate_video(req: VideoRequest):
+    _ensure_model()
     if _pipe is None:
-        return {"error": "Model not loaded"}
+        return {"error": "Model failed to load"}
     from diffusers.utils import export_to_video
 
     try:
@@ -241,7 +264,8 @@ def generate_video(req: VideoRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": _model_id}
+    # Never triggers a model load — health stays cheap for backend=auto probes.
+    return {"status": "ok", "model": _model_id, "model_loaded": _pipe is not None}
 
 
 if __name__ == "__main__":
