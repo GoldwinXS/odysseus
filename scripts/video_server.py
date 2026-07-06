@@ -115,17 +115,60 @@ class VideoRequest(BaseModel):
 
 
 _load_lock = __import__("threading").Lock()
+_busy = 0            # in-flight generations (guarded by _load_lock)
+_last_used = 0.0     # monotonic ts of last generation start/end
+# Auto-unload after this many idle seconds so RAM returns to the host when
+# nobody is generating (0 disables). The model reloads on the next request.
+_IDLE_UNLOAD_S = float(os.environ.get("VIDEO_IDLE_UNLOAD_S", "600"))
 
 
-def _ensure_model():
-    """Load the pipeline on first use. Endpoints run in the threadpool, so a
-    plain lock serializes concurrent first requests; later calls are free."""
-    global _pipe
-    if _pipe is not None:
-        return
+def _acquire_model():
+    """Load (if needed) and mark a generation in flight. Lock is NOT held
+    during inference — only around the shared-state transitions."""
+    global _pipe, _busy, _last_used
     with _load_lock:
         if _pipe is None:
             load_model()
+        _busy += 1
+        _last_used = time.monotonic()
+
+
+def _release_model():
+    global _busy, _last_used
+    with _load_lock:
+        _busy = max(0, _busy - 1)
+        _last_used = time.monotonic()
+
+
+def _unload_model():
+    """Drop the pipelines and return memory to the OS. Caller holds the lock."""
+    global _pipe, _i2v_pipe
+    logger.info("Idle for %.0fs - unloading video model to free RAM", _IDLE_UNLOAD_S)
+    _pipe = None
+    _i2v_pipe = None
+    import gc
+    gc.collect()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    logger.info("Video model unloaded")
+
+
+def _idle_reaper():
+    import threading  # noqa: F401  (thread started below)
+    while True:
+        time.sleep(60)
+        if _IDLE_UNLOAD_S <= 0:
+            continue
+        with _load_lock:
+            if (_pipe is not None and _busy == 0
+                    and (time.monotonic() - _last_used) > _IDLE_UNLOAD_S):
+                _unload_model()
+
+
+__import__("threading").Thread(target=_idle_reaper, daemon=True,
+                               name="video-idle-reaper").start()
 
 
 def load_model():
@@ -199,8 +242,9 @@ def list_models():
 
 @app.post("/v1/videos/generations")
 def generate_video(req: VideoRequest):
-    _ensure_model()
+    _acquire_model()
     if _pipe is None:
+        _release_model()
         return {"error": "Model failed to load"}
     from diffusers.utils import export_to_video
 
@@ -227,22 +271,27 @@ def generate_video(req: VideoRequest):
         num_inference_steps=steps,
     )
 
-    if req.image_url:
-        i2v = _get_i2v_pipe()
-        if i2v is not None:
-            try:
-                call_kwargs["image"] = _load_image(req.image_url)
-                result = i2v(**call_kwargs)
-            except Exception as e:
-                logger.warning(f"image-to-video failed ({e}); falling back to text-to-video")
-                call_kwargs.pop("image", None)
+    try:
+        if req.image_url:
+            i2v = _get_i2v_pipe()
+            if i2v is not None:
+                try:
+                    call_kwargs["image"] = _load_image(req.image_url)
+                    result = i2v(**call_kwargs)
+                except Exception as e:
+                    logger.warning(f"image-to-video failed ({e}); falling back to text-to-video")
+                    call_kwargs.pop("image", None)
+                    result = _pipe(**call_kwargs)
+            else:
                 result = _pipe(**call_kwargs)
         else:
             result = _pipe(**call_kwargs)
-    else:
-        result = _pipe(**call_kwargs)
 
-    frames = result.frames[0]
+        frames = result.frames[0]
+    finally:
+        # Always release the in-flight marker so the idle reaper can reclaim
+        # RAM even after a failed generation.
+        _release_model()
 
     # export_to_video needs a file path; write to a temp mp4, read bytes back.
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
