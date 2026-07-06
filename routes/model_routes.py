@@ -594,6 +594,8 @@ _NON_CHAT_PREFIXES = (
     "sora", "gpt-image", "chatgpt-image",
     # embedding / retrieval / non-chat models (common across providers)
     "snowflake/arctic-embed", "nvidia/nv-embed", "embed",
+    # Gemini non-chat model families (image/video/music generation, embeddings)
+    "imagen-", "veo-", "lyria-", "gemini-embedding",
 )
 _NON_CHAT_CONTAINS = (
     "-realtime", "-transcribe", "-tts", "-codex",
@@ -603,6 +605,12 @@ _NON_CHAT_CONTAINS = (
     "topic-control", "calibration",
     "ai-synthetic-video", "cosmos-reason2",
     "bge", "llama-guard",
+    # Gemini non-chat / non-general-chat model families: Attributed QA,
+    # research-agent products, IDE/agentic-coding products, robotics/embodied
+    # models, and computer-use action models — none of these behave as a
+    # general chat-completions model in the picker.
+    "aqa", "deep-research", "antigravity", "-live-preview",
+    "robotics-er", "computer-use",
 )
 _NON_CHAT_EXACT_PREFIXES = (
     "gpt-audio",  # gpt-audio, gpt-audio-mini etc. (not gpt-4o-audio-preview which is chat)

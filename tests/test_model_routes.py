@@ -409,6 +409,30 @@ class TestIsChatModel:
         # model id; it must not crash on .lower() (treated as chat-capable).
         assert _is_chat_model(bad) is True
 
+    @pytest.mark.parametrize("model_id", [
+        "models/aqa",
+        "gemini-2.0-flash-deep-research",
+        "antigravity",
+        "gemini-embedding-001",
+        "imagen-3.0-generate-002",
+        "veo-2.0-generate-001",
+        "lyria-002",
+        "gemini-2.0-flash-live-preview",
+        "gemini-robotics-er-1.5",
+        "gemini-2.5-computer-use-preview",
+    ])
+    def test_gemini_non_chat_families_are_excluded(self, model_id):
+        # Non-chat Gemini products (Attributed QA, research-agent products,
+        # image/video/music generation, embeddings, robotics, computer-use
+        # action models) were leaking into the chat-model picker.
+        assert _is_chat_model(model_id) is False
+
+    def test_gemini_chat_models_still_included(self):
+        # Regression guard: the new exclusions must not overreach into real
+        # Gemini chat models.
+        assert _is_chat_model("gemini-2.0-flash") is True
+        assert _is_chat_model("gemini-2.5-pro") is True
+
 
 # ── _classify_endpoint ──
 
