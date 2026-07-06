@@ -144,6 +144,8 @@ def test_inject_steering_persists_and_reaches_messages(monkeypatch, _clean_runs)
     assert sess.messages[0].role == "user"
     assert sess.messages[0].content == "steer me"
     assert (sess.messages[0].metadata or {}).get("steered") is True
+    # a genuine user steer is the human talking → stays visible in the transcript
+    assert not (sess.messages[0].metadata or {}).get("hidden")
     # user steer counts as user activity → resume cap reset
     assert "inj-1" not in subagent_runs._resume_count
 
@@ -162,6 +164,13 @@ def test_subagent_steer_does_not_reset_resume_cap(monkeypatch, _clean_runs):
     agent_loop._inject_steering_messages("inj-2", [])
     # A sub-agent-result steer is NOT genuine user activity — cap stays.
     assert subagent_runs._resume_count.get("inj-2") == 1
+    # It is framed untrusted context, not user prose, so it must persist
+    # hidden — otherwise the "UNTRUSTED SOURCE DATA" wrapper renders as a
+    # visible "You" bubble in the transcript.
+    assert len(sess.messages) == 1
+    assert sess.messages[0].role == "user"
+    assert (sess.messages[0].metadata or {}).get("hidden") is True
+    assert (sess.messages[0].metadata or {}).get("steer_kind") == "subagent"
 
 
 def test_inject_no_live_run_returns_empty(monkeypatch, _clean_runs):

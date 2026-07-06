@@ -180,7 +180,8 @@ function _renderHistoryMessage(msg, modelName, opts) {
     // text-prefix checks below remain as a fallback for older rows saved before
     // the marker existed. Tolerant to whichever boolean key the backend chose.
     if (meta && (meta.hidden || meta.hide_bubble || meta.hide_user_bubble ||
-                 meta.subagent_resume || meta.auto_resume || meta.no_bubble)) {
+                 meta.subagent_resume || meta.auto_resume || meta.no_bubble ||
+                 meta.steer_kind === 'subagent')) {
       return null;
     }
     displayContent = _stripUserVisionBlocks(displayContent);
@@ -190,6 +191,7 @@ function _renderHistoryMessage(msg, modelName, opts) {
       trimmed.startsWith('Your message was cut off.') ||
       trimmed.startsWith('Your previous response was interrupted.') ||
       trimmed.startsWith('The background sub-agent you dispatched has finished') ||
+      trimmed.startsWith('UNTRUSTED SOURCE DATA') ||
       displayContent.includes('[Instruction: Rewrite') ||
       displayContent.includes('[Instruction: Explain')
     ) {

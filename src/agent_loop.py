@@ -2397,6 +2397,8 @@ def _inject_steering_messages(session_id: Optional[str], messages: List[Dict]) -
                 meta = {"steered": True}
                 if kind != "user":
                     meta["steer_kind"] = kind
+                if kind == "subagent":
+                    meta["hidden"] = True  # framed context, not user prose
                 sess.add_message(ChatMessage("user", text, metadata=meta))
             except Exception as _e:
                 logger.warning("[steer] failed to persist steered message: %s", _e)
