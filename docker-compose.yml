@@ -146,6 +146,12 @@ services:
       - ntfy-cache:/var/cache/ntfy
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
+      # Relay a wake-up signal through ntfy.sh's APNs/FCM push infra so phone
+      # apps get instant notifications from this self-hosted server (iOS
+      # requires this; Android battery optimization otherwise kills the
+      # app's own connection). Message content stays local — only a poll
+      # request transits ntfy.sh.
+      - NTFY_UPSTREAM_BASE_URL=${NTFY_UPSTREAM_BASE_URL:-https://ntfy.sh}
     restart: unless-stopped
 
 volumes:

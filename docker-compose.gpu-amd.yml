@@ -167,6 +167,42 @@ services:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
     restart: unless-stopped
 
+  # Local LTX-Video text/image-to-video sidecar (generate_video, backend=local).
+  # Under the "video" profile so it does NOT start by default. See
+  # scripts/setup_video_sidecar.sh:
+  #   docker compose --profile video up -d --build video
+  # NOTE (AMD): docker/video/Dockerfile ships a CUDA PyTorch base for the common
+  # NVIDIA case. On ROCm, swap its FROM line for a rocm/pytorch image before
+  # building this service; the ROCm device passthrough below mirrors the odysseus
+  # service's overlay.
+  video:
+    profiles: ["video"]
+    build:
+      context: .
+      dockerfile: docker/video/Dockerfile
+    ports:
+      - "${VIDEO_BIND:-127.0.0.1}:8102:8102"
+    volumes:
+      - ./scripts/video_server.py:/workspace/video_server.py:ro,z
+      - ${APP_DATA_DIR:-./data}/huggingface:/root/.cache/huggingface:z
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      python video_server.py
+      --model ${VIDEO_MODEL:-Lightricks/LTX-Video-0.9.7-distilled}
+      --host 0.0.0.0 --port 8102 --cpu-offload --vae-tiling
+      --allowed-host host.docker.internal --allowed-host 0.0.0.0
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - ${RENDER_GID:-render}
+    restart: unless-stopped
+
 volumes:
   searxng-data:
   chromadb-data:

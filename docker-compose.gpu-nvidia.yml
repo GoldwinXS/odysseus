@@ -170,6 +170,45 @@ services:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
     restart: unless-stopped
 
+  # Local LTX-Video text/image-to-video sidecar (generate_video, backend=local).
+  # Under the "video" profile so it does NOT start by default — bring it up
+  # explicitly (heavy image + model weights). See scripts/setup_video_sidecar.sh:
+  #   docker compose --profile video up -d --build video
+  # The MCP server reaches it at http://host.docker.internal:8102; --host 0.0.0.0
+  # + --allowed-host accept the host.docker.internal Host header from that call.
+  video:
+    profiles: ["video"]
+    build:
+      context: .
+      dockerfile: docker/video/Dockerfile
+    ports:
+      - "${VIDEO_BIND:-127.0.0.1}:8102:8102"
+    volumes:
+      # Mount the server script at runtime (not copied) so edits are picked up
+      # on restart, mirroring the diffusion sidecar convention.
+      - ./scripts/video_server.py:/workspace/video_server.py:ro,z
+      # Persist the HuggingFace weights cache so recreating the container does
+      # not re-download the LTX-Video model.
+      - ${APP_DATA_DIR:-./data}/huggingface:/root/.cache/huggingface:z
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      python video_server.py
+      --model ${VIDEO_MODEL:-Lightricks/LTX-Video-0.9.7-distilled}
+      --host 0.0.0.0 --port 8102 --cpu-offload --vae-tiling
+      --allowed-host host.docker.internal --allowed-host 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
 volumes:
   searxng-data:
   chromadb-data:
