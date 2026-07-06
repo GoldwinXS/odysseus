@@ -119,7 +119,10 @@ _busy = 0            # in-flight generations (guarded by _load_lock)
 _last_used = 0.0     # monotonic ts of last generation start/end
 # Auto-unload after this many idle seconds so RAM returns to the host when
 # nobody is generating (0 disables). The model reloads on the next request.
-_IDLE_UNLOAD_S = float(os.environ.get("VIDEO_IDLE_UNLOAD_S", "600"))
+# Short by design: the pipeline holds ~10-14GB of CPU RAM, so it should spin
+# down within a couple of minutes of the last clip (user preference). The
+# reaper polls every 60s, so effective unload is idle+0..60s.
+_IDLE_UNLOAD_S = float(os.environ.get("VIDEO_IDLE_UNLOAD_S", "120"))
 
 
 def _acquire_model():
