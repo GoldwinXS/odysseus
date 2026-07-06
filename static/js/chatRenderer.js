@@ -764,6 +764,59 @@ export function getModelCost(modelName, inputTokens, outputTokens) {
 }
 
 /**
+ * Cache-aware cost estimate for a turn. `fresh_input` is the UNCACHED input;
+ * cache_read tokens are billed ~0.1x the input rate and cache_write ~1.25x
+ * (Anthropic prompt-cache economics — the local MODEL_PRICING table carries no
+ * per-model cache rates, so we derive them from the input rate). Falls back to
+ * the plain input+output formula when no cache tokens are supplied, so it's
+ * identical to getModelCost for the non-cache case. Returns null for unknown
+ * models. Used as the client-side fallback when metadata.cost_usd is absent.
+ */
+export function getModelCostCacheAware(modelName, freshInput, output, cacheRead, cacheWrite) {
+  if (!modelName) return null;
+  const key = matchModelKey(modelName, Object.keys(MODEL_PRICING));
+  if (!key) return null;
+  const p = MODEL_PRICING[key];
+  const cr = p.cache_read != null ? p.cache_read : p.input * 0.1;
+  const cw = p.cache_write != null ? p.cache_write : p.input * 1.25;
+  return (
+    (freshInput || 0) * p.input +
+    (output || 0) * p.output +
+    (cacheRead || 0) * cr +
+    (cacheWrite || 0) * cw
+  ) / 1_000_000;
+}
+
+/**
+ * Cost for a turn given its metrics dict. Prefers the server-authoritative
+ * metadata.cost_usd (priced by the served model, cache-aware, and zero for
+ * local endpoints); otherwise falls back to an improved client estimate that
+ * (a) prices the SERVED model (metrics.served_model) over the requested model,
+ * and (b) applies cache-aware math when cache fields are present. Returns null
+ * for non-billable endpoints so the caller can hide the cost. Old messages
+ * without cost_usd / cache fields degrade to the plain input+output estimate.
+ */
+export function turnCost(metrics) {
+  if (!metrics) return null;
+  // Non-billable endpoint (local/self-hosted/subscription) → hide cost, and
+  // never trust a stale server cost for it either.
+  if (!isCostTrackedEndpoint(_currentEndpointUrl())) return null;
+  const served = metrics.served_model || metrics.model;
+  // Prefer the server-computed cost when present and sane.
+  if (typeof metrics.cost_usd === 'number' && metrics.cost_usd >= 0) {
+    return metrics.cost_usd;
+  }
+  const input = metrics.input_tokens || 0;
+  const output = metrics.output_tokens || 0;
+  const cacheRead = metrics.cache_read_tokens || metrics.cache_read_input_tokens || 0;
+  const cacheWrite = metrics.cache_creation_tokens || metrics.cache_creation_input_tokens || 0;
+  if (cacheRead || cacheWrite) {
+    return getModelCostCacheAware(served, input, output, cacheRead, cacheWrite);
+  }
+  return getModelCost(served, input, output);
+}
+
+/**
  * Is this endpoint a local / self-hosted model server (vLLM, Ollama, …)?
  * Local models are free, so we must NOT bill them at cloud rates — the
  * pricing table matches on a name substring, so a local `qwen2.5-coder`
@@ -813,13 +866,6 @@ function _currentEndpointUrl() {
 
 export function isCostTrackedEndpoint(url) {
   return !isLocalEndpoint(url) && !isSubscriptionEndpoint(url);
-}
-
-/** Cost for the current turn, returning null for non-billable endpoints. */
-function _billableCost(model, inputTokens, outputTokens) {
-  const url = _currentEndpointUrl();
-  if (!isCostTrackedEndpoint(url)) return null;
-  return getModelCost(model, inputTokens, outputTokens);
 }
 
 export function getImageCost(model, quality, size) {
@@ -1770,8 +1816,10 @@ export function displayMetrics(messageElement, metrics) {
   const tps = metrics.tokens_per_second;
   const isReal = metrics.usage_source === 'real';
   const ctxPct = metrics.context_percent;
-  const model = metrics.model || 'Unknown';
-  const cost = _billableCost(model, inputTokens, outputTokens);
+  const model = metrics.served_model || metrics.model || 'Unknown';
+  // Prefer server-authoritative metadata.cost_usd; else an improved cache-aware
+  // estimate priced by the served model. null for non-billable endpoints.
+  const cost = turnCost(metrics);
 
   // Nothing useful to show — bail out (only if ALL metrics are missing)
   if (!responseTime && !inputTokens && !outputTokens && tps == null && !ctxPct) return;
@@ -1822,6 +1870,7 @@ export function displayMetrics(messageElement, metrics) {
     const ctxColor = ctxPct >= 85 ? 'var(--red, #e06c75)' : ctxPct >= 70 ? '#ff9900' : 'var(--color-muted-alt, #6b7280)';
     const prepTime = metrics.agent_prep_time;
     const modelWaitTime = metrics.agent_model_wait_time;
+    const reasoningEffort = metrics.reasoning_effort;
     const prepBreakdown = metrics.agent_prep_breakdown || null;
     const prepDetails = prepBreakdown
       ? Object.entries(prepBreakdown).map(([k, v]) => `${k}: ${v}s`).join('<br>')
@@ -1839,6 +1888,7 @@ export function displayMetrics(messageElement, metrics) {
     popup.innerHTML = `
       <div style="font-weight:600;margin-bottom:6px;color:var(--fg);">Message Stats</div>
       <div><span class="ctx-label">Model</span> ${model.split('/').pop()}</div>
+      ${reasoningEffort ? `<div><span class="ctx-label">Reasoning</span> ${reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1)}</div>` : ''}
       <div><span class="ctx-label">Input</span> ${inputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Output</span> ${outputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Total</span> ${totalTok.toLocaleString()} tokens</div>
@@ -2207,6 +2257,173 @@ const _TOOL_VERB = {
   manage_session: 'Session', ui_control: 'UI',
 };
 
+// ---- Collapsed tool-group summary (Claude-app style "Used N tools: ...") ----
+
+// Verb-PHRASE map (distinct from the single-word chip verb above) — covers
+// every tag registered in src/agent_tools/__init__.py TOOL_TAGS. Grouped by
+// phrase so several raw tool names can share one summary phrase (e.g. every
+// document-editing tool reads as "edited a file"). Unmapped tags fall back to
+// the tool name with underscores turned to spaces (see _toolSummaryPhrase).
+const _TOOL_SUMMARY_PHRASE = {
+  ls: 'listed files', glob: 'listed files', list_files: 'listed files',
+  read_file: 'read a file', read_document: 'read a file',
+  grep: 'searched code', search_tools: 'searched code', search_chats: 'searched chats',
+  bash: 'ran a command', python: 'ran a command', shell: 'ran a command', subprocess: 'ran a command',
+  edit_file: 'edited a file', edit_document: 'edited a file', update_document: 'edited a file',
+  suggest_document: 'reviewed a file',
+  write_file: 'wrote a file', create_document: 'wrote a file',
+  web_search: 'searched the web', web_fetch: 'fetched a web page', trigger_research: 'ran research',
+  manage_research: 'managed research',
+  spawn_agent: 'ran a sub-agent', send_to_subagent: 'messaged a sub-agent', manage_agents: 'managed sub-agents',
+  chat_with_model: 'chatted with a model', ask_teacher: 'asked the teacher model', list_models: 'listed models',
+  create_session: 'created a session', list_sessions: 'listed sessions', send_to_session: 'messaged a session',
+  manage_session: 'updated session settings',
+  manage_memory: 'updated memory', save_memory: 'saved a memory', search_memory: 'searched memory',
+  ui_control: 'controlled the UI',
+  generate_image: 'generated an image', edit_image: 'edited an image', view_image: 'viewed an image',
+  generate_video: 'generated a video',
+  ask_user: 'asked a question', update_plan: 'updated the plan',
+  manage_tasks: 'managed tasks', manage_bg_jobs: 'managed background jobs', pipeline: 'ran a pipeline',
+  api_call: 'called an API', app_api: 'called the app',
+  manage_skills: 'managed skills',
+  manage_endpoints: 'managed endpoints', manage_mcp: 'managed MCP servers',
+  manage_webhooks: 'managed webhooks', manage_tokens: 'managed tokens',
+  manage_documents: 'managed documents', manage_settings: 'updated settings',
+  manage_notes: 'managed notes', manage_calendar: 'managed the calendar',
+  resolve_contact: 'looked up a contact', manage_contact: 'managed a contact',
+  download_model: 'downloaded a model', serve_model: 'served a model',
+  list_served_models: 'listed served models', stop_served_model: 'stopped a served model',
+  list_downloads: 'listed downloads', cancel_download: 'canceled a download',
+  search_hf_models: 'searched Hugging Face', list_cached_models: 'listed cached models',
+  list_serve_presets: 'listed serve presets', serve_preset: 'served a preset',
+  adopt_served_model: 'adopted a served model', list_cookbook_servers: 'listed cookbook servers',
+  // Email tools (BUILTIN_EMAIL_TOOLS, unioned into TOOL_TAGS) — all read as
+  // one generic phrase; the per-tool chip still shows the specific action.
+  list_email_accounts: 'checked email', list_emails: 'checked email', read_email: 'read an email',
+  search_emails: 'searched email', send_email: 'sent an email', reply_to_email: 'replied to an email',
+  draft_email: 'drafted an email', draft_email_reply: 'drafted an email reply',
+  ai_draft_email_reply: 'drafted an email reply', archive_email: 'archived an email',
+  delete_email: 'deleted an email', mark_email_read: 'marked an email read',
+  bulk_email: 'managed email', download_attachment: 'downloaded an attachment',
+  // get_workspace deliberately omitted from a MULTI-tool summary (per spec:
+  // "omit unless alone") — handled as a special case in buildToolSummary.
+};
+
+function _toolSummaryPhrase(tool) {
+  const t = (tool || '').toLowerCase();
+  return _TOOL_SUMMARY_PHRASE[t] || t.replace(/_/g, ' ');
+}
+
+/**
+ * Build the Claude-app-style collapsed summary for a contiguous block of
+ * tool events, e.g. "Used 4 tools: read a file, searched code, ran a
+ * command, and 1 more". Dedupes phrases (a block with 3 bash calls reads
+ * "ran a command" once), keeps the first 3 distinct phrases + "and N more".
+ *
+ * Single-tool blocks: if the tool carries a persisted per-tool caption
+ * (ev.caption), that caption is used verbatim as the summary instead of the
+ * generic verb phrase — a real caption ("Checking the renderer for sprite
+ * drawing") is more informative than "read a file".
+ *
+ * get_workspace is dropped from a MULTI-tool block's phrase list (per spec:
+ * "omit unless alone") since it is usually incidental context-gathering
+ * alongside the tool call that actually mattered; a get_workspace-ONLY block
+ * still gets its own phrase so the summary is never empty.
+ */
+export function buildToolSummary(events) {
+  const list = Array.isArray(events) ? events.filter(Boolean) : [];
+  const count = list.length;
+  if (count === 0) return 'Used 0 tools';
+  if (count === 1) {
+    const ev = list[0];
+    if (ev.caption) return ev.caption;
+    return 'Used 1 tool: ' + _toolSummaryPhrase(ev.tool);
+  }
+  const nonWorkspace = list.filter(ev => (ev.tool || '').toLowerCase() !== 'get_workspace');
+  const forPhrases = nonWorkspace.length ? nonWorkspace : list;
+  const phrases = [];
+  for (const ev of forPhrases) {
+    const p = _toolSummaryPhrase(ev.tool);
+    if (!phrases.includes(p)) phrases.push(p);
+  }
+  const shown = phrases.slice(0, 3);
+  let text = 'Used ' + count + ' tools: ' + shown.join(', ');
+  const more = phrases.length - shown.length;
+  if (more > 0) text += ', and ' + more + ' more';
+  return text;
+}
+
+/**
+ * Ensure a `.agent-thread` container has the collapsible group-summary
+ * header (idempotent — a no-op if already present), and (re)build its text
+ * from `threadWrap._allEvents` (the full accumulated tool-event list for this
+ * thread, which grows across merged rounds — see the two render paths for
+ * where events get pushed onto it).
+ *
+ * Collapsed by default (`collapsed` class on threadWrap) — callers that want
+ * the live in-progress behavior (current block stays expanded while
+ * streaming) set `opts.startExpanded` on first build and remove the class
+ * themselves when the block ends; see chat.js's live path.
+ */
+export function ensureAgentThreadSummary(threadWrap, opts) {
+  if (!threadWrap) return;
+  let header = threadWrap.querySelector(':scope > .agent-thread-summary');
+  if (!header) {
+    header = document.createElement('div');
+    header.className = 'agent-thread-summary';
+    header.setAttribute('role', 'button');
+    header.setAttribute('tabindex', '0');
+    header.innerHTML =
+      '<span class="agent-thread-summary-text"></span>' +
+      '<span class="agent-thread-summary-chevron">▶</span>';
+    threadWrap.insertBefore(header, threadWrap.firstChild);
+    const startExpanded = !!(opts && opts.startExpanded);
+    threadWrap.classList.toggle('collapsed', !startExpanded);
+    header.setAttribute('aria-expanded', startExpanded ? 'true' : 'false');
+  }
+  const textEl = header.querySelector('.agent-thread-summary-text');
+  if (textEl) textEl.textContent = buildToolSummary(threadWrap._allEvents || []);
+  return header;
+}
+
+/** Collapse a thread's group-summary header (used when a live block ends —
+ * see chat.js). No-op if the thread has no summary header (shouldn't happen
+ * once ensureAgentThreadSummary has run, but defensive regardless). */
+export function collapseAgentThreadSummary(threadWrap) {
+  if (!threadWrap) return;
+  const header = threadWrap.querySelector(':scope > .agent-thread-summary');
+  if (!header) return;
+  threadWrap.classList.add('collapsed');
+  header.setAttribute('aria-expanded', 'false');
+}
+
+// Single delegated click/keyboard handler for every .agent-thread-summary
+// header — toggles the `collapsed` class on its parent .agent-thread. Mirrors
+// the existing delegated .agent-thread-header handler in chat.js (same
+// rationale: one listener survives every innerHTML rewrite, so a thread
+// rebuilt mid-stream never silently loses its click handler).
+if (typeof document !== 'undefined' && !window.__odysseus_thread_summary_click_bound) {
+  const _toggleThreadSummary = (header) => {
+    const thread = header.closest('.agent-thread');
+    if (!thread) return;
+    const collapsed = thread.classList.toggle('collapsed');
+    header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  };
+  document.body.addEventListener('click', (e) => {
+    const header = e.target.closest('.agent-thread-summary');
+    if (!header) return;
+    _toggleThreadSummary(header);
+  });
+  document.body.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const header = e.target.closest('.agent-thread-summary');
+    if (!header) return;
+    e.preventDefault();
+    _toggleThreadSummary(header);
+  });
+  window.__odysseus_thread_summary_click_bound = true;
+}
+
 function _basename(p) {
   if (typeof p !== 'string') return '';
   const parts = p.split(/[\\/]/);
@@ -2305,6 +2522,15 @@ export function addMessage(role, content, modelName, metadata) {
     const box = document.getElementById('chat-history');
     if (!box) { console.error('Chat history element not found'); return; }
 
+    // De-dupe guard: a persisted message (metadata._db_id) can be rendered
+    // twice — e.g. a history-render race, or a live completion firing after
+    // the same row already reloaded from the DB. Skip re-appending rather
+    // than duplicating the bubble/thread; the existing render is authoritative.
+    if (metadata?._db_id) {
+      const _existing = box.querySelector(`.msg[data-db-id="${CSS.escape(String(metadata._db_id))}"]`);
+      if (_existing) return _existing;
+    }
+
     // Loading a later user message means any earlier ask_user card was
     // answered.  This also removes the live card as soon as a manual reply is
     // appended, even when the user did not click one of its buttons.
@@ -2333,11 +2559,53 @@ export function addMessage(role, content, modelName, metadata) {
 
       const maxRound = Math.max(...Object.keys(toolsByRound).map(Number), roundTexts.length);
 
+      // Only the LAST message in a history slice may show reasoning expanded
+      // by default (see createThinkingSection's doc comment) — earlier
+      // messages always render their thinking collapsed. Live-stream
+      // completions (not from history) count as "last" too.
+      const _isLastMsg = metadata?._isLastMessage !== false;
+
       for (let r = 0; r < maxRound; r++) {
         const roundNum = r + 1;
         const txt = resolveDocumentPlaceholderLinks((roundTexts[r] || '').trim(), metadata);
+        const roundTools = toolsByRound[roundNum] || [];
 
-        if (txt) {
+        // Round_texts DELIBERATELY retain <think> tags (persisted so thinking
+        // survives reload) — extract them from the round's own text BEFORE
+        // deciding whether the round is a short "tool caption" preamble.
+        // Without this, a short thinking-only round like
+        // "<think>Let me check the logs first.</think>" (well under the
+        // 120-char cap) got misclassified as a caption and its entire text —
+        // thinking included — was suppressed and never rendered as a bubble,
+        // silently deleting the thinking section on reload.
+        const _thinkExtract = txt ? markdownModule.extractThinkingBlocks(txt) : null;
+        const _hasThinking = !!(_thinkExtract && _thinkExtract.thinkingBlocks.length);
+        const _visibleForCaption = _thinkExtract ? _thinkExtract.content : txt;
+
+        // Preamble heuristic (shared with the streaming path's
+        // _consumeToolPreamble via markdownModule.isToolCaptionText): only the
+        // VISIBLE reply portion is eligible to be treated as a short tool
+        // caption. A round with real thinking content always gets its own
+        // bubble so the thinking section renders — mirrors the live path's
+        // _hasThinking-gated suppression (chat.js ~2727).
+        const _isPreamble = !_hasThinking && markdownModule.isToolCaptionText(_visibleForCaption);
+        const _suppressBubble = _isPreamble && roundTools.length > 0;
+        // Caption shown inline on the round's first tool chip. Prefer the
+        // persisted per-event caption (new backend field) so old and new
+        // messages render identically once the backend starts sending it;
+        // fall back to the shared heuristic against the visible (non-
+        // thinking) text for messages that predate that field. Shown inline
+        // whenever there are tools this round, whether or not the bubble
+        // itself was suppressed (a round with thinking can still have a short
+        // visible caption alongside its thinking section).
+        const _firstToolCaption = roundTools[0] && roundTools[0].caption != null
+          ? roundTools[0].caption
+          : null;
+        const _preambleForChip = roundTools.length > 0
+          ? (_firstToolCaption || markdownModule.toolCaptionOrNull(_visibleForCaption) || '')
+          : '';
+
+        if (txt && !_suppressBubble) {
           const wrap = document.createElement('div');
           wrap.className = 'msg msg-ai' + (r > 0 ? ' msg-continuation' : '');
           const roleEl = document.createElement('div');
@@ -2372,7 +2640,12 @@ export function addMessage(role, content, modelName, metadata) {
           if (isLastTextRound && metadata?.rag_sources?.length) {
             agentFindingsSuffix += buildRagSourcesBox(metadata.rag_sources);
           }
-          body.innerHTML = agentSourcesPrefix + markdownModule.processWithThinking(markdownModule.squashOutsideCode(txt)) + agentFindingsSuffix;
+          // Thinking only defaults to expanded for the LAST round of the LAST
+          // message — every earlier round (even within this same message)
+          // renders its thinking collapsed, same as any other historical turn.
+          body.innerHTML = agentSourcesPrefix
+            + markdownModule.processWithThinking(markdownModule.squashOutsideCode(txt), { isLast: _isLastMsg && isLastTextRound })
+            + agentFindingsSuffix;
           wrap.appendChild(body);
           wrap.dataset.raw = txt;
           if (metadata?._db_id) wrap.dataset.dbId = metadata._db_id;
@@ -2382,7 +2655,6 @@ export function addMessage(role, content, modelName, metadata) {
           lastMsgAi = wrap;
         }
 
-        const roundTools = toolsByRound[roundNum] || [];
         if (roundTools.length > 0) {
           // Reuse previous thread if no text separated us (merge consecutive tool rounds)
           let threadWrap = null;
@@ -2395,7 +2667,8 @@ export function addMessage(role, content, modelName, metadata) {
             if (txt) threadWrap.classList.add('has-top');
             box.appendChild(threadWrap);
           }
-          for (const ev of roundTools) {
+          for (let ti = 0; ti < roundTools.length; ti++) {
+            const ev = roundTools[ti];
             if (ev.ask_user) pendingAskUser = ev.ask_user;
             const sum = toolChipSummary(ev);
             const node = document.createElement('div');
@@ -2404,12 +2677,21 @@ export function addMessage(role, content, modelName, metadata) {
             // screenshot) is built lazily the first time the chip is expanded \u2014
             // see the delegated click handler in chat.js \u2014 so a 100+ tool turn
             // never dumps hundreds of KB of hidden DOM on load.
+            // Inline caption on the first chip when the round's text was a preamble.
+            const captionHtml = (ti === 0 && _preambleForChip) ? `<span class="agent-thread-caption-inline">${esc(_preambleForChip)}</span>` : '';
             const detailHtml = sum.detail ? `<span class="agent-thread-detail">${esc(sum.detail)}</span>` : '';
             const statHtml = sum.stat ? `<span class="agent-thread-stat">${esc(sum.stat)}</span>` : '';
-            node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${sum.ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(sum.verb)}</span>${detailHtml}${statHtml}<span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content"></div>`;
+            node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${sum.ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(sum.verb)}</span>${captionHtml}${detailHtml}${statHtml}<span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content"></div>`;
             node._ev = ev;  // stashed for lazy content build on first expand
             threadWrap.appendChild(node);
           }
+          // Accumulate this round's events onto the thread's running total
+          // (a thread can span several merged rounds — see the reuse check
+          // above) and (re)build the collapsed group-summary header from it.
+          // History always starts collapsed (no opts.startExpanded) — only
+          // the live path (chat.js) keeps the in-progress block expanded.
+          threadWrap._allEvents = (threadWrap._allEvents || []).concat(roundTools);
+          ensureAgentThreadSummary(threadWrap);
           // Check if next round has text — extend line down to connect
           const nextTxt = (roundTexts[r + 1] || '').trim();
           if (nextTxt) threadWrap.classList.add('has-bottom');
@@ -2470,7 +2752,13 @@ export function addMessage(role, content, modelName, metadata) {
 
     // --- Standard single-bubble message ---
     const wrap = document.createElement('div');
-    wrap.className = 'msg ' + (role === 'user' ? 'msg-user' : 'msg-ai');
+    // Steered mid-turn user messages get a distinct class hook so they read
+    // differently from a normal turn-starting message, consistently between
+    // the live render (metadata._steer, set by _renderSteerBubble — never
+    // persisted) and history reload (metadata.steered, the persisted DB
+    // field once the backend saves it on the injected message).
+    const _isSteeredMsg = role === 'user' && !!(metadata?._steer || metadata?.steered);
+    wrap.className = 'msg ' + (role === 'user' ? 'msg-user' : 'msg-ai') + (_isSteeredMsg ? ' msg-steered' : '');
 
     const r = document.createElement('div');
     r.className = 'role';
@@ -2545,15 +2833,20 @@ export function addMessage(role, content, modelName, metadata) {
     if (role === 'assistant' && metadata?.rag_sources?.length) {
       findingsSuffix += buildRagSourcesBox(metadata.rag_sources);
     }
+    // Only the last message in a history slice defaults its thinking section
+    // to expanded (see createThinkingSection's doc comment); live-completion
+    // callers that don't set _isLastMessage keep today's expanded-by-default.
+    const _plainIsLast = metadata?._isLastMessage !== false;
     // If thinking is stored in metadata (not in text), reconstruct the full display
     if (role === 'assistant' && metadata?.thinking) {
       const thinkTime = metadata.thinking_time || null;
       const thinkHtml = markdownModule.processWithThinking(
-        '<think' + (thinkTime ? ` time="${thinkTime}"` : '') + '>' + metadata.thinking + '</think>\n\n' + text
+        '<think' + (thinkTime ? ` time="${thinkTime}"` : '') + '>' + metadata.thinking + '</think>\n\n' + text,
+        { isLast: _plainIsLast }
       );
       b.innerHTML = sourcesPrefix + thinkHtml + findingsSuffix;
     } else {
-      b.innerHTML = sourcesPrefix + markdownModule.processWithThinking(text) + findingsSuffix;
+      b.innerHTML = sourcesPrefix + markdownModule.processWithThinking(text, { isLast: _plainIsLast }) + findingsSuffix;
     }
 
     // The vision/OCR caption is stripped from the displayed text above (so the
@@ -2767,6 +3060,8 @@ const chatRenderer = {
   modelColor,
   applyModelColor,
   getModelCost,
+  getModelCostCacheAware,
+  turnCost,
   isCostTrackedEndpoint,
   isSubscriptionEndpoint,
   getImageCost,
@@ -2779,6 +3074,9 @@ const chatRenderer = {
   safeToolScreenshotSrc,
   toolChipSummary,
   buildToolContentHtml,
+  buildToolSummary,
+  ensureAgentThreadSummary,
+  collapseAgentThreadSummary,
   safeDisplayImageSrc,
   removeAskUserCards,
   renderAskUserCard,

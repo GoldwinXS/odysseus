@@ -1807,7 +1807,9 @@ async function initResearchSearchSettings() {
 async function initAgentSettings() {
   var toolsInput = el('set-agentMaxTools');
   var roundsInput = el('set-agentMaxRounds');
+  var subRoundsInput = el('set-subagentMaxRounds');
   var supInput = el('set-agentSupervisorLadder');
+  var effortSelect = el('set-reasoningEffortDefault');
   var msg = el('set-agentMsg');
   if (!toolsInput) return;
 
@@ -1816,7 +1818,9 @@ async function initAgentSettings() {
     var settings = await res.json();
     if (settings.agent_max_tool_calls) toolsInput.value = settings.agent_max_tool_calls;
     if (roundsInput && settings.agent_max_rounds) roundsInput.value = settings.agent_max_rounds;
+    if (subRoundsInput && settings.subagent_max_rounds) subRoundsInput.value = settings.subagent_max_rounds;
     if (supInput) supInput.checked = !!settings.agent_supervisor_ladder;
+    if (effortSelect) effortSelect.value = settings.reasoning_effort_default || 'default';
   } catch (e) {}
 
   // Clamp + coerce a raw input to an int in [lo, hi]; falls back to `dflt`
@@ -1830,11 +1834,15 @@ async function initAgentSettings() {
   async function save() {
     var tools = clampInt(toolsInput.value, 0, 1000, 0);
     var rounds = roundsInput ? clampInt(roundsInput.value, 1, 200, 20) : null;
+    var subRounds = subRoundsInput ? clampInt(subRoundsInput.value, 1, 200, 12) : null;
     toolsInput.value = tools;                       // reflect the clamped value
     if (roundsInput) roundsInput.value = rounds;
+    if (subRoundsInput) subRoundsInput.value = subRounds;
     var payload = { agent_max_tool_calls: tools };
     if (rounds != null) payload.agent_max_rounds = rounds;
+    if (subRounds != null) payload.subagent_max_rounds = subRounds;
     if (supInput) payload.agent_supervisor_ladder = !!supInput.checked;
+    if (effortSelect) payload.reasoning_effort_default = effortSelect.value;
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -1842,14 +1850,19 @@ async function initAgentSettings() {
       });
       msg.textContent = (tools > 0 ? 'Limit: ' + tools + ' tool calls' : 'Unlimited tool calls') +
         (rounds != null ? ' · ' + rounds + ' steps/message' : '') +
+        (subRounds != null ? ' · ' + subRounds + ' sub-agent rounds' : '') +
         (supInput && supInput.checked ? ' · supervisor on' : '');
       msg.style.color = 'var(--fg)';
+      // New chats read this default at creation time via reasoningEffort.js —
+      // no live re-broadcast needed here (an already-open composer keeps
+      // whatever it resolved at load/session-switch time).
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
   toolsInput.addEventListener('change', save);
   if (roundsInput) roundsInput.addEventListener('change', save);
   if (supInput) supInput.addEventListener('change', save);
+  if (effortSelect) effortSelect.addEventListener('change', save);
   var cur = parseInt(toolsInput.value, 10) || 0;
   var curR = roundsInput ? (parseInt(roundsInput.value, 10) || 20) : null;
   msg.textContent = (cur > 0 ? 'Limit: ' + cur + ' tool calls' : 'Unlimited tool calls') +

@@ -7,8 +7,10 @@ import markdownModule from './markdown.js';
 import chatRenderer from './chatRenderer.js';
 import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js';
+import { initReasoningEffort, notifySessionChanged as _notifyReasoningEffortSessionChanged } from './reasoningEffort.js';
 import themeModule from './theme.js';
 import spinnerModule from './spinner.js';
+import fileHandlerModule from './fileHandler.js';
 
 const API_BASE = window.location.origin;
 
@@ -121,11 +123,20 @@ function _renderHistoryMessage(msg, modelName, opts) {
   // render a LIVE ask_user card; earlier turns' persisted ask_user payloads
   // were already answered, so their cards are stale (see chatRenderer). Older
   // pages loaded via the pager are never last, so the default (undefined →
-  // suppressed) is correct there too.
+  // suppressed) is correct there too. The same flag also decides whether this
+  // message's thinking section(s) may default to expanded — see
+  // createThinkingSection's doc comment in markdown.js.
   const _isLast = !!(opts && opts.isLast);
   const meta = msg.metadata
-    ? { ...msg.metadata, _fromHistory: true, _suppressAskUser: !_isLast }
-    : (!_isLast ? { _suppressAskUser: true } : null);
+    ? { ...msg.metadata, _fromHistory: true, _suppressAskUser: !_isLast, _isLastMessage: _isLast }
+    : (!_isLast ? { _suppressAskUser: true, _isLastMessage: false } : { _isLastMessage: true });
+  // De-dupe guard: skip re-rendering a persisted message that's already on
+  // the page (e.g. a pager/reload race appending the same row twice).
+  if (meta?._db_id) {
+    const _boxDedupe = document.getElementById('chat-history');
+    const _existing = _boxDedupe && _boxDedupe.querySelector(`.msg[data-db-id="${CSS.escape(String(meta._db_id))}"]`);
+    if (_existing) return _existing;
+  }
   // Tool-heavy assistant turns: rebuild the compact agent thread (round
   // texts + lazy collapsed tool chips) via chatRenderer.addMessage — the
   // same renderer used when a live stream completes — instead of pushing
@@ -194,7 +205,11 @@ function _renderHistoryMessage(msg, modelName, opts) {
   if (chatRenderer.hideWelcomeScreen) chatRenderer.hideWelcomeScreen();
 
   const wrap = document.createElement('div');
-  wrap.className = 'msg ' + (msg.role === 'user' ? 'msg-user' : 'msg-ai');
+  // Same msg-steered class hook as chatRenderer.addMessage — keeps a steered
+  // mid-turn message visually consistent whichever render path a reload
+  // happens to take for it.
+  const _isSteeredHistMsg = msg.role === 'user' && !!meta?.steered;
+  wrap.className = 'msg ' + (msg.role === 'user' ? 'msg-user' : 'msg-ai') + (_isSteeredHistMsg ? ' msg-steered' : '');
   wrap.dataset.raw = displayContent;
   if (meta?._db_id) wrap.dataset.dbId = meta._db_id;
 
@@ -224,6 +239,9 @@ function _renderHistoryMessage(msg, modelName, opts) {
 
   const body = document.createElement('div');
   body.className = 'body';
+  // Only the last message in the history slice may default its thinking
+  // section to expanded (see createThinkingSection's doc comment).
+  const _histIsLast = meta?._isLastMessage !== false;
   if (meta && meta.subagent) {
     // A delivered sub-agent result can be many KB — render it COLLAPSED by
     // default (native <details>) so it doesn't dominate the transcript. The
@@ -241,13 +259,28 @@ function _renderHistoryMessage(msg, modelName, opts) {
     const inner = document.createElement('div');
     inner.style.cssText = 'margin-top:6px';
     inner.innerHTML = markdownModule.processWithThinking(
-      markdownModule.squashOutsideCode(markdownModule.renderContent(rest))
+      markdownModule.squashOutsideCode(markdownModule.renderContent(rest)),
+      { isLast: _histIsLast }
     );
     det.appendChild(inner);
     body.appendChild(det);
+  } else if (msg.role === 'assistant' && meta?.thinking) {
+    // Thinking persisted separately from content (not embedded as <think>
+    // tags in the text) — reconstruct the same way chatRenderer.addMessage's
+    // plain path does, so this fallback renderer never drops it (previously
+    // this branch didn't exist here at all: a non-tool-heavy assistant
+    // message with metadata.thinking rendered with NO thinking section on
+    // reload, even though the tool-heavy path and the live path both show it).
+    const thinkTime = meta.thinking_time || null;
+    body.innerHTML = markdownModule.processWithThinking(
+      '<think' + (thinkTime ? ` time="${thinkTime}"` : '') + '>' + meta.thinking + '</think>\n\n' +
+        markdownModule.squashOutsideCode(markdownModule.renderContent(displayContent || '')),
+      { isLast: _histIsLast }
+    );
   } else {
     body.innerHTML = markdownModule.processWithThinking(
-      markdownModule.squashOutsideCode(markdownModule.renderContent(displayContent || ''))
+      markdownModule.squashOutsideCode(markdownModule.renderContent(displayContent || '')),
+      { isLast: _histIsLast }
     );
   }
   if (msg.role === 'user' && Array.isArray(meta?.attachments) && meta.attachments.length) {
@@ -1917,6 +1950,9 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
       const presetsModule = window.presetsModule || (await import('./presets.js')).default;
       if (presetsModule && presetsModule.onSessionSwitch) presetsModule.onSessionSwitch(id);
     } catch (e) {}
+    // Restore this session's reasoning-effort selection (falls back to the
+    // global default when the session has no stored override).
+    try { _notifyReasoningEffortSessionChanged(id); } catch (e) {}
     const meta = sessions.find(s => s.id === id);
 
     // Clear the active-plan bar so the previous session's plan doesn't linger
@@ -1964,6 +2000,13 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
         msgInput.style.height = '';
         msgInput.style.overflow = '';
         autoResize(msgInput);
+        // Clear any pending attachment chips from the previous session/draft
+        // (#attach-strip) — previously nothing cleared these on switch, so a
+        // "Document"/image chip attached in one chat kept floating in the
+        // composer after switching sessions or starting a New Chat.
+        if (fileHandlerModule.getPendingCount && fileHandlerModule.getPendingCount() > 0) {
+          fileHandlerModule.clearPending();
+        }
       }
     }
     const sendBtn2 = document.querySelector('.send-btn');
@@ -2260,6 +2303,9 @@ export function createDirectChat(url, modelId, endpointId) {
   _skipAutoSelect = true;
   _suppressNextSessionLoading = true;
   currentSessionId = null;
+  // New chat has no stored reasoning-effort override yet — reset the
+  // composer selector to the global default (per spec: new chats start there).
+  try { _notifyReasoningEffortSessionChanged(null); } catch (e) {}
   Storage.remove('lastSessionId');
   history.replaceState(null, '', window.location.pathname);
   document.querySelectorAll('.list-item.active-session, .session-item.active').forEach(el => {
@@ -2297,6 +2343,14 @@ export function createDirectChat(url, modelId, endpointId) {
   // Enable input
   const msgInput = document.getElementById('message');
   if (msgInput) { msgInput.disabled = false; msgInput.value = ''; msgInput.focus(); }
+
+  // Clear any pending attachment chips from the previous chat (#attach-strip)
+  // — this is the "New Chat" entry point (app.js's brand-button handler calls
+  // this, not selectSession, so it needs its own clear too; see the
+  // selectSession clear above for the session-to-session switch case).
+  if (fileHandlerModule.getPendingCount && fileHandlerModule.getPendingCount() > 0) {
+    fileHandlerModule.clearPending();
+  }
 }
 
 /** Actually create the session in the DB. Called on first message send. */
@@ -2886,6 +2940,19 @@ async function _checkServerStream(sessionId) {
     box.appendChild(holder);
     uiModule.scrollHistory();
 
+    // Composer into steering mode while polling a reattached-but-not-yet-live
+    // server stream — same as resumeStream's own reattach. Reverted in every
+    // exit path of the poll below (session switch, resume success, stream end,
+    // or fetch error) so it never sticks on a session that finished/left.
+    if (window.chatModule && window.chatModule.setComposerSteeringMode) {
+      window.chatModule.setComposerSteeringMode(true);
+    }
+    const _revertComposerSteering = () => {
+      if (window.chatModule && window.chatModule.setComposerSteeringMode) {
+        window.chatModule.setComposerSteeringMode(false);
+      }
+    };
+
     // sessions.js executes before chat.js in module order, so window.chatModule
     // may not be set yet when _checkServerStream first runs. Retry resumeStream
     // on the first poll tick where it becomes available.
@@ -2895,6 +2962,7 @@ async function _checkServerStream(sessionId) {
         clearInterval(pollId);
         spinner.destroy();
         if (holder.parentNode) holder.remove();
+        _revertComposerSteering();
         return;
       }
       if (!_resumeRetried && window.chatModule && window.chatModule.resumeStream) {
@@ -2904,6 +2972,8 @@ async function _checkServerStream(sessionId) {
           clearInterval(pollId);
           spinner.destroy();
           if (holder.parentNode) holder.remove();
+          // resumeStream manages the composer's steering mode itself once
+          // attached — don't revert here, it would immediately undo it.
           return;
         }
       }
@@ -2913,6 +2983,7 @@ async function _checkServerStream(sessionId) {
           clearInterval(pollId);
           spinner.destroy();
           if (holder.parentNode) holder.remove();
+          _revertComposerSteering();
           // Reload session to show the completed response + docs
           selectSession(sessionId);
         }
@@ -2920,6 +2991,7 @@ async function _checkServerStream(sessionId) {
         clearInterval(pollId);
         spinner.destroy();
         if (holder.parentNode) holder.remove();
+        _revertComposerSteering();
         selectSession(sessionId);
       }
     }, 1500);
@@ -2948,6 +3020,7 @@ function _initAllDropdowns() {
     setPendingChat: (v) => { _pendingChat = v; },
     createDirectChat,
   });
+  initReasoningEffort();
   _initDropdownDismiss();
   _initBulkSelect();
 }

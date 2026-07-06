@@ -23,6 +23,7 @@ import slashCommands, { initSlashCommands, isCommand, handleSlashCommand, handle
 import createResearchSynapse from './researchSynapse.js';
 import { createStreamRenderer } from './streamingRenderer.js';
 import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composerArrowUpRecall.js';
+import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffort.js';
 
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
@@ -109,7 +110,14 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (!bar.hidden) { bar.hidden = true; bar.innerHTML = ''; }
       return;
     }
-    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    // Inline markdown (bold/code/links) inside a checklist item's text —
+    // mdToHtml wraps a lone line in a <p>...</p>, which would break the row's
+    // flex layout, so unwrap that single outer paragraph after rendering.
+    const mdInline = (s) => {
+      const html = markdownModule.mdToHtml(markdownModule.squashOutsideCode(String(s == null ? '' : s)));
+      const m = html.match(/^<p>([\s\S]*)<\/p>$/);
+      return m ? m[1] : html;
+    };
     const rows = _parsePlanLines(_storedPlan);
     const items = rows.filter((r) => r.item);
     const done = items.filter((r) => r.done).length;
@@ -140,9 +148,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           const st = r.done ? 'opacity:.5;text-decoration:line-through' : '';
           return `<div style="display:flex;gap:6px;align-items:flex-start;padding:1px 0;font-size:12px">
             <span style="font-family:var(--mono,monospace);opacity:.85;flex:0 0 auto">${box}</span>
-            <span style="${st}">${esc(r.text)}</span></div>`;
+            <span style="${st}">${mdInline(r.text)}</span></div>`;
         }
-        return `<div style="font-weight:600;margin-top:6px;font-size:12px">${esc(r.text)}</div>`;
+        return `<div style="font-weight:600;margin-top:6px;font-size:12px">${mdInline(r.text)}</div>`;
       }).join('');
       body = `<div style="border-top:1px solid var(--border,#3a3a42);max-height:40vh;overflow:auto;padding:6px 12px 8px;line-height:1.5;color:var(--fg)">${list}</div>`;
     }
@@ -609,14 +617,6 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
   // Update the composer placeholder to advertise mid-turn steering, restoring
   // it when the turn ends. Minimal + muted (uses the existing placeholder slot).
-  // Display preference (localStorage, like theme/UI-scale): when on, the
-  // agent's reasoning renders COLLAPSED — the "Thinking…" bar shows but the
-  // content stays hidden until the user clicks it. Default off = current
-  // behavior (live reasoning expanded).
-  function _collapseReasoningOn() {
-    try { return localStorage.getItem('collapse_reasoning') === '1'; }
-    catch (e) { return false; }
-  }
   const _DEFAULT_COMPOSER_PLACEHOLDER = 'Message Odysseus…';
   const _STEER_COMPOSER_PLACEHOLDER_FULL = 'Steer the reply — send to add mid-response…';
   const _STEER_COMPOSER_PLACEHOLDER_SHORT = 'Steer the reply…';
@@ -822,7 +822,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
           }
         }
       });
-      document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+      // Turn stopped mid-tool — collapse any still-expanded live block to its
+      // one-line summary (matches the "block ends" auto-collapse rule).
+      document.querySelectorAll('.agent-thread.streaming').forEach(t => { chatRenderer.collapseAgentThreadSummary(t); t.classList.remove('streaming'); });
 
       // Clean up any thinking spinners
       document.querySelectorAll('.agent-thinking-dots').forEach(el => {
@@ -1086,6 +1088,26 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
     // Declare accumulated outside try block so it's accessible in catch
     let accumulated = '';
+    // Set true only once the network request actually goes out (right after
+    // the fetch() call below returns). Distinguishes "crashed before we ever
+    // contacted the server" (nothing was sent — the composer text must be
+    // restored, never silently swapped for an auto-recovery handshake) from
+    // "the stream itself dropped after starting" (accumulated may hold real
+    // partial output worth preserving). See the catch block's _requestDispatched
+    // check for FIX 6: previously ANY synchronous throw between clearing the
+    // composer and dispatching fetch (e.g. a transient null DOM/module lookup
+    // right after a page reload) was caught here, classified as a
+    // "recoverable" TypeError, and silently replaced the user's real message
+    // with an internal recovery handshake — losing it with no visible error.
+    let _requestDispatched = false;
+    // Preserve the exact text the user typed so it can be restored verbatim
+    // if we crash before dispatching (see above). Captured once, right where
+    // `msg` is first read, well before the composer is cleared.
+    const _originalUserText = msg;
+    // Reference to the optimistic user bubble rendered before the crash zone
+    // — declared here (not with `let` inside the try) so the catch block can
+    // remove it if we never actually dispatched the request.
+    let _userMsgElOuter = null;
     // Are we currently inside an unclosed <think> block? Toggled per think/answer
     // cycle so a multi-round agent response (one reasoning phase PER round) wraps each
     // round's reasoning in its own <think>…</think> instead of leaking rounds 2+ as text.
@@ -1179,6 +1201,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       let _userMsgEl = null;
       if (!skipBubble) {
         _userMsgEl = addMessage('user', userDisplay, null, _pendingAttachInfo ? { attachments: _pendingAttachInfo } : null);
+        _userMsgElOuter = _userMsgEl;
       }
       messageInput.value = '';
       messageInput.style.height = '';
@@ -1417,7 +1440,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (presetsModule.getSelectedPreset()) {
         fd.append('preset_id', presetsModule.getSelectedPreset());
       }
-
+      // Reasoning-effort selector — "default" is the same as omitting it
+      // (apply_reasoning_effort in llm_core.py treats both as a no-op), so
+      // only send it when the user picked something else.
+      const _reasoningEffort = _getCurrentReasoningEffort();
+      if (_reasoningEffort && _reasoningEffort !== 'default') {
+        fd.append('reasoning_effort', _reasoningEffort);
+      }
 
       const abortCtrl = new AbortController();
       abortCtrl._reason = '';
@@ -1536,7 +1565,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         headers: { 'X-Tz-Offset': String(_tzOffsetMin), 'X-Tz-Name': _tzName },
         signal: abortCtrl.signal
       });
-      
+      // The request genuinely reached the network layer — from here on, any
+      // failure is a real stream/connection problem (accumulated partial
+      // output may exist and is worth preserving), not a pre-flight crash
+      // that silently ate the user's message before it was ever sent.
+      _requestDispatched = true;
+
       if (!res.ok) {
         clearResponseTimeout();
         if (res.status === 404) {
@@ -1595,6 +1629,22 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       let currentToolBubble = null;   // Current tool execution bubble
       let lastToolThread = null;      // Visible tool timeline for tool-only turns
       let roundFinalized = false;     // Whether current round's text is finalized
+      let _roundSuppressed = false;   // True when round bubble was hidden (text consumed as caption)
+      let _preambleBuffering = false; // True while short visible text is withheld from the DOM — it may become a tool caption
+      let _preambleText = '';         // Visible (non-thinking) text since the last tool chip / round boundary
+      // Claude-app-style tool captions: pull the short sentence the model just
+      // streamed ("Checking the renderer for where sprites are drawn.") and
+      // attach it to the tool chip about to be created, instead of leaving it
+      // as a detached text fragment above the chip. Consumed (and cleared) once
+      // per tool_start so back-to-back tool calls each get only their own text.
+      // Heuristic (blank-line check + 120-char cap + whitespace collapse) lives
+      // in markdown.js's isToolCaptionText/toolCaptionOrNull so the history
+      // render path (chatRenderer.js) can never drift from this live path.
+      function _consumeToolPreamble() {
+        const raw = _preambleText;
+        _preambleText = '';
+        return markdownModule.toolCaptionOrNull(raw) || '';
+      }
       let _sourcesHtml = '';          // Sources box HTML to prepend to body
       let _sourcesExpanded = false;   // Track if user expanded sources during stream
       let _sourcesData = null;        // Raw sources data for rebuilding
@@ -1898,6 +1948,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
               } else if (bgDone) {
                 bgDone.status = 'completed';
                 bgDone.accumulated = accumulated;
+                // FIX 7: this reader loop is DONE for streamSessionId — reset
+                // _streamSessionId here too (not just in the outer finally's
+                // !_isBgFinally branch, which never runs for this backgrounded
+                // path since the map entry — and thus _isBgFinally — stays
+                // true even after completion, until checkBackgroundStream
+                // consumes it on return). Without this, hasActiveStream(this
+                // session) kept returning true forever, so _checkServerStream
+                // permanently skipped its resume/reattach check for it.
+                if (_streamSessionId === streamSessionId) _streamSessionId = null;
                 if (_isBg) {
                   try {
                     _notifyStreamComplete(streamSessionId, streamQuery);
@@ -1978,9 +2037,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 clearFirstTokenWaitTimers();
               }
               if (json.type === 'agent_prep') {
+                // Keep-alive only: clears the response timers (line above) and
+                // suppresses the pause-dots. Do NOT spawn a spinner row here —
+                // the main bubble still shows its "Processing request" spinner
+                // at this point, and _showThinkingSpinner appends a second,
+                // headerless bubble ("Preparing agent" duplicate glitch).
                 if (!_isBg) {
                   _cancelThinkingTimer();
-                  _replaceThinkingSpinner('Preparing agent');
                 }
                 continue;
               }
@@ -1991,6 +2054,16 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 const _threadAbove = roundHolder?.previousElementSibling;
                 if (_threadAbove && _threadAbove.classList.contains('agent-thread') && !_threadAbove.classList.contains('has-bottom')) {
                   _threadAbove.classList.add('has-bottom');
+                }
+                // The tool block that was active just ended (text/thinking
+                // started) — auto-collapse it to the one-line summary, same
+                // as history render. Guarded by `.streaming` so this only
+                // fires once per block (removed a few lines below) — a
+                // second delta in the same text run must not re-collapse an
+                // already-collapsed thread the user may have manually
+                // re-opened while reading it.
+                if (_threadAbove && _threadAbove.classList.contains('agent-thread') && _threadAbove.classList.contains('streaming')) {
+                  chatRenderer.collapseAgentThreadSummary(_threadAbove);
                 }
                 // VLLM reasoning tokens: wrap in <think> tags for the thinking UI.
                 // Stateful open/close (not a whole-message substring check) so each round
@@ -2006,6 +2079,25 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 accumulated += _delta;
                 roundText += _delta;
                 currentAccumulated = accumulated; // Update global tracker
+                // Track plain visible text for the next tool chip's caption.
+                // Never accumulate thinking-flagged deltas — only the model's
+                // actual reply text counts as a tool-call preamble.
+                if (!json.thinking) {
+                  _preambleText += json.delta;
+                  // While visible text is short enough to become a caption
+                  // (single paragraph, ≤120 chars), don't render it to the DOM
+                  // yet — it will either be consumed as an inline caption by
+                  // tool_start, or flushed below once it grows past the limit.
+                  const _isStillPreamble = markdownModule.isToolCaptionText(_preambleText);
+                  if (_isStillPreamble && !_preambleBuffering) {
+                    _preambleBuffering = true;
+                  } else if (!_isStillPreamble && _preambleBuffering) {
+                    // Text grew past the caption threshold — it's real chat
+                    // text now, so flush the buffer and render everything.
+                    _preambleBuffering = false;
+                    _renderStream();
+                  }
+                }
                 // First token arrived — switch stop button from processing to streaming
                 if (wasEmpty && submitBtn && !_isBg) {
                   submitBtn.dataset.phase = 'receiving';
@@ -2105,16 +2197,19 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 if (hasUnclosedThink && !isThinking) {
                   isThinking = true;
                   thinkingStartTime = Date.now();
+                  _preambleBuffering = false;  // thinking supersedes any buffered preamble
                   if (spinner && spinner.element) spinner.destroy();
 
-                  // Create a live thinking box — starts expanded so content streams visibly
+                  // Create a live thinking box — collapsed by default (the
+                  // "Thinking…" header/timer/spinner still stream live and
+                  // stay clickable — see markdown.js's delegated toggle
+                  // handler); only expands here when the auto-expand-thinking
+                  // pref is on.
                   var thinkBody = roundHolder.querySelector('.body');
                   var thinkContent = _ensureStreamLayout(thinkBody);
                   thinkContent.style.minHeight = '';
                   _liveThinkDomId = 'live-think-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-                  // Respect the collapse-reasoning preference: keep the live
-                  // thinking content collapsed (the header/spinner still show).
-                  var _exp = _collapseReasoningOn() ? '' : ' expanded';
+                  var _exp = markdownModule.autoExpandThinkingPref() ? ' expanded' : '';
                   thinkContent.innerHTML = `
                     <div class="thinking-section">
                       <div class="thinking-header" data-thinking-id="${_liveThinkDomId}">
@@ -2250,7 +2345,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 } else {
                   // Normal streaming
                   if (spinner && spinner.element) spinner.destroy();
-                  _renderStream();
+                  if (!_preambleBuffering) _renderStream();
                   _scheduleThinkingSpinner();
                   // Feed streaming TTS with accumulated text
                   if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
@@ -2650,13 +2745,32 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   if (_liveThinkContent) _liveThinkContent.id = _thinkId2;
                   if (_liveThinkToggle) _liveThinkToggle.id = _thinkId2 + '-toggle';
                 }
-                _renderStream();
+                // If preamble text was buffered (never rendered to DOM), skip
+                // the render — it goes straight to the inline caption below.
+                // Otherwise render to finalize the text bubble first.
+                const _wasBuffering = _preambleBuffering;
+                _preambleBuffering = false;
+                if (!_wasBuffering) _renderStream();
+                // Consume preamble early so we can suppress the text bubble when
+                // its visible content is used as an inline tool caption (avoids
+                // the same sentence appearing both as a bubble and on the chip).
+                const _stashedPreamble = _consumeToolPreamble();
+
                 // --- Finalize current text bubble (only once per round) ---
                 if (!roundFinalized) {
                   roundFinalized = true;
                   if (spinner && spinner.element) spinner.destroy();
                   const dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(_stripDocumentFenceForChat(roundText)));
-                  if (dt.trim()) {
+                  // Suppress the text bubble when its visible content was
+                  // consumed as a tool caption AND there's no thinking to show
+                  // — the caption now reads inline with the tool name (e.g.
+                  // "BASH · checking status of running containers"), so a
+                  // separate bubble is redundant.
+                  const _hasThinking = /<think/i.test(roundText);
+                  if (dt.trim() && _stashedPreamble && !_hasThinking) {
+                    roundHolder.style.display = 'none';
+                    _roundSuppressed = true;
+                  } else if (dt.trim()) {
                     var _body3 = roundHolder.querySelector('.body');
                     var _contentEl3 = _ensureStreamLayout(_body3);
                     _contentEl3.style.minHeight = '';  // clear streaming inflate
@@ -2673,20 +2787,23 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // --- Thread timeline: group tools in a thread container ---
                 const cmd = json.command || '';
                 const chatBox = document.getElementById('chat-history');
-                // Find existing thread to append to — check last few children
-                // (agent_step may insert an empty msg-ai between tool rounds)
-                let threadWrap = null;
-                for (let ci = chatBox.children.length - 1; ci >= Math.max(0, chatBox.children.length - 5); ci--) {
-                  const child = chatBox.children[ci];
-                  if (child.classList.contains('agent-thread')) {
-                    threadWrap = child;
-                    break;
-                  }
-                  // Skip hidden (empty) bubbles and thinking spinners
-                  if (child.style.display === 'none' || child.classList.contains('agent-thinking-dots')) continue;
-                  // Stop if we hit a visible message bubble (has real content between tools)
-                  if (child.classList.contains('msg')) break;
-                }
+                // Group by round number (tool_start's json.round is
+                // authoritative from the server) instead of scanning DOM
+                // siblings for shape — deterministic and matches the history
+                // renderer's rule exactly: a new round merges into the
+                // previous thread ONLY when no visible text bubble separated
+                // them (chatRenderer.js's tool-heavy addMessage path checks
+                // `!txt && lastWrap.classList.contains('agent-thread')`,
+                // where `txt` is that round's own — possibly empty/suppressed
+                // — text). Here the equivalent is: the round that just
+                // finalized rendered no visible bubble (roundHolder stayed
+                // display:none, whether because it was truly empty or its
+                // text was consumed as an inline caption).
+                const _thisRound = json.round || 0;
+                const _priorRoundHadNoBubble = !roundHolder || roundHolder.style.display === 'none';
+                let threadWrap = (lastToolThread && lastToolThread.isConnected && _priorRoundHadNoBubble)
+                  ? lastToolThread
+                  : null;
                 if (threadWrap) {
                   // Continuing an existing thread — remove has-bottom (agent_step may have set it
                   // expecting text, but we got more tools instead)
@@ -2702,7 +2819,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                     threadWrap.classList.add('has-top');
                   }
                   chatBox.appendChild(threadWrap);
+                  // New live thread — Claude-app style: the CURRENT in-progress
+                  // block stays expanded so the user sees activity, then
+                  // auto-collapses to the one-line summary when the block ends
+                  // (next text/thinking bubble or turn end — see the collapse
+                  // calls at those points below).
+                  threadWrap._allEvents = [];
+                  chatRenderer.ensureAgentThreadSummary(threadWrap, { startExpanded: true });
                 }
+                threadWrap.dataset.round = String(_thisRound);
                 threadWrap.classList.add('streaming');
                 lastToolThread = threadWrap;
                 const toolLabel = _toolLabels[json.tool.toLowerCase()] || json.tool;
@@ -2710,7 +2835,15 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 const node = document.createElement('div')
                 node.className = 'agent-thread-node running';
                 const cmdHtml = cmd ? `<pre class="agent-thread-cmd">${esc(cmd)}</pre>` : '';
-                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${toolIcon}</span><span class="agent-thread-tool">${esc(toolLabel)}</span><span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
+                // Caption: the short sentence the model streamed right before this
+                // call (Claude-app style "Checking the renderer for…"). Only a
+                // short trailing fragment counts as a preamble — long text, or
+                // text with an earlier blank-line-separated paragraph, stays as
+                // normal chat text instead and the chip gets no caption.
+                const preamble = _stashedPreamble;
+                node._preamble = preamble;
+                const inlineCaption = preamble ? `<span class="agent-thread-caption-inline">${esc(preamble)}</span>` : '';
+                node.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${toolIcon}</span><span class="agent-thread-tool">${esc(toolLabel)}</span>${inlineCaption}<span class="agent-thread-wave">▁▂▃</span></div><div class="agent-thread-content">${cmdHtml}</div>`;
                 // Expand/collapse via delegated click handler (init at module bottom).
                 threadWrap.appendChild(node);
                 currentToolBubble = node;
@@ -2823,7 +2956,20 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                   // bottom of file) so no per-node listener needed.
                   const _wasOpen = currentToolBubble.classList.contains('open');
                   currentToolBubble.className = 'agent-thread-node' + (ok ? '' : ' error') + (_wasOpen ? ' open' : '');
-                  currentToolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(json.tool)}</span><span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}${diffHtml}</div>`;
+                  const _preamble = currentToolBubble._preamble || '';
+                  const _inlineCaption = _preamble ? `<span class="agent-thread-caption-inline">${esc(_preamble)}</span>` : '';
+                  currentToolBubble.innerHTML = `<div class="agent-thread-dot"></div><div class="agent-thread-header"><span class="agent-thread-icon">${ok ? '\u2713' : '\u2717'}</span><span class="agent-thread-tool">${esc(json.tool)}</span>${_inlineCaption}<span class="agent-thread-status">${ok ? 'done' : 'failed'}</span><span class="agent-thread-chevron">\u25B6</span></div><div class="agent-thread-content">${cmdHtml2}${outHtml}${diffHtml}</div>`;
+                  // Feed this completed tool into the live thread's collapsed-
+                  // summary text (the block itself stays expanded \u2014 see
+                  // ensureAgentThreadSummary's startExpanded \u2014 until the block
+                  // ends and something below collapses it).
+                  const _liveThread = currentToolBubble.closest('.agent-thread');
+                  if (_liveThread) {
+                    _liveThread._allEvents = (_liveThread._allEvents || []).concat([{
+                      tool: json.tool, caption: _preamble || null, exit_code: json.exit_code,
+                    }]);
+                    chatRenderer.ensureAgentThreadSummary(_liveThread);
+                  }
                   // Reset so thinking spinner between tools says "Thinking" not the old tool's label
                   _lastToolName = '';
                   uiModule.scrollHistory();
@@ -2947,6 +3093,9 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 if (_isBg) continue;
                 _cancelThinkingTimer();
                 _removeThinkingSpinner();
+                // Flush any buffered preamble text — if we reached agent_step
+                // without a tool_start consuming it, it's a real reply, not a caption.
+                _preambleBuffering = false;
                 _renderStream();
                 // Mark thread as connected to bubble below
                 const _activeThread = document.querySelector('.agent-thread.streaming');
@@ -2956,6 +3105,8 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // --- New round: create fresh AI bubble with spinner ---
                 currentToolBubble = null;
                 roundFinalized = false;
+                _roundSuppressed = false;
+                _preambleBuffering = false;
                 isThinking = false;
                 _docFenceOpened = false;
                 _docFenceContentStart = -1;
@@ -2977,6 +3128,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 box.appendChild(newWrap);
                 roundHolder = newWrap;
                 roundText = '';
+                _preambleText = '';
                 // Destroy any previous spinner before creating new one
                 if (spinner && spinner.element) spinner.destroy();
                 // Show spinner while waiting for text (skip for research — has its own progress)
@@ -3015,7 +3167,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
                 // Reset round bubble state so the teacher's first text starts a new bubble
                 roundHolder = null;
                 roundText = '';
+                _preambleText = '';
                 roundFinalized = false;
+                _roundSuppressed = false;
+                _preambleBuffering = false;
                 currentToolBubble = null;
                 uiModule.scrollHistory();
 
@@ -3062,12 +3217,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         throw new Error('Stream closed before completion');
       }
 
+      // If text was buffered as a potential caption but no tool followed,
+      // flush it now — it's a real (short) reply, not a caption.
+      _preambleBuffering = false;
       _renderStream();
       if (spinner && spinner.element) { try { spinner.destroy(); } catch (_) {} spinner = null; }
       _cancelThinkingTimer();
       _removeThinkingSpinner();
-      // Stop any thread pulse animations
-      document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+      // Stop any thread pulse animations. Turn end — collapse any still-
+      // expanded live block to its one-line summary (the "or turn end
+      // arrives" half of the auto-collapse rule; the mid-turn half is the
+      // json.delta handler above).
+      document.querySelectorAll('.agent-thread.streaming').forEach(t => { chatRenderer.collapseAgentThreadSummary(t); t.classList.remove('streaming'); });
       // --- Final render (skip if stream was ever backgrounded or currently in background) ---
       // Remove streaming class from all round bubbles
       holder.classList.remove('streaming');
@@ -3132,7 +3293,7 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
 
         // Finalize the last round's bubble — flatten stream-content wrapper for clean DOM
         const finalDisplay = stripToolBlocks(_stripDocumentFenceForChat(roundText, { final: _docFenceOpened }));
-        if (finalDisplay.trim()) {
+        if (finalDisplay.trim() && !_roundSuppressed) {
           var _body4 = roundHolder.querySelector('.body');
           // Preserve sources expanded state before final render
           var _wasExpanded = _sourcesExpanded || !!(_body4 && _body4.querySelector('.sources-content.expanded'));
@@ -3333,12 +3494,49 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       } // end if (!_isBgFinal)
 
     } catch (err) {
+      // FIX 6 (root cause): the composer is cleared and the optimistic user
+      // bubble is rendered LONG before the actual fetch() dispatch — dozens of
+      // DOM/module lookups run in between (toggle checkboxes, document/preset
+      // modules, file upload, etc.). Any synchronous throw in that window
+      // (e.g. a transient null element right after a fresh page reload) used
+      // to fall through to the generic recovery logic below, which
+      // classifies a bare TypeError as "recoverable" (_isRecoverableStreamErr)
+      // and calls _tryAutoRecover — but with accumulated still '' (nothing
+      // ever streamed), that function has no partial output to show, so it
+      // silently overwrites the composer with an internal handshake prompt
+      // and auto-submits it, discarding the user's real message with no
+      // visible error. Handle this case FIRST and distinctly: nothing was
+      // ever sent, so undo the optimistic bubble and hand the user's exact
+      // text back to the composer with a visible error instead.
+      if (!_requestDispatched) {
+        console.error('Message send failed before the request reached the network:', err);
+        if (_userMsgElOuter && _userMsgElOuter.parentNode) _userMsgElOuter.remove();
+        if (holder && holder.parentNode) holder.remove();
+        currentHolder = null;
+        currentAccumulated = '';
+        currentAbort = null;
+        clearResponseTimeout();
+        clearProcessingProbe();
+        clearFirstTokenWaitTimers();
+        const _restoreInput = uiModule.el('message');
+        if (_restoreInput) {
+          _restoreInput.value = _originalUserText;
+          _restoreInput.disabled = false;
+          if (uiModule.autoResize) uiModule.autoResize(_restoreInput);
+          _restoreInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        updateSubmitButton('idle', submitBtn);
+        try { uiModule.showError && uiModule.showError('Could not send message — please try again.'); } catch (_) {}
+        return;
+      }
+      _preambleBuffering = false;
       _renderStream();
       // Clean up any active spinner (e.g. "Generating response" during tool calls)
       if (spinner && spinner.element) spinner.destroy();
       _cancelThinkingTimer();
       _removeThinkingSpinner();
-      document.querySelectorAll('.agent-thread.streaming').forEach(t => t.classList.remove('streaming'));
+      // Stream errored/aborted — collapse any still-expanded live block.
+      document.querySelectorAll('.agent-thread.streaming').forEach(t => { chatRenderer.collapseAgentThreadSummary(t); t.classList.remove('streaming'); });
       // Check if this stream was running in background
       const _isBgCatch = (sessionModule.getCurrentSessionId() !== streamSessionId) || _backgroundStreams.has(streamSessionId);
 
@@ -3346,6 +3544,10 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
         // Error happened while backgrounded — update map, don't touch DOM
         console.error('Background stream error:', err);
         var bgErr = _backgroundStreams.get(streamSessionId);
+        // FIX 7: this reader loop is done for streamSessionId either way
+        // (completed-then-benign-error, or a genuine error) — same reasoning
+        // as the [DONE]-while-backgrounded reset above.
+        if (_streamSessionId === streamSessionId) _streamSessionId = null;
         if (bgErr && bgErr.status === 'completed') {
           // [DONE] was already processed — this error is benign (e.g. reader.read() after close)
           // Don't override the completed status; just ensure the completed dot stays
@@ -3539,6 +3741,21 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
             messageInput.focus();
           }
         }
+
+        // FIX 7 (part of the session-switch-orphans-the-run bug):
+        // _streamSessionId was NEVER reset anywhere in this file — once a
+        // stream ran for a session, hasActiveStream(sessionId) returned true
+        // for that session FOREVER (for the rest of the tab's life), because
+        // this was the only assignment to it. That made
+        // sessions.js's _checkServerStream() skip its entire
+        // resumeStream/spinner/poll reattachment path on every subsequent
+        // selectSession into that session — including a LATER stream that
+        // detached to the background and finished (or errored) while the
+        // user was elsewhere, and even a stream that completed normally while
+        // still foregrounded. Reset it here, guarded so a race with a BRAND
+        // NEW stream already started for a different session (which
+        // overwrote _streamSessionId already) can't be clobbered.
+        if (_streamSessionId === streamSessionId) _streamSessionId = null;
 
         // Clear tracking variables
         currentAccumulated = '';
@@ -3858,6 +4075,18 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     // for a same-tab POST stream and spawn its own spinner+poll on re-entry.
     _resumingStreams.add(sessionId);
 
+    // FIX 7: reattaching to a still-running server stream (cross-device / a
+    // background switch-and-return) must put the composer into steering mode
+    // the same way a same-tab live stream does — otherwise it silently stays
+    // in normal "send" mode even though a reply is actively generating, and
+    // a message typed here would queue for AFTER the turn instead of steering
+    // it. Only touch the composer if the user is actually looking at this
+    // session right now (resumeStream can also be invoked for a session the
+    // user isn't currently viewing via the poll-retry path in sessions.js).
+    if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+      _setComposerPlaceholder(true);
+    }
+
     const holder = document.createElement('div');
     holder.className = 'msg msg-ai';
     const meta = sessionModule.getSessions().find(s => s.id === sessionId);
@@ -3891,6 +4120,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     const cleanup = () => {
       try { spinner.destroy(); } catch (_) {}
       _resumingStreams.delete(sessionId);
+      // Revert the composer out of steering mode — but only if the user is
+      // still viewing this session; otherwise this would clobber whatever
+      // session/placeholder they've since navigated to.
+      if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+        _setComposerPlaceholder(false);
+      }
     };
 
     const renderDelta = () => {
@@ -3898,7 +4133,13 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
       if (docFenceOpened && !dt.trim()) {
         _showDocumentWritingStatus(contentDiv);
       } else {
-        contentDiv.innerHTML = markdownModule.mdToHtml(markdownModule.squashOutsideCode(dt));
+        // Route through the thinking-aware pipeline (not mdToHtml directly) —
+        // a detached run's replay buffer can contain <think>...</think> from
+        // mid-generation, and mdToHtml alone would show the raw tags as text
+        // instead of a collapsed thinking section during cross-device /
+        // reconnect resume. Coarse batched re-renders (throttled below) make
+        // re-running full extraction on each flush acceptable.
+        contentDiv.innerHTML = markdownModule.processWithThinking(markdownModule.squashOutsideCode(dt));
       }
       uiModule.scrollHistory();
     };
@@ -5515,6 +5756,12 @@ import { wireArrowUpRecall, getLastUserMessageFromChatHistory } from './composer
     detachCurrentStream,
     checkBackgroundStream,
     resumeStream,
+    // Exposed so sessions.js's stream-status fallback (spinner+poll, used
+    // when resumeStream itself is unavailable or fails) can also put the
+    // composer into steering mode while reattached to a still-running
+    // server stream — same placeholder swap _setComposerPlaceholder already
+    // does for a same-tab live stream and for resumeStream's own reattach.
+    setComposerSteeringMode: _setComposerPlaceholder,
     hideWelcomeScreen: chatRenderer.hideWelcomeScreen,
     showWelcomeScreen: chatRenderer.showWelcomeScreen,
     checkPendingResearch,

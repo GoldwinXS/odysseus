@@ -27,7 +27,15 @@ export const THEMES = {
                 advanced: { sendBtnBg: '#949494', sendBtnHover: '#7f7f7f',
                             userBubbleBg: '#2f2f2f', aiBubbleBg: '#171717',
                             inputBg: '#2f2f2f', brandColor: '#ffffff', brandMixTo: '#ffffff' } },
-  claude:     { bg:'#262624', fg:'#f5f4f0', panel:'#30302e', border:'#4a4a47', red:'#c6613f' },
+  claude:     { bg:'#262624', fg:'#f5f4ef', panel:'#30302e', border:'#3e3d3a', red:'#d97757',
+                advanced: { sidebarBg: '#21201e', sendBtnBg: '#d97757', sendBtnHover: '#c15f3c',
+                            brandColor: '#d97757', toggleActive: '#d97757' } },
+  // Fable — a storyteller's night: ink-indigo, parchment, candlelight gold, aurora teal
+  fable:      { bg:'#10132b', fg:'#eae3cf', panel:'#181c38', border:'#3a3f63', red:'#d9a441',
+                advanced: { sidebarBg: '#0c0f22', bubbleBorder: '#3a3f63',
+                            brandColor: '#d9a441', brandMixTo: '#4fd1c5',
+                            sendBtnBg: '#d9a441', sendBtnHover: '#e0a458',
+                            toggleActive: '#4fd1c5', hamburgerColor: '#eae3cf' } },
   cute:       { bg:'#fff0f5', fg:'#d4608a', panel:'#fff8fa', border:'#f0c0d0', red:'#ff6b9d' },
 };
 
@@ -395,17 +403,22 @@ const UI_SCALE_KEY = 'odysseus-ui-scale';
 const DEFAULT_UI_SCALE = '100';
 
 export function applyUiScale(scale) {
-  // EMERGENCY NEUTRALIZE: "Larger" applied a whole-page `zoom: 1.25`, which
-  // breaks position:fixed / 100dvh layout on some setups — the app became
-  // completely unclickable with no way to reach the control or DevTools to
-  // undo it. Force 100% regardless of the stored value, and reset a stored
-  // "125" back to default so the control returns to "Default" on next load.
-  // TODO: reintroduce "Larger" as a root font-size scale (rem-based), which
-  // enlarges text without the zoom layout breakage.
+  // v1 applied a whole-page `zoom: 1.25`, which broke position:fixed /
+  // 100dvh layout on some setups — the app became completely unclickable
+  // with no way to reach the control or DevTools to undo it. That was
+  // emergency-neutralized (always forced back to 100%) rather than fixed.
+  //
+  // Reintroduced here as a *scoped* font-size multiplier instead of `zoom`:
+  // it sets `--chat-text-scale` on <html> and only the chat message area
+  // (#chat-container — history + composer, see style.css `.msg`,
+  // `.msg .body`, `.chat-input-bar textarea#message`) consumes it via `em`/
+  // calc(). Nothing outside the chat area reads this var, so modals,
+  // position:fixed panels, and 100dvh shells are untouched — the exact
+  // class of bug that broke `zoom` can't happen here.
   document.documentElement.classList.remove('ui-scale-110', 'ui-scale-125', 'ui-scale-140');
-  if (scale && scale !== DEFAULT_UI_SCALE) {
-    try { localStorage.setItem(UI_SCALE_KEY, DEFAULT_UI_SCALE); } catch (e) {}
-  }
+  const pct = parseInt(scale, 10);
+  const mult = (!pct || isNaN(pct)) ? 1 : Math.max(1, Math.min(1.5, pct / 100));
+  document.documentElement.style.setProperty('--chat-text-scale', String(mult));
 }
 
 const _BG_CLASSES = ['bg-pattern-dots',
@@ -1211,16 +1224,36 @@ export function initThemeUI() {
     });
   }
 
-  // Collapse-reasoning: a pure display pref (localStorage, like frosted/scale).
-  // When on, the agent's thinking renders collapsed by default — chat.js reads
-  // the same key at render time. Only affects future turns; no re-render needed.
+  // Auto-expand thinking: a pure display pref (localStorage, like frosted/
+  // scale) — replaces the old collapse_reasoning pref (thinking is now ALWAYS
+  // collapsed by default everywhere; this is the only opt-in to auto-expand
+  // it again, for the last round of the last message).
+  //
+  // Deliberately NOT imported from markdown.js's autoExpandThinkingPref —
+  // ui.js already imports theme.js (for the theme toggle UI), and markdown.js
+  // imports ui.js, so theme.js -> markdown.js would close an import cycle
+  // (theme.js -> markdown.js -> ui.js -> theme.js) that breaks module
+  // initialization order (`Cannot access 'uiModule' before initialization`).
+  // This mirrors the original collapse_reasoning code's own stated rationale
+  // for an independent reader: a trivial synchronous localStorage read isn't
+  // worth risking an import cycle over. The migration logic below MUST stay
+  // in lockstep with markdown.js's autoExpandThinkingPref — same key names,
+  // same one-time migrate-and-remove behavior.
   const collapseReasoningToggle = document.getElementById('collapse-reasoning-toggle');
   if (collapseReasoningToggle) {
-    let _cr = false;
-    try { _cr = localStorage.getItem('collapse_reasoning') === '1'; } catch (e) {}
-    collapseReasoningToggle.checked = _cr;
+    let _autoExpand = false;
+    try {
+      if (localStorage.getItem('collapse_reasoning') !== null) {
+        localStorage.removeItem('collapse_reasoning');
+        if (localStorage.getItem('auto_expand_thinking') === null) {
+          localStorage.setItem('auto_expand_thinking', '0');
+        }
+      }
+      _autoExpand = localStorage.getItem('auto_expand_thinking') === '1';
+    } catch (e) {}
+    collapseReasoningToggle.checked = _autoExpand;
     collapseReasoningToggle.addEventListener('change', () => {
-      try { localStorage.setItem('collapse_reasoning', collapseReasoningToggle.checked ? '1' : '0'); } catch (e) {}
+      try { localStorage.setItem('auto_expand_thinking', collapseReasoningToggle.checked ? '1' : '0'); } catch (e) {}
     });
   }
 

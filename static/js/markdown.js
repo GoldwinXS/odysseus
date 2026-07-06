@@ -168,6 +168,33 @@ export function startsWithReasoningPrefix(text) {
   return /^\s*(?:thinking(?:\s+process)?\s*:|the user |i need |i should |i will |they are |the question |i can )/i.test(text || '');
 }
 
+/**
+ * Shared "is this short text a tool-call caption?" heuristic (Claude-app
+ * style "Checking the renderer for where sprites are drawn." right before a
+ * tool chip). Previously duplicated with the same two literals
+ * (blank-line check, 120-char cap) in chat.js's live _consumeToolPreamble and
+ * chatRenderer.js's history-render inline check — extracted here so both
+ * paths can never drift. A caption must be a single short paragraph: text
+ * containing an earlier blank-line-separated paragraph reads as real chat
+ * content, not a one-line preamble.
+ */
+export function isToolCaptionText(text, maxLen = 120) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return false;
+  if (/\n\s*\n/.test(trimmed)) return false;
+  return trimmed.length <= maxLen;
+}
+
+/**
+ * Returns the normalized caption string (internal whitespace collapsed to
+ * single spaces, since a caption renders as one line) when `text` qualifies
+ * per isToolCaptionText, or null otherwise.
+ */
+export function toolCaptionOrNull(text, maxLen = 120) {
+  if (!isToolCaptionText(text, maxLen)) return null;
+  return String(text).trim().replace(/\s+/g, ' ');
+}
+
 export function normalizeThinkingMarkup(text) {
   if (!text) return text;
   let normalized = text;
@@ -275,14 +302,18 @@ export function extractThinkingBlocks(text) {
   // Remove all complete <think>/<thinking> blocks
   let cleanContent = normalized.replace(thinkRegex, '');
 
-  // If there's an unclosed tag, decide between two cases:
+  // If there's an unclosed tag, decide between three cases:
   // (a) Stray opener at the very start with no real reply before it — typical
   //     of quantized models (MiniMax-AWQ) that emit a literal `<think>` token
   //     at the start of every reply without ever closing it. Strip just the
   //     opener and keep the body as the reply, otherwise the bubble looks
   //     blank on reload (the body was being treated as collapsed thinking).
-  // (b) Cut-off mid-generation — there's already real reply text before the
-  //     opener. Drop from the tag onward as before (it's truncated thinking).
+  // (b) Cut-off mid-generation with real reply text already emitted before the
+  //     opener: that reply text stays as content, and the never-closed
+  //     thinking body is preserved as its own (truncated) thinking section
+  //     instead of being silently deleted — the model was mid-thought when
+  //     the turn ended, not producing throwaway text.
+  let truncated = false;
   if (hasUnclosedThinkTag(normalized)) {
     const gemmaThoughtStart = cleanContent.search(/<\|channel>thought/i);
     if (gemmaThoughtStart >= 0) {
@@ -297,6 +328,15 @@ export function extractThinkingBlocks(text) {
       if (strayOpener) {
         cleanContent = strayOpener[1];
       } else {
+        // Case (b): pull out the partial thinking body (everything after the
+        // unclosed opener) instead of discarding it, so a turn cut off
+        // mid-reasoning still shows what the model was thinking.
+        const cutoffMatch = cleanContent.match(/<think(?:ing)?(?:\s+[^>]*)?>([\s\S]*)$/i);
+        const partialThought = cutoffMatch ? cutoffMatch[1].trim() : '';
+        if (partialThought) {
+          thinkingBlocks.push(partialThought);
+          truncated = true;
+        }
         cleanContent = cleanContent.replace(/<think(?:ing)?(?:\s+[^>]*)?>[\s\S]*$/gi, '');
       }
     }
@@ -321,27 +361,78 @@ export function extractThinkingBlocks(text) {
     thinkingBlocks: mergedBlocks,
     content: cleanContent.trim(),
     thinkingTime,
+    // True when the LAST thinking block was cut off mid-generation (never
+    // closed) rather than a complete thought — used to label it "(truncated)"
+    // instead of silently dropping it.
+    truncated,
   };
 }
 
 /**
- * Create a collapsible thinking section
+ * "Auto-expand thinking" display preference — replaces the old
+ * `collapse_reasoning` pref (which defaulted OFF -> reasoning expanded by
+ * default, with an "expand only the last round" carve-out). Thinking is now
+ * ALWAYS collapsed by default everywhere (live, history, resume); this pref,
+ * default OFF, is the only way to opt back into auto-expanding it.
+ *
+ * Migration: a user who had `collapse_reasoning` explicitly set (either value)
+ * is migrated to `auto_expand_thinking=0` — the new "always collapsed by
+ * default" behavior wins regardless of their old choice, since the old
+ * pref's "expand unless collapsed" semantics no longer exist to preserve.
+ * The migration runs once (removes the legacy key so it doesn't re-fire).
+ *
+ * Exported so chat.js (live) and theme.js (Settings UI) read/migrate through
+ * this single implementation rather than each re-deriving it independently
+ * (that duplication is how the old pref's read/write drifted across files).
  */
-function createThinkingSection(thinkingContent, index = 0, thinkingTime = null) {
+export function autoExpandThinkingPref() {
+  try {
+    if (localStorage.getItem('collapse_reasoning') !== null) {
+      localStorage.removeItem('collapse_reasoning');
+      if (localStorage.getItem('auto_expand_thinking') === null) {
+        localStorage.setItem('auto_expand_thinking', '0');
+      }
+    }
+    return localStorage.getItem('auto_expand_thinking') === '1';
+  } catch (e) { return false; }
+}
+
+/**
+ * Create a collapsible thinking section.
+ *
+ * Expand-state rule (kept identical between the live and history/reload
+ * render paths so a section never flips open/closed just from a refresh):
+ *   - Thinking is ALWAYS collapsed by default, everywhere (live streaming,
+ *     history render, server resume) — matches the Claude-app pattern where
+ *     the "Thinking - Ns" header is the affordance and content stays hidden
+ *     until clicked.
+ *   - The ONLY exception: the `auto_expand_thinking` pref (default OFF), which
+ *     when ON expands the LAST round of the LAST message (opts.isLast) —
+ *     mirroring the old collapse_reasoning=OFF behavior for users who want it
+ *     back. Every earlier historical round still renders collapsed regardless.
+ * `opts.isLast` defaults to true so single-shot / live-ish callers that don't
+ * pass it (there are ~25 call sites outside this fix's scope) keep today's
+ * "expand only if the auto-expand pref is on" behavior.
+ */
+function createThinkingSection(thinkingContent, index = 0, thinkingTime = null, opts = {}) {
   const id = `thinking-${Date.now()}-${index}`;
   const timeHtml = thinkingTime ? `<span style="font-size:11px;opacity:0.4;font-variant-numeric:tabular-nums;">${thinkingTime}s</span>` : '';
+  const isLast = opts.isLast !== false;
+  const expanded = autoExpandThinkingPref() && isLast;
+  const expClass = expanded ? ' expanded' : '';
+  const label = opts.truncated ? 'thinking process (truncated)' : 'thinking process';
   return `
     <div class="thinking-section">
       <div class="thinking-header" data-thinking-id="${id}">
         <div class="thinking-header-left">
-          <span>View thinking process</span>
+          <span data-label="${label}">${expanded ? 'Hide' : 'View'} ${label}</span>
         </div>
         <div style="display:flex;align-items:center;gap:6px;">
           ${timeHtml}
-          <span class="thinking-toggle" id="${id}-toggle"></span>
+          <span class="thinking-toggle${expClass}" id="${id}-toggle"></span>
         </div>
       </div>
-      <div class="thinking-content" id="${id}">
+      <div class="thinking-content${expClass}" id="${id}">
         <div class="thinking-content-inner">
           ${mdToHtml(thinkingContent)}
         </div>
@@ -452,17 +543,28 @@ export function createCollapsible(contentMarkdown, label = 'details') {
     </div>`;
 }
 
-export function processWithThinking(text) {
-  const { thinkingBlocks, content, thinkingTime } = extractThinkingBlocks(text);
+// `opts.isLast` (default true) controls the collapsed/expanded default of any
+// thinking section produced here — see createThinkingSection's doc comment
+// for the exact rule. History-reload callers (sessions.js, chatRenderer.js)
+// pass isLast explicitly; the many live/one-shot callers that omit opts keep
+// today's "expand unless the collapse_reasoning pref is on" behavior.
+export function processWithThinking(text, opts = {}) {
+  const { thinkingBlocks, content, thinkingTime, truncated } = extractThinkingBlocks(text);
 
   let html = '';
   let visibleContent = content || '';
   const doneOnly = /^\s*\[DONE\]\s*$/i.test(visibleContent);
   const hadTrailingDone = !doneOnly && /(?:^|\n)\s*\[DONE\]\s*$/i.test(visibleContent);
 
-  // Add thinking sections (collapsed by default)
+  // Add thinking sections. `truncated` only ever describes the LAST block
+  // (extractThinkingBlocks merges all blocks into one when there are several,
+  // so there is at most one thinking section per call anyway).
   thinkingBlocks.forEach((block, index) => {
-    html += createThinkingSection(block, index, thinkingTime);
+    const isLastBlock = index === thinkingBlocks.length - 1;
+    html += createThinkingSection(block, index, thinkingTime, {
+      isLast: opts.isLast,
+      truncated: isLastBlock && truncated,
+    });
   });
 
   // Add the actual content
@@ -837,7 +939,10 @@ const markdownModule = {
   extractThinkingBlocks,
   normalizeThinkingMarkup,
   startsWithReasoningPrefix,
-  renderMermaid
+  isToolCaptionText,
+  toolCaptionOrNull,
+  renderMermaid,
+  autoExpandThinkingPref,
 };
 
 export default markdownModule;
