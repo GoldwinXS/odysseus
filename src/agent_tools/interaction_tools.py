@@ -3,6 +3,101 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+class SendToSubagentTool:
+    async def execute(self, content, ctx):
+        """
+        send_to_subagent: steer a RUNNING background sub-agent mid-flight. The
+        parent agent uses this to inject guidance ("focus on X", "also check Y",
+        "stop and summarize") into a sub-agent it dispatched with spawn_agent,
+        WITHOUT cancelling it.
+
+        Mechanics: each background sub-agent runs with an ephemeral steer-queue
+        session (``_subagent_<id>``); this enqueues the message onto that queue
+        via agent_runs.enqueue_steer, and the sub-agent's own agent loop drains
+        it at the next round boundary (Claude-Code-style steering). Validates the
+        target is a sub-agent that is (a) in THIS chat and (b) still running.
+
+        Content (JSON): {"subagent_id": "sub_3", "message": "..."} — a bare
+        string is treated as the message with no target (an error). Returns a
+        result dict; no subprocess/filesystem.
+        """
+        from src import agent_runs, subagent_runs
+
+        session_id = ctx.get("session_id")
+        if not session_id:
+            return "send_to_subagent: no session", {
+                "error": "send_to_subagent can only be used inside a chat session.",
+                "exit_code": 1,
+            }
+
+        sub_id, message = "", ""
+        raw = (content or "").strip()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            sub_id = str(parsed.get("subagent_id") or parsed.get("id") or "").strip()
+            message = str(parsed.get("message") or parsed.get("text") or "").strip()
+        else:
+            message = raw
+
+        if not sub_id:
+            return "send_to_subagent: invalid", {
+                "error": "send_to_subagent needs a `subagent_id` (e.g. 'sub_3') — the id "
+                         "spawn_agent returned. Use manage_agents to list running ids.",
+                "exit_code": 1,
+            }
+        if not message:
+            return "send_to_subagent: invalid", {
+                "error": "send_to_subagent needs a non-empty `message` to send to the sub-agent.",
+                "exit_code": 1,
+            }
+
+        rec = subagent_runs.find_running(session_id, sub_id)
+        if rec is None:
+            return f"send_to_subagent: {sub_id} not running", {
+                "error": (
+                    f"No RUNNING sub-agent '{sub_id}' in this chat. It may have already "
+                    "finished (check the chat for its result) or the id is wrong — call "
+                    "manage_agents to list running sub-agents and their ids."
+                ),
+                "exit_code": 1,
+            }
+
+        queue_session = rec.get("queue_session")
+        # Frame the steer so the sub-agent reads it as guidance from its dispatcher,
+        # not as a fresh unrelated user message. Enqueued as kind="user" so it's
+        # injected as an in-turn user message the worker acts on this round.
+        framed = (
+            "[Guidance from the agent that dispatched you — adjust your work "
+            f"accordingly]\n{message}"
+        )
+        queued = bool(queue_session) and agent_runs.enqueue_steer(queue_session, framed, kind="user")
+        if not queued:
+            # Race: the sub-agent finished between find_running and enqueue.
+            return f"send_to_subagent: {sub_id} just finished", {
+                "error": (
+                    f"Sub-agent '{sub_id}' is no longer accepting steering (it just "
+                    "finished). Check the chat for its result."
+                ),
+                "exit_code": 1,
+            }
+
+        desc = f"send_to_subagent: {sub_id}"
+        logger.info("Tool executed: %s (%d chars) → queue=%s", desc, len(message), queue_session)
+        return desc, {
+            "output": (
+                f"Sent guidance to running sub-agent {sub_id}. It will pick this up at "
+                "its next step and adjust. Do NOT wait for it — its result still posts "
+                "into this chat when it finishes."
+            ),
+            "subagent_id": sub_id,
+            "status": "running",
+            "exit_code": 0,
+        }
+
 class AskUserTool:
     async def execute(self, content, ctx):
         """

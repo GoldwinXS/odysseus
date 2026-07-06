@@ -216,7 +216,16 @@ def _normalize_integration_base_url(base_url: Any) -> str:
 
 
 def _join_integration_url(base_url: str, path: str) -> str:
-    return urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    rel = path.lstrip("/")
+    if not rel:
+        # Path "" or "/" means "the base endpoint itself". Don't append a
+        # trailing slash — some APIs 404 on it (e.g. Discord webhooks:
+        # POST .../webhooks/{id}/{token}/ is Not Found while the same URL
+        # without the slash succeeds). httpx still sends "/" as the
+        # request-line path when the URL has no path component, so
+        # integrations that genuinely target the root (ntfy) are unaffected.
+        return base_url.rstrip("/")
+    return urljoin(base_url.rstrip("/") + "/", rel)
 
 
 def load_integrations() -> List[Dict[str, Any]]:

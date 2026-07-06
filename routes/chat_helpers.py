@@ -796,18 +796,65 @@ async def build_chat_context(
     )
 
 
-def accumulate_token_usage(session_id: str, metrics: dict):
-    """Add input/output token counts to the session's running totals."""
+def accumulate_token_usage(session_id: str, metrics: dict, endpoint_url: Optional[str] = None):
+    """Add input/output token counts to the session's running totals.
+
+    Also accumulates Anthropic prompt-cache token counts (cache_read /
+    cache_creation) so the true billed cost stays auditable: a cache_read
+    token is priced ~0.1x and a cache_creation token ~1.25x a fresh input
+    token, so lumping them into total_input_tokens would misstate cost.
+
+    Cost accounting: the per-turn USD cost is priced HERE (the single
+    accumulation point) from the SERVED model + cache-aware rates
+    (src/pricing.py) and added to Session.total_cost_usd. If the caller already
+    priced this turn (``metrics["cost_usd"]`` set by save_assistant_response),
+    that value is reused so the message metadata and the session total agree;
+    otherwise it is computed from ``endpoint_url``. Local/self-hosted endpoints
+    contribute 0. When endpoint_url is None and no precomputed cost is present,
+    the cost defaults to 0 for models absent from the pricing table.
+
+    Mid-turn model switch (fallback after round 1): in AGENT mode chat_routes
+    never sees the per-round ``usage`` events — src/agent_loop.py consumes them
+    internally and emits ONE per-turn ``metrics`` event carrying the summed
+    token/cache counts and a single served ``model`` (the last round's). We
+    therefore price the per-turn SUM with that served model. In CHAT mode there
+    is one usage/metrics event per completion, so pricing the sum with its
+    served model is exact. Per-round pricing across a mid-turn switch would
+    require touching agent_loop.py (owned elsewhere), so this is the accurate
+    AND minimal choice given what is observable at this site.
+    """
     in_t = metrics.get("input_tokens", 0)
     out_t = metrics.get("output_tokens", 0)
-    if not (in_t or out_t):
+    c_read = metrics.get("cache_read_tokens", 0) or metrics.get("cache_read_input_tokens", 0)
+    c_write = metrics.get("cache_creation_tokens", 0) or metrics.get("cache_creation_input_tokens", 0)
+    if not (in_t or out_t or c_read or c_write):
         return
+
+    # Reuse the per-turn cost computed in save_assistant_response when present so
+    # the message-level cost_usd and the session total never diverge; otherwise
+    # price it here from the served model + endpoint.
+    cost = metrics.get("cost_usd")
+    if cost is None:
+        try:
+            from src.pricing import price_usage
+            cost = price_usage(metrics, endpoint_url=endpoint_url)
+        except Exception:
+            cost = 0.0
+    try:
+        cost = float(cost or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+
     db = SessionLocal()
     try:
         db_s = db.query(DBSession).filter(DBSession.id == session_id).first()
         if db_s:
             db_s.total_input_tokens = (db_s.total_input_tokens or 0) + in_t
             db_s.total_output_tokens = (db_s.total_output_tokens or 0) + out_t
+            db_s.total_cache_read_tokens = (db_s.total_cache_read_tokens or 0) + c_read
+            db_s.total_cache_creation_tokens = (db_s.total_cache_creation_tokens or 0) + c_write
+            if cost:
+                db_s.total_cost_usd = (db_s.total_cost_usd or 0.0) + cost
             db.commit()
     except Exception:
         db.rollback()
@@ -1022,6 +1069,21 @@ def save_assistant_response(
         md["requested_model"] = requested_model
     if actual_model:
         md["model"] = actual_model
+
+    # Server-authoritative per-turn cost. Priced by the SERVED model, cache-aware,
+    # and zero for local/self-hosted endpoints (src/pricing.py). The frontend
+    # prefers this metadata.cost_usd over its own estimate; old messages without
+    # it fall back to the improved client-side estimate. Only attach when there
+    # were real token counts to price (skip estimated/empty metrics).
+    if last_metrics and (md.get("input_tokens") or md.get("output_tokens")
+                         or md.get("cache_read_tokens") or md.get("cache_creation_tokens")):
+        try:
+            from src.pricing import price_usage
+            _cost = price_usage(md, endpoint_url=getattr(sess, "endpoint_url", None))
+            if _cost and _cost > 0:
+                md["cost_usd"] = round(_cost, 6)
+        except Exception:
+            logger.debug("cost pricing failed for session %s", session_id, exc_info=True)
     if character_name:
         md["character_name"] = character_name
     if web_sources:
@@ -1214,9 +1276,12 @@ def run_post_response_tasks(
     if _extraction_jobs:
         _spawn_bg(_run_extraction_jobs_sequentially(session_id, _extraction_jobs))
 
-    # Token accumulation
+    # Token + cost accumulation. Pass the serving endpoint so pricing can zero
+    # out local/self-hosted models (src/pricing.py.is_endpoint_free).
     if last_metrics:
-        accumulate_token_usage(session_id, last_metrics)
+        accumulate_token_usage(
+            session_id, last_metrics, endpoint_url=getattr(sess, "endpoint_url", None)
+        )
 
     # Webhook
     if webhook_manager and not compare_mode:

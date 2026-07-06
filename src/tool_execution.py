@@ -337,6 +337,7 @@ _MCP_TOOL_MAP = {
     "web_search":     ("web_search", "web_search"),
     "web_fetch":      ("web_fetch",  "web_fetch"),
     "generate_image": ("image_gen",  "generate_image"),
+    "generate_video": ("video_gen",  "generate_video"),
 }
 _EMAIL_MCP_OWNER_ARG = "_odysseus_owner"
 
@@ -380,6 +381,22 @@ def _parse_generate_image(content: str) -> Dict:
     return args
 
 
+def _parse_generate_video(content: str) -> Dict:
+    content = content.strip()
+    # Prefer the JSON form (matches the tool schema) — it survives multi-line
+    # prompts intact. Fall back to line 1 = prompt for the bare-text form.
+    if content.startswith("{"):
+        try:
+            d = json.loads(content)
+            if isinstance(d, dict) and str(d.get("prompt", "")).strip():
+                keys = ("prompt", "duration_seconds", "resolution", "image_url", "backend", "model")
+                return {k: d[k] for k in keys if k in d}
+        except (json.JSONDecodeError, TypeError):
+            pass
+    lines = content.split("\n")
+    return {"prompt": lines[0].strip() if lines else ""}
+
+
 def _parse_manage_memory(content: str) -> Dict:
     lines = content.strip().split("\n")
     action = lines[0].strip().lower() if lines else ""
@@ -414,6 +431,7 @@ _MCP_ARG_PARSERS: Dict[str, Callable[[str], Dict[str, str]]] = {
     "read_file":      lambda c: {"path": c.split("\n")[0].strip()},
     "write_file":     _parse_write_file,
     "generate_image": _parse_generate_image,
+    "generate_video": _parse_generate_video,
     "manage_memory":  _parse_manage_memory,
 }
 
@@ -441,6 +459,7 @@ _MCP_JSON_PRIMARY_KEYS: Dict[str, tuple] = {
     "read_file":      ("path",),
     "write_file":     ("path",),
     "generate_image": ("prompt",),
+    "generate_video": ("prompt",),
 }
 
 
@@ -486,6 +505,8 @@ async def _call_mcp_tool(
     # URL into its prose (which it mangles/hallucinates).
     if tool == "generate_image":
         _promote_image_fields(result)
+    elif tool == "generate_video":
+        _promote_video_fields(result)
 
     return result
 
@@ -507,6 +528,29 @@ def _promote_image_fields(result: Dict) -> None:
         ("image_prompt", r'^Generated image for:\s*(.+)$'),
         ("image_model", r'^model:\s*(.+)$'),
         ("image_size", r'^size:\s*(.+)$'),
+    ):
+        fm = re.search(pat, out, re.M)
+        if fm:
+            result[field] = fm.group(1).strip()
+
+
+def _promote_video_fields(result: Dict) -> None:
+    """Lift the generated-video URL (+ prompt/model) from a successful
+    generate_video MCP text result into structured fields. The clip is saved
+    under /api/generated-image/<file>.mp4 and lands in the gallery (which renders
+    <video> off the .mp4 extension); the `Direct link:` in the text result also
+    linkifies in chat. This just exposes video_url as a structured field so the
+    delivery doesn't depend on the model echoing the URL into its prose."""
+    if not isinstance(result, dict) or result.get("exit_code") != 0:
+        return
+    out = result.get("stdout") or ""
+    m = re.search(r'(?:https?://[^\s)\]]+)?/api/generated-image/[A-Za-z0-9._-]+\.(?:mp4|webm|mov|mkv|m4v)', out)
+    if not m:
+        return
+    result["video_url"] = m.group(0).strip()
+    for field, pat in (
+        ("video_prompt", r'^Generated video for:\s*(.+)$'),
+        ("video_model", r'^model:\s*(.+)$'),
     ):
         fm = re.search(pat, out, re.M)
         if fm:

@@ -56,10 +56,30 @@ def test_function_call_to_tool_block_unknown_tool_returns_none():
     assert block is None
 
 
-def test_function_call_to_tool_block_invalid_json_returns_none():
-    """Unparseable JSON arguments should result in returning None."""
-    block = function_call_to_tool_block("web_search", '{"query": "valid json')  # invalid JSON
-    assert block is None
+def test_function_call_to_tool_block_invalid_json_is_repaired_not_dropped():
+    """Malformed JSON arguments must never be silently dropped (that lost real
+    tool calls — see incident notes in src/tool_schemas.py's repair helpers).
+    This particular payload is a recoverable truncation (an unterminated
+    string with no other structural damage), so the generalized repair
+    pipeline reconstructs the real call instead of returning None."""
+    block = function_call_to_tool_block("web_search", '{"query": "valid json')  # truncated JSON
+    assert block is not None
+    assert block.tool_type == "web_search"
+    assert block.content == "valid json"
+
+
+def test_function_call_to_tool_block_unrepairable_json_surfaces_error_block():
+    """When no repair strategy can salvage the arguments, the call must still
+    not vanish: a synthetic ToolBlock is returned whose tool_type carries a
+    diagnostic message. src/tool_execution.py's dispatcher turns any
+    unrecognized tool_type into a normal {"error": ...} tool result, so this
+    reaches the model as a failed (and retryable) tool call instead of being
+    dropped with no trace."""
+    block = function_call_to_tool_block("web_search", "{not json at all !!! ][[")
+    assert block is not None
+    assert "web_search" in block.tool_type
+    assert "malformed JSON arguments" in block.tool_type
+    assert "could not be repaired" in block.tool_type
 
 
 def test_google_search_mapping():

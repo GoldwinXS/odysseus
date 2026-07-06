@@ -478,6 +478,12 @@ def setup_chat_routes(
         use_research = form_data.get("use_research")
         time_filter = form_data.get("time_filter")
         preset_id = form_data.get("preset_id")
+        # Reasoning-effort selector ("default"/"off"/"low"/"medium"/"high") —
+        # the client resolves per-session vs. global-default precedence itself
+        # (see static/js/chat.js) and always sends the effective value here, so
+        # the route just forwards it through; "default"/blank means no override
+        # (apply_reasoning_effort in llm_core.py treats both as a no-op).
+        reasoning_effort = (form_data.get("reasoning_effort") or (body or {}).get("reasoning_effort") or "").strip().lower() or None
         # Issue #3229: API callers send JSON, not FormData.  Read from the
         # JSON body as fallback so callers who send {"allow_bash": true}
         # actually get bash enabled.
@@ -1144,6 +1150,7 @@ def setup_chat_routes(
                         prompt_type=preset_id,
                         tools=None,
                         session_id=session,
+                        reasoning_effort=reasoning_effort,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1173,6 +1180,13 @@ def setup_chat_routes(
                                     _reported_model = last_metrics.get("model")
                                     last_metrics["requested_model"] = _requested_model
                                     last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
+                                    # served_model records the model that ACTUALLY produced
+                                    # this response (fallback answerer, provider alias, or the
+                                    # Anthropic message.model) — distinct from the requested
+                                    # model, which the fallbacks previously masked.
+                                    _served = _reported_model or _answered_by or _actual_model
+                                    if _served and _served != _requested_model:
+                                        last_metrics["served_model"] = _served
                                     if ctx.context_length and last_metrics.get("input_tokens"):
                                         pct = min(round((last_metrics["input_tokens"] / ctx.context_length) * 100, 1), 100.0)
                                         last_metrics["context_percent"] = pct
@@ -1313,6 +1327,7 @@ def setup_chat_routes(
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
                         tool_events_sink=_tool_events_sink,
+                        reasoning_effort=reasoning_effort,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1335,6 +1350,18 @@ def setup_chat_routes(
                                     "rounds_exhausted",
                                     "ask_user",
                                     "plan_update",
+                                    # steering_injected: a mid-turn user/steer message
+                                    # (agent_loop.py) — without this it's parsed then
+                                    # silently dropped, so it never reaches the live
+                                    # client, the replay buffer, or a second device.
+                                    "steering_injected",
+                                    # tool_progress: live elapsed/tail updates for
+                                    # long-running tools (bash/python); agent_prep:
+                                    # per-turn prep-phase timing breakdown;
+                                    # budget_exceeded: tool-call budget hit mid-turn.
+                                    # All three have frontend handlers already but
+                                    # were missing from this whitelist.
+                                    "tool_progress", "agent_prep", "budget_exceeded",
                                 ):
                                     if data.get("type") == "agent_step":
                                         _agent_rounds = max(_agent_rounds, data.get("round", 1))
@@ -1359,6 +1386,17 @@ def setup_chat_routes(
                                     _reported_model = last_metrics.get("model")
                                     last_metrics["requested_model"] = last_metrics.get("requested_model") or _requested_model
                                     last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
+                                    # served_model = what actually produced the reply, distinct
+                                    # from the requested model (fallback answerer / provider
+                                    # alias / Anthropic message.model). NOTE: the agent loop's
+                                    # per-turn cache-token SUM (cache_read_tokens /
+                                    # cache_creation_tokens) must be accumulated in
+                                    # src/agent_loop.py:_build_metrics — that file is owned
+                                    # elsewhere; once it forwards those keys they flow through
+                                    # here into metadata + session totals unchanged.
+                                    _served = _reported_model or _answered_by or _actual_model
+                                    if _served and _served != _requested_model:
+                                        last_metrics["served_model"] = _served
                                     yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
                             except json.JSONDecodeError:
                                 yield chunk

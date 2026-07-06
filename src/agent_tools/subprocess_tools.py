@@ -1,16 +1,52 @@
 import asyncio
+import contextvars
 import sys
 import time
 import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from src.constants import MAX_OUTPUT_CHARS
 
+# Cap on bash inside a sub-agent, set by the sub-agent runner for the duration of
+# its loop. A sub-agent's whole run is bounded by the same wall-clock cap bash
+# defaults to (both 600s), so one blocking foreground command — a dev server the
+# model forgot to background — could burn the entire budget and leave the worker
+# with nothing to report. When this is set, bash uses it instead of the global
+# `agent_bash_timeout_seconds`, so a single command can't eat the run. contextvars
+# are task-local, so a sub-agent's cap never leaks into the parent turn's bash.
+# (Set by _run_subagent in model_interaction_tools.py — we can't edit agent_loop.py
+# to thread it through, so a contextvar is the clean non-invasive route.)
+_subagent_bash_timeout: contextvars.ContextVar = contextvars.ContextVar(
+    "subagent_bash_timeout", default=None
+)
+
+
+def set_subagent_bash_timeout(seconds: Optional[int]):
+    """Bind (or clear) the sub-agent bash cap for the current task context.
+
+    Returns the contextvars token so the caller can reset() it on the way out —
+    mirrors _active_workspace's set/reset pattern in tool_execution.py."""
+    return _subagent_bash_timeout.set(seconds if (seconds and seconds > 0) else None)
+
+
+def reset_subagent_bash_timeout(token) -> None:
+    """Undo a set_subagent_bash_timeout so the binding never leaks past the run."""
+    try:
+        _subagent_bash_timeout.reset(token)
+    except Exception:
+        pass
+
+
 # A hung foreground command (e.g. a dev server the model forgot to background)
 # freezes the whole turn until this fires — at 1 hour that reads as a silent
 # stall. Default to 10 minutes (covers real builds/installs) and make it
 # tunable via the `agent_bash_timeout_seconds` setting. Progress SSE events
 # still stream every PROGRESS_INTERVAL_S so long-but-live commands stay visible.
+# Inside a sub-agent the runner-supplied cap (contextvar above) takes precedence
+# so a single blocking command can't consume the sub-agent's whole time budget.
 def _bash_timeout() -> int:
+    _sub = _subagent_bash_timeout.get()
+    if _sub and _sub > 0:
+        return _sub
     try:
         from src.settings import get_setting
         v = int(get_setting("agent_bash_timeout_seconds", 600) or 600)

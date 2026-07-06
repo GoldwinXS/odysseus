@@ -322,7 +322,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Spawn/dispatch a sub-agent that runs a full tool-using agent loop on a self-contained task IN THE BACKGROUND. Returns immediately with an acknowledgement — do NOT wait for it; the sub-agent's result is delivered into this chat as a message when it finishes. Use to dispatch or delegate a focused unit of work to an autonomous agent that reports back — e.g. 'read js/render/models.js, screenshot localhost:1338, and list what looks visually wrong'. The sub-agent has the normal tools (files, shell, browser, etc.) but cannot spawn further agents.",
+            "description": "Spawn/dispatch a sub-agent that runs a full tool-using agent loop on a self-contained task IN THE BACKGROUND. Returns immediately with an acknowledgement — do NOT wait for it; the sub-agent's result is delivered into this chat as a message when it finishes. Use to dispatch or delegate a focused unit of work to an autonomous agent that reports back — e.g. 'read js/render/models.js, screenshot localhost:1338, and list what looks visually wrong'. The sub-agent has the normal tools (files, shell, browser, etc.) but cannot spawn further agents. Optionally begin the task with directive line(s) consumed from the top of the task text: 'model: <name>' to pin a model, and/or 'timeout: <seconds>' (60-21600) to raise the wall-clock backstop for a long job.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -344,6 +344,21 @@ FUNCTION_TOOL_SCHEMAS = [
                     "action": {"type": "string", "description": "Leave empty or 'list' to see running/recent sub-agents. Use 'stop <id>' (e.g. 'stop sub_3') to cancel one."}
                 },
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_to_subagent",
+            "description": "Steer a RUNNING background sub-agent (one you dispatched with spawn_agent) mid-flight WITHOUT cancelling it. Inject guidance the sub-agent picks up at its next step — e.g. narrow its focus, add a constraint or a new sub-task, correct a wrong assumption, or tell it to wrap up. The message is delivered as an in-turn instruction from you (its dispatcher). Get the id from spawn_agent's acknowledgement or manage_agents. Use manage_agents (not this) to check status or stop one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subagent_id": {"type": "string", "description": "The running sub-agent's id, e.g. 'sub_3' (from spawn_agent or manage_agents)."},
+                    "message": {"type": "string", "description": "The guidance/instruction to send to the running sub-agent."}
+                },
+                "required": ["subagent_id", "message"]
             }
         }
     },
@@ -1348,21 +1363,304 @@ def _repair_document_function_args(tool_type: str, arguments: str) -> Optional[d
     return None
 
 
+# ---------------------------------------------------------------------------
+# Generalized malformed-arguments repair (all tools, not just documents)
+#
+# Incident: a deepseek sub-agent emitted a ~20KB write_file call (path + a
+# huge markdown content string). json.loads failed (raw control characters /
+# possible truncation inside the big string) and — because the repair path
+# above only covers update_document — the call was silently dropped: no
+# retry, no error surfaced to the model, the file was never written. These
+# helpers extend "wrapper parse failure, not a semantic tool-choice failure"
+# reasoning to every tool.
+# ---------------------------------------------------------------------------
+
+_FUNCTION_SCHEMA_BY_NAME: dict = {
+    entry["function"]["name"]: entry["function"]
+    for entry in FUNCTION_TOOL_SCHEMAS
+    if isinstance(entry, dict) and isinstance(entry.get("function"), dict)
+}
+
+
+def _string_params_for(name: str):
+    """Return (required_string_keys, all_string_keys) in schema-declared order."""
+    func = _FUNCTION_SCHEMA_BY_NAME.get(name)
+    if not func:
+        return [], []
+    params = func.get("parameters", {}) or {}
+    props = params.get("properties", {}) or {}
+    required = params.get("required", []) or []
+    all_strings = [k for k, v in props.items() if isinstance(v, dict) and v.get("type") == "string"]
+    required_strings = [k for k in required if k in all_strings]
+    return required_strings, all_strings
+
+
+def _strip_trailing_garbage(raw: str) -> str:
+    """Drop anything after the final top-level '}' (e.g. stray tokens some
+    local models append after a otherwise-complete JSON object)."""
+    end = raw.rfind("}")
+    if end < 0:
+        return raw
+    return raw[:end + 1]
+
+
+def _escape_raw_control_chars_in_strings(raw: str) -> str:
+    """Escape literal control characters (raw newlines/tabs/CR) that appear
+    INSIDE JSON string literals. A model streaming a big content blob will
+    often emit a real '\\n' byte instead of the two-character escape '\\n',
+    which is illegal inside a JSON string and fails json.loads even though
+    the payload is otherwise complete and well-formed."""
+    out = []
+    in_string = False
+    escape_next = False
+    for ch in raw:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch == "\n":
+            out.append("\\n")
+        elif in_string and ch == "\r":
+            out.append("\\r")
+        elif in_string and ch == "\t":
+            out.append("\\t")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _close_truncated_json(raw: str) -> Optional[str]:
+    """Best-effort close-out for JSON cut off mid-stream (e.g. a response
+    truncated at a token/length limit while writing a large string value).
+    Closes an open string literal (if the raw text ends inside one) and then
+    appends enough closing brackets/braces to balance what's open. Returns
+    None if the text doesn't look like a plausibly-truncated JSON object."""
+    raw = raw.rstrip()
+    if not raw.startswith("{"):
+        return None
+    in_string = False
+    escape_next = False
+    stack = []
+    for ch in raw:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    if not stack and not in_string:
+        return None  # already balanced; not a truncation case
+    closer = {"{": "}", "[": "]"}
+    patch = ('"' if in_string else "") + "".join(closer[c] for c in reversed(stack))
+    return raw + patch
+
+
+def _extract_large_string_field(name: str, raw: str):
+    """Targeted extraction for schemas shaped like write_file (a couple of
+    small required string params + one big free-text string param), the same
+    idea _repair_document_function_args uses for update_document's `content`,
+    generalized to any tool via its schema.
+
+    Strategy: find each small (non-final) required string field by its
+    JSON key, take the literal text up to the *next* declared string key (or
+    to the final closing quote/brace for the last field), and lenient-decode
+    each. Falls back cleanly (returns None) if the field markers can't be
+    located in the expected order — callers then try weaker generic repairs.
+    """
+    required_strings, all_strings = _string_params_for(name)
+    if not all_strings or not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        return None
+    close_brace = raw.rfind("}")
+    if close_brace < 0:
+        close_brace = len(raw)  # tolerate a truncated/missing final brace
+
+    # Order fields by where their key actually appears in the payload so we
+    # can slice each value up to the start of the next key.
+    positions = []
+    for key in all_strings:
+        marker = f'"{key}"'
+        pos = raw.find(marker)
+        if pos >= 0:
+            positions.append((pos, key))
+    if not positions:
+        return None
+    positions.sort()
+
+    # All required string fields must be present, or there's nothing safe to
+    # reconstruct.
+    found_keys = {k for _, k in positions}
+    if not all(k in found_keys for k in required_strings):
+        return None
+
+    result = {}
+    for idx, (pos, key) in enumerate(positions):
+        colon_pos = raw.find(":", pos + len(f'"{key}"'))
+        if colon_pos < 0:
+            return None
+        first_quote = raw.find('"', colon_pos + 1)
+        if first_quote < 0:
+            return None
+        # End boundary: start of the next field's key marker, else the last
+        # quote before the final closing brace (mirrors the document repair).
+        if idx + 1 < len(positions):
+            next_pos = positions[idx + 1][0]
+            search_region_end = raw.rfind('"', first_quote + 1, next_pos)
+        else:
+            search_region_end = raw.rfind('"', first_quote + 1, close_brace)
+        if search_region_end <= first_quote:
+            return None
+        value = _decode_loose_json_string(raw[first_quote + 1:search_region_end])
+        result[key] = value
+
+    return result if result else None
+
+
+def _repair_function_args(name: str, tool_type: str, arguments: str):
+    """Try, in order, every available repair strategy for malformed function
+    call arguments. Returns (args_dict_or_None, strategy_name_or_None) so the
+    caller can log exactly what happened.
+
+    Strategies (cheapest / most-targeted first):
+      1. document   - existing update_document quote-repair (unchanged).
+      2. reparse    - strip trailing garbage, retry json.loads.
+      3. escape_ctrl - escape raw control chars inside strings, retry json.loads.
+      4. close_truncated - close an open string/braces for cut-off JSON, retry.
+      5. field_extract - schema-driven positional string extraction (handles
+         the write_file path+content shape, and anything else with a big
+         free-text field, when the JSON-level repairs above can't parse it).
+    """
+    if not isinstance(arguments, str):
+        return None, None
+    raw = arguments.strip()
+    if not raw:
+        return None, None
+
+    doc_args = _repair_document_function_args(tool_type, arguments)
+    if doc_args is not None:
+        return doc_args, "document"
+
+    stripped = _strip_trailing_garbage(raw)
+    if stripped != raw:
+        try:
+            return json.loads(stripped), "reparse"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    escaped = _escape_raw_control_chars_in_strings(stripped)
+    try:
+        return json.loads(escaped), "escape_ctrl"
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    closed = _close_truncated_json(escaped)
+    if closed:
+        try:
+            return json.loads(closed), "close_truncated"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    extracted = _extract_large_string_field(name, raw)
+    if extracted is not None:
+        return extracted, "field_extract"
+
+    return None, None
+
+
+def _malformed_args_tool_block(name: str, tool_type: str, args_len: int, args_prefix: str, parse_err) -> ToolBlock:
+    """Build a synthetic ToolBlock that surfaces an unrecoverable args-parse
+    failure to the model as a normal (failing) tool result, instead of
+    returning None and letting the call vanish.
+
+    execute_tool_block()/_execute_tool_block_impl() (src/tool_execution.py)
+    dispatch purely on `block.tool_type` string equality; anything that
+    matches no known branch already falls through to:
+        desc = f"unknown: {tool}"
+        result = {"error": f"Unknown tool: {tool}", "exit_code": 1}
+    which format_tool_result() renders as "### {desc}\n**Error:** ...". That
+    fallback exists today and requires no change — we just need `tool_type`
+    itself to carry the real diagnostic (name, size, parse error, raw-arg
+    preview) so what reaches the model is actionable instead of a generic
+    "Unknown tool" message. This is the best fix achievable entirely inside
+    tool_schemas.py; see the module note near the top of this function for
+    the caller-side improvement that would make this cleaner still.
+    """
+    diagnostic = (
+        f"tool call '{name}' had malformed JSON arguments and could not be repaired "
+        f"(args_len={args_len} chars, json_error={parse_err}). "
+        f"Raw args started with: {args_prefix!r}. "
+        "Retry the call with valid JSON — if the payload is large, consider "
+        "writing it in smaller chunks or escaping embedded newlines/quotes properly."
+    )
+    return ToolBlock(diagnostic, "")
+
+
 def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock]:
-    """Convert a native function call into a ToolBlock for the existing execution pipeline."""
+    """Convert a native function call into a ToolBlock for the existing execution pipeline.
+
+    NOTE on error surfacing: when arguments are malformed JSON and no repair
+    strategy (see _repair_function_args) succeeds, this function does NOT
+    return None-and-drop. It returns a synthetic ToolBlock (see
+    _malformed_args_tool_block) whose tool_type string IS the diagnostic
+    message; src/tool_execution.py's dispatcher already turns any unrecognized
+    tool_type into a {"error": ...} tool result via its existing fallback
+    branch, so the model sees a real failed-tool-call result and can retry.
+    Only genuinely unresolvable/unnamed calls (name empty, etc.) should ever
+    reach the caller's separate "unconvertible native call" path in
+    agent_loop.py (_resolve_tool_blocks / _unknown_tool_call_error), which
+    still exists for calls this function truly cannot represent.
+    """
     tool_type = _TOOL_NAME_MAP.get(name, name)
     try:
         if not arguments or (isinstance(arguments, str) and not arguments.strip()):
             args = {}
         else:
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
-    except (json.JSONDecodeError, TypeError):
-        args = _repair_document_function_args(tool_type, arguments)
+    except (json.JSONDecodeError, TypeError) as parse_err:
+        raw_args = arguments if isinstance(arguments, str) else str(arguments)
+        args, strategy = _repair_function_args(name, tool_type, raw_args)
+        args_len = len(raw_args)
+        args_prefix = raw_args[:200].replace("\n", "\\n")
         if args is not None:
-            logger.warning(f"Repaired malformed document function call arguments for {name}")
+            logger.warning(
+                f"Repaired malformed function call arguments for {name} "
+                f"(tool_type={tool_type}, args_len={args_len}, strategy={strategy}, "
+                f"error={parse_err})"
+            )
         else:
-            logger.error(f"Failed to parse function call arguments for {name}: {arguments}")
-            return None
+            # Every repair strategy failed. Do NOT silently vanish: log every
+            # detail needed to reproduce/fix this, then fall through to a
+            # synthetic ToolBlock instead of returning None so the failure is
+            # not dropped on the floor (see module docstring note below the
+            # imports for why this is the best available fix without touching
+            # agent_loop.py's error-surfacing plumbing).
+            logger.warning(
+                f"Failed to parse function call arguments for {name} after trying "
+                f"all repair strategies (tool_type={tool_type}, args_len={args_len}, "
+                f"error={parse_err}, args_prefix={args_prefix!r})"
+            )
+            return _malformed_args_tool_block(name, tool_type, args_len, args_prefix, parse_err)
 
     # Some models emit valid JSON that isn't an object (e.g. a bare array
     # ["ls -la"], string, or number) as function arguments. Most local tools keep
@@ -1478,6 +1776,12 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         # "stop sub_3"}', whose startswith("stop") fails and silently lists
         # instead of cancelling.
         content = args.get("action", "")
+    elif tool_type == "send_to_subagent":
+        # The handler parses JSON {"subagent_id","message"} (and accepts id/text
+        # aliases). Normalise any plausible key so a native call reaches it.
+        _sid = (args.get("subagent_id") or args.get("id") or "").strip() if isinstance(args, dict) else ""
+        _msg = (args.get("message") or args.get("text") or "") if isinstance(args, dict) else ""
+        content = json.dumps({"subagent_id": _sid, "message": _msg})
     elif tool_type == "create_session":
         content = args.get("name", "Untitled") + "\n" + args.get("model", "")
     elif tool_type == "list_sessions":
