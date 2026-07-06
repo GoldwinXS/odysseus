@@ -92,6 +92,21 @@ def is_queue_session(session_id: Optional[str]) -> bool:
     return bool(session_id) and session_id.startswith(_QUEUE_SESSION_PREFIX)
 
 
+def parent_session_for_queue(queue_session: Optional[str]) -> Optional[str]:
+    """Reverse-map a sub-agent's ephemeral queue session id back to the real
+    parent chat session that spawned it. Returns None if unknown (e.g. the run
+    already evicted). Used so work a sub-agent starts (e.g. a background job)
+    is delivered into a persisted chat, not the queue session that is torn down
+    the moment the sub-agent ends."""
+    if not is_queue_session(queue_session):
+        return None
+    for parent, recs in _UPDATES.items():
+        for rec in recs:
+            if rec.get("queue_session") == queue_session:
+                return parent
+    return None
+
+
 def _register_ephemeral_session(queue_session: str, model: str) -> None:
     """Register a NON-PERSISTING in-memory Session under the sub-agent's queue id
     so the loop's steering path can get_session()/add_message() it without either

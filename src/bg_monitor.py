@@ -82,10 +82,17 @@ async def _run_followup(rec: dict) -> bool:
     sm = get_session_manager()
     if not sm:
         return False  # not ready yet — retry
-    sess = sm.get_session(rec["session_id"])
+    try:
+        sess = sm.get_session(rec["session_id"])
+    except Exception:
+        # get_session RAISES (KeyError) for an unknown id — e.g. a job launched
+        # under a sub-agent's ephemeral steer-queue session that has since been
+        # torn down. Treat it like a deleted session (handled) rather than let
+        # the exception bubble and retry this job forever every tick.
+        sess = None
     if not sess:
-        # Session was deleted — nothing to continue. Consider it handled so we
-        # don't retry forever.
+        # Session was deleted / never persisted — nothing to continue. Consider
+        # it handled so we don't retry forever.
         logger.info("bg-followup: session %s gone for job %s — skipping", rec.get("session_id"), rec.get("id"))
         return True
 

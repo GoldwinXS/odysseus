@@ -809,18 +809,49 @@ async def _execute_tool_block_impl(
     # isn't held open for a multi-minute install/ffmpeg/download. The always-on
     # monitor re-invokes the agent with the full output when the job finishes.
     if tool == "bash" and session_id:
+        from src import bg_jobs
         _is_bg, _bg_cmd = _split_bg_marker(content)
-        if _is_bg and _bg_cmd:
-            from src import bg_jobs
-            rec = bg_jobs.launch(_bg_cmd, session_id=session_id, cwd=agent_cwd())
-            short = _bg_cmd.strip().split(chr(10))[0][:80]
+        _cmd = _bg_cmd if _is_bg else content.strip()
+        # A server/watcher (http.server, uvicorn, npm run dev, …) never returns —
+        # run in the foreground it would hang the whole chat turn. Auto-detach it
+        # even without an explicit #!bg marker, and (below) launch it uncapped so
+        # the runaway reaper doesn't mark a healthy long-lived server "failed".
+        _server_like = bg_jobs.looks_long_running(_cmd)
+        _auto_bg = (not _is_bg) and _server_like
+        if _cmd and (_is_bg or _auto_bg):
+            # Deliver the finish/timeout follow-up to the real chat, not a
+            # sub-agent's ephemeral steer-queue session — that session is torn
+            # down the moment the sub-agent ends, which orphaned the job (its
+            # follow-up could never be delivered, so it retried forever).
+            _deliver_session = session_id
+            try:
+                from src import subagent_runs
+                if subagent_runs.is_queue_session(session_id):
+                    _parent = subagent_runs.parent_session_for_queue(session_id)
+                    if _parent:
+                        _deliver_session = _parent
+            except Exception:
+                pass
+            _max_rt = 0 if _server_like else bg_jobs.DEFAULT_MAX_RUNTIME_S
+            rec = bg_jobs.launch(_cmd, session_id=_deliver_session, cwd=agent_cwd(),
+                                 max_runtime_s=_max_rt)
+            short = _cmd.split(chr(10))[0][:80]
             desc = f"bash (background): {short}"
+            _auto_note = (
+                "Detected a long-running server command and started it detached so it "
+                "won't block your turn (a foreground server never returns). "
+                if _auto_bg else ""
+            )
+            _finish_note = (
+                "It will keep serving until it exits or you stop it (uncapped)."
+                if _server_like else
+                "You will be automatically re-invoked with its full output when it finishes."
+            )
             result = {
                 "output": (
-                    f"Started background job `{rec['id']}`. It is running detached; "
-                    f"do NOT wait for it or poll it. You will be automatically re-invoked "
-                    f"with its full output when it finishes. Continue with other work, or "
-                    f"end your turn now and resume when the result arrives. If the user "
+                    f"{_auto_note}Started background job `{rec['id']}`. It is running detached; "
+                    f"do NOT wait for it or poll it. {_finish_note} Continue with other work, or "
+                    f"end your turn now. If the user "
                     f"later asks to check progress or stop it, call the manage_bg_jobs "
                     f"tool yourself (output or kill); do not tell them to run a tool "
                     f"command, and do not surface raw tool syntax in your reply."
@@ -828,7 +859,8 @@ async def _execute_tool_block_impl(
                 "exit_code": 0,
                 "bg_job_id": rec["id"],
             }
-            logger.info(f"Tool executed: {desc} -> bg job {rec['id']}")
+            logger.info(f"Tool executed: {desc} -> bg job {rec['id']} "
+                        f"(auto_bg={_auto_bg}, server_like={_server_like})")
             return desc, result
 
     # Route MCP-extracted tools through the MCP manager. Forward

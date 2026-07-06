@@ -12,7 +12,9 @@ Design goals:
     agent has actually been re-invoked, so completion can never silently
     "do nothing" — the monitor retries on the next tick.
   * Bounded: a hard max-runtime marks a runaway job failed and STILL triggers
-    a follow-up ("timed out"), so you always hear back.
+    a follow-up ("timed out"), so you always hear back. Server/watcher commands
+    (see looks_long_running) are launched uncapped (max_runtime_s=0) so the
+    reaper never mistakes a healthy long-lived server for a runaway.
 
 This module only owns launch + state. The monitor / agent re-invocation lives
 in the caller (so this stays import-light and unit-testable).
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -52,6 +55,54 @@ _MAX_OUTPUT_CHARS = 16000
 # files) is kept before pruning, so neither the store nor data/bg_jobs/ grows
 # without bound. The agent has already consumed the result by then.
 _RETENTION_S = 3600  # 1 hour after follow-up
+
+# Commands that never return on their own — servers / watchers that run until
+# killed. Two consequences: (1) launched in the FOREGROUND they hang the whole
+# chat turn (the user's "you blocked yourself when you launched the server"), so
+# the caller auto-detaches them; (2) the runaway reaper must NOT mark them
+# "failed" at the max-runtime cap — a server staying up is success, not failure —
+# so the caller launches them uncapped (max_runtime_s=0). Conservative: only
+# well-known server launchers match, checked against the command's first line.
+_LONG_RUNNING_RE = re.compile(
+    r"""(?xi)
+    (?:^|[;&|(]\s*)                      # a command position: start, or right
+                                         # after a shell separator ; && || | (
+                                         # — NOT a plain word-space, so a server
+                                         # NAME inside prose (echo "…uvicorn…")
+                                         # doesn't match.
+    (?:
+        python[0-9.]*\s+(?:-\S+\s+)*-m\s+http\.server |
+        python[0-9.]*\s+(?:-\S+\s+)*-m\s+uvicorn |
+        (?:uvicorn|gunicorn|hypercorn|daphne|waitress-serve) |
+        flask\s+run |
+        (?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|preview) |
+        (?:npx\s+)?(?:vite|next|nuxt|serve|http-server|live-server) |
+        node\s+\S*server |
+        php\s+-S |
+        ng\s+serve |
+        streamlit\s+run |
+        rails\s+server |
+        jekyll\s+serve
+    )
+    """
+)
+
+
+def looks_long_running(command: str) -> bool:
+    """Heuristic: does `command` start a server/watcher that runs until killed
+    (so it never produces a final exit code on its own)? Used to (a) auto-detach
+    it so it can't block the chat turn, and (b) exempt it from the runaway
+    max-runtime reaper. Conservative — only well-known server launchers match."""
+    if not command or not command.strip():
+        return False
+    # Check the first AND last non-empty lines — a server is often preceded by a
+    # `cd <dir>` line — but not middle prose (an `echo "starting uvicorn"` line
+    # would false-positive on the bare launcher names).
+    lines = [ln for ln in command.splitlines() if ln.strip()]
+    for ln in {lines[0], lines[-1]}:
+        if _LONG_RUNNING_RE.search(ln):
+            return True
+    return False
 
 
 def _load() -> Dict[str, Dict[str, Any]]:
@@ -207,8 +258,10 @@ def refresh() -> Dict[str, Dict[str, Any]]:
             rec["status"] = "done" if code == 0 else "failed"
             rec["ended_at"] = now
             changed = True
-        elif (now - rec.get("started_at", now)) > rec.get("max_runtime_s", DEFAULT_MAX_RUNTIME_S):
-            # Runaway / stuck — reap it but STILL surface a follow-up.
+        elif rec.get("max_runtime_s") and (now - rec.get("started_at", now)) > rec["max_runtime_s"]:
+            # Runaway / stuck — reap it but STILL surface a follow-up. A falsy
+            # max_runtime_s (0/None) means "uncapped" — a server launched to stay
+            # up until it dies or is killed, so the reaper skips it entirely.
             _kill(rec.get("pid"))
             rec["status"] = "failed"
             rec["exit_code"] = -1
