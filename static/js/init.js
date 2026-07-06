@@ -173,15 +173,22 @@ window.addEventListener('pageshow', clearFreshComposerRestore);
   const attachStrip = document.getElementById('attach-strip');
   const chatContainer = document.getElementById('chat-container');
   const _syncComposerClearance = () => {
-    let top = window.innerHeight;
+    // Measure against the visual viewport: on mobile the layout viewport
+    // (innerHeight) can exceed it (keyboard open, URL-bar collapse), which
+    // inflated the clearance and left a dead gap above the bottom edge.
+    const vpHeight = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+    let top = vpHeight;
     for (const el of [attachStrip, chatBar]) {
       if (!el) continue;
       const rect = el.getBoundingClientRect();
       if (rect.height > 0) top = Math.min(top, rect.top);
     }
-    const clearance = Math.max(12, Math.ceil(window.innerHeight - top + 8));
+    const clearance = Math.max(12, Math.ceil(vpHeight - top + 8));
     root.style.setProperty('--composer-clearance', clearance + 'px');
   };
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', _syncComposerClearance);
+  }
   requestAnimationFrame(_syncComposerClearance);
   if (typeof ResizeObserver !== 'undefined') {
     const ro = new ResizeObserver(_syncComposerClearance);

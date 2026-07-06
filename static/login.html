@@ -6,7 +6,7 @@
 <title>Odysseus — Login</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 4L16 22L6 22Z' fill='%23e06c75'/%3E%3Cpath d='M16 8L16 22L24 22Z' fill='%23e06c75' opacity='0.6'/%3E%3Cpath d='M4 24Q10 20 16 24Q22 28 28 24' stroke='%23e06c75' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="manifest" href="/static/manifest.json">
-<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=20260705sailboat">
 <script nonce="{{CSP_NONCE}}">
 (function(){
   // Per-theme bg-effect defaults — mirrors THEME_DEFAULT_* maps in
@@ -228,7 +228,7 @@
   .remember-toggle:hover .remember-dot {
     border-color: color-mix(in srgb, var(--fg) 40%, transparent);
   }
-  .logo-boat { width: 1.6rem; height: 1.6rem; margin-right: 0.4rem; vertical-align: -0.15em; color: var(--red); }
+  .logo-boat { width: 3.4rem; height: 1.6rem; margin-right: 0.4rem; vertical-align: -0.35em; color: var(--red); }
   .version-label {
     position: fixed; bottom: 12px; right: 16px;
     font-size: 0.7rem; opacity: 0.25;
@@ -248,12 +248,51 @@
     vertical-align: -3px;
   }
   @keyframes login-spin { to { transform: rotate(360deg); } }
+  /* Sailing logo — rolling waves the boat rides before settling. Mirrors
+     the .sail-boat scene rules in style.css so the login page (which
+     doesn't load style.css) gets the same effect. See style.css for the
+     physics notes (damped oscillation matched to the front-wave period). */
+  @keyframes sail-wave-roll { from { transform: translateX(0); } to { transform: translateX(-28px); } }
+  @keyframes sail-sea-calm { 0% { transform: scaleY(1); } 60% { transform: scaleY(1); } 100% { transform: scaleY(0.5); } }
+  @keyframes sail-ride {
+    0% { transform: translate(-38px, 0.5px) rotate(-8deg); opacity: 0; }
+    6% { opacity: 1; }
+    10% { transform: translate(-27px, -5.5px) rotate(6deg); }
+    21% { transform: translate(-17px, 4.5px) rotate(-5.5deg); }
+    31% { transform: translate(-10px, -3.8px) rotate(4.5deg); }
+    42% { transform: translate(-5px, 3px) rotate(-3.4deg); }
+    52% { transform: translate(-2px, -2.2px) rotate(2.5deg); }
+    63% { transform: translate(-0.5px, 1.5px) rotate(-1.7deg); }
+    73% { transform: translate(0, -1px) rotate(1.1deg); }
+    84% { transform: translate(0, 0.6px) rotate(-0.6deg); }
+    92% { transform: translate(0, -0.25px) rotate(0.25deg); }
+    100% { transform: translate(0, 0) rotate(0); }
+  }
+  .sail-boat .sail-ride-boat {
+    transform-box: view-box;
+    transform-origin: 50% 85%;
+    animation: sail-ride 4.6s linear both;
+    animation-timing-function: ease-in-out;
+  }
+  .sail-boat .sail-sea {
+    transform-box: view-box;
+    transform-origin: 50% 100%;
+    animation: sail-sea-calm 4.6s linear both;
+  }
+  .sail-boat .sail-wave-front { animation: sail-wave-roll 1.9s linear infinite; }
+  .sail-boat .sail-wave-back { animation: sail-wave-roll 3.1s linear infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .sail-boat, .sail-boat * {
+      animation: none !important;
+      transition: none !important;
+    }
+  }
 </style>
 </head>
 <body>
 <main class="card">
   <h1 class="logo">
-    <svg class="logo-boat" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d="M16 4L16 22L6 22Z" fill="currentColor"/><path d="M16 8L16 22L24 22Z" fill="currentColor" opacity="0.6"/><path d="M4 24Q10 20 16 24Q22 28 28 24" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg><span>Odysseus</span>
+    <svg class="logo-boat sail-boat" viewBox="0 0 120 56" aria-hidden="true" focusable="false"><g class="sail-ride-boat"><rect x="59" y="10" width="1.6" height="24" rx="0.8" fill="currentColor" opacity="0.9"/><path d="M 59 11 L 59 32 L 42 32 Q 51 26 59 11 Z" fill="currentColor"/><path d="M 62 14 L 62 32 L 75 32 Q 68 27 62 14 Z" fill="currentColor" opacity="0.55"/><path d="M 38 35 L 82 35 L 75 43 Q 60 46 45 43 Z" fill="currentColor" opacity="0.85"/></g><g class="sail-sea"><path class="sail-wave-back" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.35" d="M -28 46 Q -21 41 -14 46 T 0 46 T 14 46 T 28 46 T 42 46 T 56 46 T 70 46 T 84 46 T 98 46 T 112 46 T 126 46 T 140 46 T 154 46"/><path class="sail-wave-front" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" opacity="0.8" d="M -28 50 Q -21 44.5 -14 50 T 0 50 T 14 50 T 28 50 T 42 50 T 56 50 T 70 50 T 84 50 T 98 50 T 112 50 T 126 50 T 140 50 T 154 50"/></g></svg><span>Odysseus</span>
   </h1>
   <p class="setup-note" id="setupNote" style="display:none"></p>
 

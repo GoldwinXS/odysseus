@@ -78,6 +78,7 @@ function _handlePickerKeydown(e, listEl, itemSelector, closeFn) {
 let _deps = null;
 let _autoSelectingDefault = false;
 let _defaultChatPickInFlight = false;
+let _defaultChatLastAttempt = 0;
 
 function _modelExists(modelId, url) {
   if (!modelId || !window.modelsModule || !window.modelsModule.getCachedItems) return false;
@@ -128,7 +129,17 @@ async function _ensureDefaultPendingChat() {
   if (!_deps || _defaultChatPickInFlight) return;
   if (_deps.getCurrentSessionId && _deps.getCurrentSessionId()) return;
   const pending = _deps.getPendingChat && _deps.getPendingChat();
-  if (pending && pending.modelId) return;
+  // A real user pick is final. A speculative auto pick (first-available
+  // fallback) stays upgradeable: at cold start the local endpoint's model
+  // list loads before remote endpoints' lists, so the configured default
+  // fails _modelExists and the picker used to stick on an arbitrary local
+  // model forever. We keep retrying until the default endpoint's list is in.
+  if (pending && pending.modelId && !pending.auto) return;
+  const cachedDc = window.__odysseusDefaultChat;
+  if (cachedDc && pending && pending.modelId === cachedDc.model) return;
+  const now = Date.now();
+  if (_defaultChatLastAttempt && now - _defaultChatLastAttempt < 2000) return;
+  _defaultChatLastAttempt = now;
   _defaultChatPickInFlight = true;
   try {
     await _ensureModelCacheForFallback();
@@ -148,8 +159,10 @@ async function _ensureDefaultPendingChat() {
       updateModelPicker();
       return;
     }
-    // No configured default, or the configured default is gone/offline:
-    // preserve the convenience fallback and keep the picker usable.
+    // Configured default not resolvable yet (its endpoint's model list may
+    // still be loading): keep any existing auto pick rather than demoting to
+    // first-available; the next updateModelPicker retries the upgrade.
+    if (pending && pending.modelId) return;
     const fallback = _firstAvailableModel();
     if (fallback) {
       _deps.setPendingChat(fallback);
@@ -780,6 +793,10 @@ export function updateModelPicker() {
     if (fallback) {
       _deps.setPendingChat(fallback);
       modelId = fallback.modelId;
+      // Speculative pick: also kick the async configured-default resolution
+      // so this upgrades to the real default once its endpoint list arrives
+      // (self-guarded against loops/backoff inside).
+      _ensureDefaultPendingChat();
     }
   }
 
@@ -792,7 +809,15 @@ export function updateModelPicker() {
       if (item.offline) return;
       (item.models || []).concat(item.models_extra || []).forEach(m => allAvailable.push(m));
     });
-    if (allAvailable.length > 0 && !allAvailable.includes(modelId)) {
+    // If the pending model's own endpoint is online but hasn't delivered its
+    // model list yet (remote endpoints load after local ones), treat it as
+    // "unknown", not "vanished" — otherwise the configured default gets
+    // demoted to an arbitrary local model during the load window.
+    const _pendingUrl = ((_pendingChat && _pendingChat.url) || '').replace(/\/+$/, '');
+    const _pendingEntry = items.find(it => ((it.url || '').replace(/\/+$/, '')) === _pendingUrl);
+    const _pendingListLoading = !!(_pendingEntry && !_pendingEntry.offline &&
+      ((_pendingEntry.models || []).length + (_pendingEntry.models_extra || []).length) === 0);
+    if (allAvailable.length > 0 && !allAvailable.includes(modelId) && !_pendingListLoading) {
       // Model no longer available — switch to first available
       const fallback = items.find(item => !item.offline && (item.models || []).length > 0);
       if (fallback) {

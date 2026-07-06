@@ -163,37 +163,17 @@ html {
 :root.density-spacious .sidebar .section { padding: 0; }
 
 /* ── UI text-size scale (accessibility) ──
-   Density only changes the root font-size, which can't move the many
-   hard-coded px sizes. `zoom` scales the whole UI uniformly (px text
-   included) while keeping layout intact, unlike `transform: scale`. */
-:root.ui-scale-125 { zoom: 1.25; }
-/* `zoom` makes the 100dvh shell render taller than the real viewport, which
-   pushes the bottom-pinned sidebar account/settings row below the fold (and
-   body's overflow:hidden then clips it). Shrink the shell by the same factor
-   so it fits the viewport exactly. */
-:root.ui-scale-125 body { height: calc(100dvh / 1.25); }
-/* Modals/panels under the 1.25x scale: zoom renders a centred, viewport-sized
-   panel ~1.25x taller, pushing its draggable header + close button off-screen
-   (a catch-22 — you can't reach the control to turn the size back down). Divide
-   each max-height by the same factor to keep the original on-screen footprint.
-   Desktop only — the mobile `!important` full-sheet rules win on small screens
-   and stay top-anchored, so their headers are already visible. */
-:root.ui-scale-125 .modal-content          { max-height: calc(85dvh / 1.25); }
-:root.ui-scale-125 .cal-modal-content      { max-height: calc(88dvh / 1.25); }
-:root.ui-scale-125 .settings-modal-content { max-height: calc(85dvh / 1.25); }
-:root.ui-scale-125 #theme-popup            { max-height: min(calc(85dvh / 1.25), 480px); }
-/* Cookbook is the one modal that set its height inline (94vh), which beat the
-   .modal-content compensation above and overflowed the viewport at 1.25x
-   (header + close button pushed off-screen). Own its height here so the same
-   zoom compensation applies. */
+   The v1 `zoom: 1.25` implementation (and its whole family of
+   `:root.ui-scale-125 ... / 1.25` height compensators that used to live
+   here) is GONE — the body-height compensator was itself a bug factory:
+   with the class applied but zoom unsupported/overridden, body shrank to
+   80% of the viewport, leaving a dead band under the whole app (chat,
+   sidebar, everything). Text size is now a scoped font-size multiplier:
+   theme.js sets `--chat-text-scale` on <html> and only the chat message
+   area consumes it (see #chat-container / .chat-input-bar textarea rules).
+   These two height rules survive because other styles depend on them. */
 #cookbook-modal .modal-content             { height: 94vh; max-height: 94vh; }
-:root.ui-scale-125 #cookbook-modal .modal-content { height: calc(94dvh / 1.25); max-height: calc(94dvh / 1.25); }
-/* PDF export modal also set its height inline (86vh) at v1.0; that inline cap
-   beat the .modal-content compensation above and shifted ~1vh at Default when
-   removed. Own its height here so Default is byte-for-byte 86vh and the same
-   1.25x compensation applies. */
 .pdf-export-overlay .modal-content { max-height: 86vh; }
-:root.ui-scale-125 .pdf-export-overlay .modal-content { max-height: calc(86dvh / 1.25); }
 
 /* ── Background Patterns ── */
 
@@ -521,7 +501,7 @@ body.bg-pattern-sparkles {
     }
 
     .user-bar-name {
-      font-size: 9.75px;
+      font-size: 13px;
       font-weight: 500;
       color: var(--fg);
       opacity: 0.8;
@@ -596,6 +576,15 @@ body.bg-pattern-sparkles {
       align-items: center;
       flex-shrink: 0;
       min-height: 24px;
+      overflow: visible;
+    }
+    .sidebar-brand-boat {
+      /* 120:56 scene viewBox — keep the aspect so waves aren't squashed */
+      width: 2.1rem;
+      height: 1rem;
+      margin-right: 0.35rem;
+      flex-shrink: 0;
+      color: var(--brand-color, var(--red));
     }
     .sidebar-brand-title {
       font-size: 1rem;
@@ -1185,7 +1174,7 @@ body.bg-pattern-sparkles {
       flex: 1; cursor: pointer; user-select: none;
       display: flex; align-items: center; gap: 6px;
       margin: 0; padding: 0; border: none;
-      font-size: 10px; font-weight: 400; font-family: inherit;
+      font-size: 13px; font-weight: 400; font-family: inherit;
       /* 1.3 (not 1) so Fira Code's tall glyph box isn't vertically clipped in
          Chromium/Edge — mirrors the .list-item fix. The title is flex-centred
          in a fixed-height (29px) header, so this adds headroom without reflow. */
@@ -1695,7 +1684,7 @@ body.bg-pattern-sparkles {
       border-radius: 4px;
       border: none;
       line-height: 1.3;
-      font-size: 13px;
+      font-size: 13.5px;
       background: transparent;
       transition: background 0.08s;
       cursor: pointer;
@@ -1779,7 +1768,7 @@ body.bg-pattern-sparkles {
     }
     .list-item span {
       color: var(--fg);
-      font-size: 9.75px;
+      font-size: 13.5px;
     }
     .grow {
       flex: 1;
@@ -1840,6 +1829,11 @@ body.bg-pattern-sparkles {
       margin-bottom: 0;
       transition: margin-left 160ms cubic-bezier(0.22, 0.61, 0.36, 1),
                   margin-right 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
+      /* "Text size" accessibility setting (theme.js applyUiScale). Scoped to
+         the chat area only — `.msg` / `.msg .body` are sized in `em` so they
+         inherit this; nothing outside #chat-container reads the var, so
+         modals/fixed panels/100dvh shells are unaffected. */
+      font-size: calc(1em * var(--chat-text-scale, 1));
     }
     .chat-meta { font-size:12px; color:color-mix(in srgb, var(--fg) 60%, transparent); margin-bottom:6px; }
     .chat-history {
@@ -1933,10 +1927,12 @@ body.bg-pattern-sparkles {
       margin-bottom:10px;
     }
     .welcome-boat {
-      width: 1.8rem;
-      height: 1.8rem;
-      margin-right: 0.4rem;
-      vertical-align: -0.15em;
+      /* Welcome-screen showpiece: the full sailing scene (120:56 viewBox),
+         block-centered above the name instead of an inline glyph. */
+      display: block;
+      width: 11rem;
+      height: 5.1rem;
+      margin: 0 auto 0.4rem;
       color: var(--brand-color, var(--red));
     }
     #welcome-screen .welcome-sub {
@@ -2053,7 +2049,7 @@ body.bg-pattern-sparkles {
       word-wrap: break-word;
       overflow-wrap: break-word;
       overflow: hidden;
-      animation: msg-enter 0.3s ease-out both;
+      animation: msg-enter 0.22s ease-out both;
     }
     .msg-user {
       align-items: flex-end;
@@ -2349,6 +2345,13 @@ body.bg-pattern-sparkles {
 
     /* Unified chat input bar */
     .chat-input-bar {
+      /* Single source of truth for the composer control row: every icon
+         button, the workspace chip, the Agent/Chat toggle, and the + button
+         are sized off this so they can never drift apart again. There's a
+         mobile override of this same variable in the @media(max-width:768px)
+         block (search "Composer control row" in this file) — update both if
+         this ever changes. */
+      --composer-ctrl-h: 32px;
       background: var(--input-bg, var(--panel));
       border: 1px solid var(--input-border, var(--border));
       border-radius: 16px;
@@ -2360,6 +2363,14 @@ body.bg-pattern-sparkles {
       margin-left: auto;
       margin-right: auto;
       width: 100%;
+    }
+    /* Desktop: inset the composer from the window bottom so it reads as a
+       floating card (matches .chat-container's 16px side padding). The mobile
+       block keeps its own safe-area padding — do not apply this there. */
+    @media (min-width: 769px) {
+      .chat-input-bar {
+        margin-bottom: 16px;
+      }
     }
     .chat-input-top {
       width: 100%;
@@ -2388,7 +2399,9 @@ body.bg-pattern-sparkles {
       white-space: pre-wrap;
       overflow-wrap: break-word;
       font-family: inherit;
-      font-size: 14px;
+      /* Must track textarea#message's font-size exactly (same var/calc) so
+         the ghost suggestion overlay stays character-aligned with real input. */
+      font-size: calc(14px * var(--chat-text-scale, 1));
       line-height: 1.5;
       padding: 0;
       border: 1px solid transparent;
@@ -2404,7 +2417,9 @@ body.bg-pattern-sparkles {
       border: none;
       outline: none;
       resize: none;
-      font-size: 14px;
+      /* Fixed px (not em) so it doesn't compound with .chat-input-bar's own
+         inherited em scaling — scale explicitly off the same var instead. */
+      font-size: calc(14px * var(--chat-text-scale, 1));
       line-height: 1.5;
       color: var(--fg);
       min-height: 24px;
@@ -2436,7 +2451,7 @@ body.bg-pattern-sparkles {
     }
     .chat-input-left {
       display: flex;
-      gap: 4px;
+      gap: 8px;
       align-items: center;
       flex-wrap: nowrap;
       overflow: hidden;
@@ -2476,13 +2491,25 @@ body.bg-pattern-sparkles {
       color: var(--fg);
       opacity: 0.5;
       cursor: pointer;
-      padding: 6px;
+      /* Fixed control height (not padding-driven) so a plain icon button and
+         a text-bearing one (.tool-indicator, e.g. the workspace chip) come
+         out exactly the same height — width stays auto so labeled chips can
+         grow horizontally without going oval. */
+      height: var(--composer-ctrl-h);
+      min-width: var(--composer-ctrl-h);
+      padding: 0 7px;
+      box-sizing: border-box;
       border-radius: 8px;
       display: flex;
       align-items: center;
       justify-content: center;
       transition: opacity 0.15s, background 0.15s, color 0.15s;
       position: relative;
+    }
+    .input-icon-btn svg {
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
     }
     .input-icon-btn:hover {
       opacity: 0.8;
@@ -2620,9 +2647,15 @@ body.bg-pattern-sparkles {
       color: #fff;
       border: none;
       border-radius: 8px;
-      min-width: 32px;
-      width: 32px;
-      height: 32px !important;
+      /* Same control height as the rest of the composer row (icon buttons,
+         workspace chip, Agent/Chat toggle) — stays its existing shape/accent
+         color, just not oversized. On mobile the box is exactly square so
+         an 8px radius still reads visually close to circular for a small
+         icon-only button; the expand-to-pill states (newchat-expanded,
+         mic recording) are unaffected since they don't touch radius. */
+      min-width: var(--composer-ctrl-h, 32px);
+      width: var(--composer-ctrl-h, 32px);
+      height: var(--composer-ctrl-h, 32px) !important;
       padding: 0;
       cursor: pointer;
       display: flex;
@@ -2774,11 +2807,13 @@ body.bg-pattern-sparkles {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.7; }
     }
-    /* Mode toggle — Agent / Chat */
+    /* Mode toggle — Agent / Chat. Height pinned to --composer-ctrl-h so it
+       matches every other control in the composer row (falls back to 28px
+       for any other .mode-toggle usage outside the composer). */
     .mode-toggle {
       display: flex;
       flex-shrink: 0;
-      height: 28px;
+      height: var(--composer-ctrl-h, 28px);
       border: 1px solid var(--border);
       border-radius: 10px;
       overflow: hidden;
@@ -2856,6 +2891,85 @@ body.bg-pattern-sparkles {
         content: 'Unif';
         font-size: 11px;
       }
+    }
+    /* Reasoning-effort selector — a single compact button (mirrors the
+       .mode-toggle-btn text/height idiom) that opens a small popover menu
+       (mirrors .model-picker-menu's positioning/chrome). Drops out of the
+       composer row at the same container-query breakpoint as .mode-toggle —
+       it is the same "nice to have, textarea always wins" priority tier. */
+    .reasoning-effort-wrap {
+      position: relative;
+      flex-shrink: 0;
+    }
+    .reasoning-effort-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: var(--composer-ctrl-h, 28px);
+      padding: 0 10px;
+      font-size: 11px;
+      font-weight: 500;
+      font-family: inherit;
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: color-mix(in srgb, var(--fg) 40%, transparent);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: color 0.2s, background 0.15s;
+    }
+    .reasoning-effort-btn:hover {
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+    }
+    .reasoning-effort-btn.effort-active {
+      color: var(--fg);
+    }
+    /* Unsupported-by-current-model state: same muted treatment as a disabled
+       control, but still clickable (the choice just won't apply until the
+       user switches to a supporting model) — no dead-end UI. */
+    .reasoning-effort-btn.effort-unsupported {
+      opacity: 0.45;
+    }
+    .reasoning-effort-menu {
+      position: absolute;
+      bottom: calc(100% + 8px);
+      right: 0;
+      z-index: 250;
+      min-width: 120px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 -4px 20px rgba(0,0,0,0.4);
+      padding: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    .reasoning-effort-menu.hidden { display: none; }
+    .reasoning-effort-item {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: none;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      color: color-mix(in srgb, var(--fg) 70%, transparent);
+      cursor: pointer;
+    }
+    .reasoning-effort-item:hover {
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      color: var(--fg);
+    }
+    .reasoning-effort-item.active {
+      color: var(--fg);
+      font-weight: 600;
+    }
+    @container chatbar (max-width: 340px) {
+      .chat-input-right .reasoning-effort-wrap { display: none !important; }
     }
     /* Message count badge in the chat-meta header (next to the title).
        Auto-hides when empty so a brand-new chat doesn't show "0 msgs". */
@@ -4194,15 +4308,17 @@ body.bg-pattern-sparkles {
        to right) so the motion still reads naturally. */
     body:has(.notes-pane.modal-right-docked) .toast {
       right: auto;
-      left: 16px;
+      left: max(16px, env(safe-area-inset-left, 0px));
       transform: translateX(-120%);
     }
     body:has(.notes-pane.modal-right-docked) .toast.show { transform: translateX(0); }
     body:has(.notes-pane.modal-right-docked) .toast.exiting { transform: translateX(120%); }
     @media (max-width: 768px) {
       .toast {
-        top: 12px;
-        right: 12px;
+        /* Notch/rounded-corner safe area — top in portrait, right (or left,
+           when docked — see below) in landscape. */
+        top: max(12px, env(safe-area-inset-top, 0px));
+        right: max(12px, env(safe-area-inset-right, 0px));
         max-width: calc(100vw - 24px);
         /* Receive touches so the swipe-to-dismiss gesture works (desktop keeps
            pointer-events:none so the toast never blocks clicks). Horizontal pan
@@ -4297,10 +4413,31 @@ body.bg-pattern-sparkles {
     }
     @media (max-width:768px){
       .box { max-height:none; }
-      .chat-container { padding:10px; flex:1; margin-top:0; padding-top:42px; min-height:0; }
+      /* padding-top reserves room for the compact .chat-top-bar header below;
+         add the notch/status-bar safe area on top of the existing 42px so the
+         header doesn't get pulled up under the notch in portrait. */
+      /* padding-bottom is 0 here (not 10px) because .chat-input-bar — the
+         last child, flush against the bottom edge — already reserves its own
+         "10px + env(safe-area-inset-bottom)" below (see ~4611). Stacking a
+         flat 10px here on top of that gave a double gap: 20px + the ~34px
+         home-indicator inset read as one big dead band under the composer.
+         The composer is the single owner of the bottom safe-area inset. */
+      .chat-container { padding:10px; padding-bottom:0; flex:1; margin-top:0; padding-top:calc(42px + env(safe-area-inset-top, 0px)); min-height:0; }
       .scroll-nav-btn { width:44px; height:44px; font-size:14px; margin-bottom:0; }
-      .send-btn { width:48px; height:48px !important; border-radius:12px; }
-      .send-btn svg { width:22px; height:22px; }
+      /* Composer control row: one shared height on mobile too (bumped up
+         from the 32px desktop value for touch, but kept equal across the
+         icon buttons, workspace chip, Agent/Chat toggle, and + button —
+         previously this button alone jumped to 48px while its neighbors
+         stayed 34/44px, which read as "one oversized control"). */
+      .chat-input-bar {
+        --composer-ctrl-h: 36px;
+        /* Tighter composer chrome on mobile: paddings/gaps only (touch
+           heights stay 36px), reclaiming ~15px of transcript space. */
+        padding: 6px 10px;
+        gap: 5px;
+      }
+      .send-btn { width: var(--composer-ctrl-h); height: var(--composer-ctrl-h) !important; border-radius:10px; }
+      .send-btn svg { width:18px; height:18px; }
       #compare-toggle-btn { display:none !important; }
       .section[draggable] { -webkit-user-drag:none; }
       .drag-handle, .item-drag-handle, .folder-drag-handle { display:none !important; }
@@ -4351,15 +4488,35 @@ body.bg-pattern-sparkles {
         -webkit-overflow-scrolling: touch;
         overscroll-behavior-y: auto;
         overflow-y: scroll !important;
-        padding-bottom: 40px;
+        /* Was a flat 40px — that read as a dead band between the last menu
+           item and the account row below. .sidebar-inner isn't the bottom
+           edge of the drawer (`.sidebar-user-bar` sits after it and owns the
+           home-indicator safe area, see below), so this only needs enough
+           bounce room to not feel clipped mid-scroll. */
+        padding-bottom: 8px;
       }
       .sidebar:not(.hidden) {
         overscroll-behavior: auto;
       }
-      /* Sidebar header — room for hamburger */
+      /* Sidebar user/account row — the true bottom edge of the drawer
+         (.sidebar spans top:0/bottom:0). It had no safe-area padding at all,
+         so on notched iPhones it sat flush under the home-indicator strip.
+         Own the inset here (single layer) rather than padding .sidebar-inner
+         above it, which only pushed the gap earlier without clearing the bar. */
+      .sidebar-user-bar {
+        padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+      }
+      /* Sidebar header — room for hamburger. The drawer is pinned to the
+         left edge (or right, via .right-side) and spans full height, so it
+         needs both the top inset (portrait notch) and the leading-edge
+         inset (landscape notch) added to the existing padding. */
       .sidebar-header {
-        padding: 18px 12px 8px 12px;
+        padding: max(18px, env(safe-area-inset-top, 0px)) 12px 8px max(12px, env(safe-area-inset-left, 0px));
         min-height: 44px;
+      }
+      .sidebar.right-side .sidebar-header {
+        padding-left: 12px;
+        padding-right: max(40px, env(safe-area-inset-right, 0px));
       }
       .sidebar-brand-title {
         font-size: 1.2rem;
@@ -4421,12 +4578,16 @@ body.bg-pattern-sparkles {
       .section-header-flex h4::before {
         height: 18px;
       }
-      /* Compact top bar on mobile — align with sidebar header */
+      /* Compact top bar on mobile — align with sidebar header. The
+         margin-top/padding-top pair cancel out (pulling the bar up into the
+         reserved .chat-container padding, then padding it back down by the
+         same amount) — grown by the safe-area inset so the header content
+         itself clears the notch instead of sitting under it. */
       .chat-top-bar {
         padding: 1px 8px;
         min-height: 14px;
-        margin-top: -31px;
-        padding-top: 31px;
+        margin-top: calc(-31px - env(safe-area-inset-top, 0px));
+        padding-top: calc(31px + env(safe-area-inset-top, 0px));
       }
       .chat-top-bar .chat-new-btn { display: none; }
       .chat-meta-overlay { font-size: 0.65em; max-width: 55%; overflow: visible; left: 50%; top: 50%; transform: translate(-50%, -50%); position: absolute; }
@@ -4483,11 +4644,14 @@ body.bg-pattern-sparkles {
         padding: 12px 10px;
         min-height: 48px;
       }
-      /* Input icon buttons — bigger touch targets */
+      /* Input icon buttons — sized off the shared composer control height
+         (36px on mobile) so they stay equal to the workspace chip, the
+         Agent/Chat toggle, and the + button instead of ballooning to 44px
+         on their own. */
       .input-icon-btn {
-        padding: 10px;
-        min-width: 44px;
-        min-height: 44px;
+        padding: 0 8px;
+        min-width: var(--composer-ctrl-h, 36px);
+        height: var(--composer-ctrl-h, 36px);
       }
       /* Tool indicators — icon only on mobile (hide text, keep x) */
       .tool-indicator > span {
@@ -4501,9 +4665,11 @@ body.bg-pattern-sparkles {
       .hamburger-btn {
         width: 44px;
         height: 44px;
-        top: 6px;
+        /* Notch/rounded-corner safe area — top in portrait, right in
+           landscape (this button is pinned to the right edge on mobile). */
+        top: max(6px, env(safe-area-inset-top, 0px));
         left: auto !important;
-        right: 4px !important;
+        right: max(4px, env(safe-area-inset-right, 0px)) !important;
         -webkit-tap-highlight-color: transparent;
       }
       .hamburger-btn:hover,
@@ -4516,8 +4682,10 @@ body.bg-pattern-sparkles {
       .mobile-new-chat-btn {
         display: flex;
         position: fixed;
-        top: 12px;
-        left: 8px;
+        /* Notch/rounded-corner safe area — top in portrait, left in
+           landscape (this button is pinned to the left edge on mobile). */
+        top: max(12px, env(safe-area-inset-top, 0px));
+        left: max(8px, env(safe-area-inset-left, 0px));
         z-index: 210;
         width: 32px;
         height: 32px;
@@ -4586,13 +4754,15 @@ body.bg-pattern-sparkles {
         padding: 6px !important;
         border-radius: 12px !important;
       }
-      /* Safe area padding for notched devices */
+      /* Safe area padding for notched devices (base tightened 10px -> 6px
+         to match the mobile composer padding above) */
       .chat-input-bar {
-        padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+        padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
       }
-      /* Mode toggle — larger touch targets */
+      /* Mode toggle — larger touch targets. Height now comes from
+         --composer-ctrl-h (see the mobile override set once above, next to
+         .send-btn) so it stays equal to the icon buttons/chip/+ button. */
       .mode-toggle {
-        height: 34px;
         border-radius: 12px;
       }
       .mode-toggle::before {
@@ -9403,6 +9573,33 @@ body.fullwidth-chat .chat-history {
   color: var(--red);
   letter-spacing: -1px;
 }
+/* Claude-app-style preamble caption: the short sentence the model streamed
+   right before this tool call, shown as a muted subtitle under the chip
+   header (e.g. "Checking the renderer for where sprites are drawn."). */
+.agent-thread-caption {
+  font-size: 0.82em;
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+  padding: 0 0 2px 22px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-thread-caption-inline {
+  font-size: 0.85em;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: 2px;
+}
+.agent-thread-caption-inline::before {
+  content: "·";
+  opacity: 0.5;
+  margin-right: 4px;
+}
 /* Live "cooking" timer on a running tool — prominent (accent, tabular) so a
    long-running command always reads as alive, not frozen. */
 .agent-thread-elapsed {
@@ -9465,6 +9662,53 @@ body.fullwidth-chat .chat-history {
   overflow-x: auto;
 }
 
+/* Collapsed tool-group summary — Claude-app style "Used N tools: ..." one-
+   liner that replaces the whole chip list until clicked. Reuses the same
+   muted color-mix convention as .agent-thread-caption above (no dedicated
+   --muted var in this codebase) and the same chevron-rotate idiom as
+   .agent-thread-chevron. Sits ABOVE the .agent-thread-node children inside
+   the same .agent-thread container (see ensureAgentThreadSummary in
+   chatRenderer.js) — collapsed state hides the nodes via the sibling rule
+   below rather than removing them from the DOM. */
+.agent-thread-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.85em;
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+  user-select: none;
+  padding: 2px 0 4px 0;
+}
+.agent-thread-summary:hover {
+  color: color-mix(in srgb, var(--fg) 75%, transparent);
+}
+.agent-thread-summary:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--fg) 40%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.agent-thread-summary-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-thread-summary-chevron {
+  font-size: 0.7em;
+  transition: transform 0.2s ease;
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+/* Expanded (not .collapsed): chevron points down, nodes visible below the
+   summary line (which stays as the "hide" affordance — click collapses). */
+.agent-thread:not(.collapsed) .agent-thread-summary-chevron {
+  transform: rotate(90deg);
+}
+/* Collapsed: hide every chip below the summary line. */
+.agent-thread.collapsed .agent-thread-node {
+  display: none;
+}
+
 /* Mobile: constrain thread content */
 @media (max-width: 768px) {
   .agent-thread {
@@ -9492,6 +9736,9 @@ body.fullwidth-chat .chat-history {
   .agent-thread-dot {
     left: -16px;
     top: 10px;
+  }
+  .agent-thread-summary {
+    font-size: 0.8em;
   }
 }
 
@@ -23033,7 +23280,7 @@ body.gallery-selecting .gallery-dl-btn,
   background: none;
   color: color-mix(in srgb, var(--fg) 60%, transparent);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 13.5px;
   font-weight: 500;
   cursor: pointer;
   border-radius: 6px;
@@ -23266,12 +23513,98 @@ body:not(.welcome-ready) #welcome-screen {
 @keyframes msg-enter {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Tool-call chip entrance — subtle scale-in so a new chip in the agent
+   thread doesn't just pop into place. Same insertion-time-only gate as
+   .msg below (bulk history render adds .no-animate to #chat-history). */
+@keyframes tool-chip-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.agent-thread-node {
+  animation: tool-chip-in 0.2s ease-out both;
+}
+
+/* ── Sailing logo ──
+   A layered scene (.sail-boat svg, viewBox 0 0 120 56): rolling waves the
+   boat visibly RIDES before settling. Three animations compose it:
+   - sail-wave-roll: each wave path repeats a 28-unit wavelength and spans
+     past the viewBox; sliding left one wavelength and looping = a seamless
+     rolling sea. Front wave rolls faster (1.9s) than the back (3.1s) for
+     parallax. Runs forever, but the sea calms (below) so it reads as still.
+   - sail-sea-calm: the swell dies down — wave GROUP flattens via scaleY
+     once the boat has settled.
+   - sail-ride: the boat drifts in from port and rides the front wave —
+     heave (translateY) and pitch (rotate) follow a damped oscillation
+     matched to the 1.9s wave period (keyframes every ~10.5% of 4.6s with
+     decaying amplitude). Timing is LINEAR overall so the keyframe spacing
+     IS the physics; per-segment ease-in-out smooths crests and troughs.
+   Drift happens inside the viewBox (svg clips itself), so wrappers need no
+   overflow handling. Plays once per element; waves keep a calm slow roll. */
+@keyframes sail-wave-roll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-28px); }
+}
+@keyframes sail-sea-calm {
+  0% { transform: scaleY(1); }
+  60% { transform: scaleY(1); }
+  100% { transform: scaleY(0.5); }
+}
+@keyframes sail-ride {
+  0% { transform: translate(-38px, 0.5px) rotate(-8deg); opacity: 0; }
+  6% { opacity: 1; }
+  10% { transform: translate(-27px, -5.5px) rotate(6deg); }
+  21% { transform: translate(-17px, 4.5px) rotate(-5.5deg); }
+  31% { transform: translate(-10px, -3.8px) rotate(4.5deg); }
+  42% { transform: translate(-5px, 3px) rotate(-3.4deg); }
+  52% { transform: translate(-2px, -2.2px) rotate(2.5deg); }
+  63% { transform: translate(-0.5px, 1.5px) rotate(-1.7deg); }
+  73% { transform: translate(0, -1px) rotate(1.1deg); }
+  84% { transform: translate(0, 0.6px) rotate(-0.6deg); }
+  92% { transform: translate(0, -0.25px) rotate(0.25deg); }
+  100% { transform: translate(0, 0) rotate(0); }
+}
+.sail-boat .sail-ride-boat {
+  transform-box: view-box;
+  transform-origin: 50% 85%;
+  animation: sail-ride 4.6s linear both;
+  animation-timing-function: ease-in-out;
+}
+.sail-boat .sail-sea {
+  transform-box: view-box;
+  transform-origin: 50% 100%;
+  animation: sail-sea-calm 4.6s linear both;
+}
+.sail-boat .sail-wave-front {
+  animation: sail-wave-roll 1.9s linear infinite;
+}
+.sail-boat .sail-wave-back {
+  animation: sail-wave-roll 3.1s linear infinite;
+}
+/* Welcome-screen extra: after the ride settles, the boat keeps an
+   almost-imperceptible harbor bob (chained second animation) so the big
+   scene feels alive at rest without drawing the eye. */
+@keyframes sail-idle {
+  0%, 100% { transform: translate(0, 0) rotate(0); }
+  30% { transform: translate(0, -0.9px) rotate(0.7deg); }
+  65% { transform: translate(0, 0.7px) rotate(-0.55deg); }
+}
+.welcome-boat .sail-ride-boat {
+  animation: sail-ride 4.6s both, sail-idle 7s 4.6s infinite;
+  animation-timing-function: ease-in-out, ease-in-out;
 }
 
 @keyframes picker-roll-up {
@@ -23371,7 +23704,8 @@ body:not(.welcome-ready) #welcome-screen {
 }
 
 /* Disable entrance animations when loading chat history (bulk render) */
-.chat-history.no-animate .msg {
+.chat-history.no-animate .msg,
+.chat-history.no-animate .agent-thread-node {
   animation: none;
 }
 
@@ -23381,7 +23715,10 @@ body:not(.welcome-ready) #welcome-screen {
   .modal-content,
   #welcome-screen,
   .toast,
-  .token-new {
+  .token-new,
+  .agent-thread-node,
+  .sail-boat,
+  .sail-boat * {
     animation: none !important;
     transition: none !important;
   }
