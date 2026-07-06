@@ -73,12 +73,16 @@ def test_dedupe_candidates_keeps_first_of_each_route():
 
 def test_duplicate_route_is_attempted_only_once(monkeypatch):
     """A fallback that repeats the primary's (url, model) must NOT make the chain
-    sail back into the same dead route — each distinct route is tried once."""
+    sail back into the same dead route — each distinct route is tried once.
+
+    Uses a 400 (deterministic / non-retryable) so this isolates de-duplication
+    from the same-candidate transient-retry layer (429/5xx retry in place; see
+    test_transient_status_retries_same_candidate)."""
     calls = []
 
     async def fake_stream(url, model, messages, **kw):
         calls.append((url, model))
-        yield 'event: error\ndata: {"status": 503, "text": "down"}\n\n'
+        yield 'event: error\ndata: {"status": 400, "text": "bad request"}\n\n'
 
     monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
 
@@ -97,3 +101,167 @@ def test_summarize_stream_error():
     assert "400" in llm_core._summarize_stream_error('event: error\ndata: {"status": 400, "text": "nope"}\n\n')
     assert llm_core._summarize_stream_error(None) == "primary model failed"
     assert llm_core._summarize_stream_error("garbage") == "primary model failed"
+
+
+def _reset_breaker():
+    """Clear module-level circuit-breaker state so tests don't leak into each other."""
+    with llm_core._host_health_lock:
+        llm_core._unhealthy_endpoints.clear()
+        llm_core._endpoint_status_fails.clear()
+
+
+def test_transient_status_retries_same_candidate(monkeypatch):
+    """A pre-content 503 retries the SAME candidate before advancing. First two
+    attempts 503, third succeeds → 3 calls to the same route, no fallback event."""
+    _reset_breaker()
+    calls = []
+
+    async def _noop_sleep(*_a, **_k):
+        return None
+    monkeypatch.setattr(llm_core.asyncio, "sleep", _noop_sleep)
+
+    async def fake_stream(url, model, messages, **kw):
+        calls.append(model)
+        if len([c for c in calls if c == model]) <= 2:
+            yield 'event: error\ndata: {"status": 503, "text": "overloaded"}\n\n'
+        else:
+            yield 'data: {"delta": "ok"}\n\n'
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("u1", "m1", {})], [{"role": "user", "content": "hi"}]
+        ):
+            out.append(c)
+        return out
+
+    chunks = asyncio.run(run())
+    assert calls == ["m1", "m1", "m1"], f"expected 2 retries then success: {calls}"
+    assert any('"delta": "ok"' in c for c in chunks)
+    assert not any('"fallback"' in c for c in chunks)
+
+
+def test_400_does_not_retry_same_candidate(monkeypatch):
+    """A 400 is deterministic — never retried in place; advance immediately."""
+    _reset_breaker()
+    calls = []
+
+    async def fake_stream(url, model, messages, **kw):
+        calls.append(model)
+        if model == "m1":
+            yield 'event: error\ndata: {"status": 400, "text": "bad"}\n\n'
+        else:
+            yield 'data: {"delta": "hi"}\n\n'
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("u1", "m1", {}), ("u2", "m2", {})], [{"role": "user", "content": "hi"}]
+        ):
+            out.append(c)
+        return out
+
+    chunks = asyncio.run(run())
+    assert calls == ["m1", "m2"], f"400 must not retry in place: {calls}"
+    assert any('"fallback"' in c for c in chunks)
+
+
+def test_401_trips_breaker_and_next_call_skips_endpoint(monkeypatch):
+    """A 401 cools the endpoint immediately; a subsequent chain that includes
+    that endpoint SKIPS it (no wasted round-trip) as long as a healthy one exists."""
+    _reset_breaker()
+    calls = []
+
+    async def fake_stream(url, model, messages, **kw):
+        calls.append(model)
+        if model == "dead":
+            yield 'event: error\ndata: {"status": 401, "text": "credit balance too low"}\n\n'
+        else:
+            yield 'data: {"delta": "ok"}\n\n'
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run(cands):
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(cands, [{"role": "user", "content": "hi"}]):
+            out.append(c)
+        return out
+
+    cands = [("u1", "dead", {}), ("u2", "live", {})]
+    asyncio.run(run(cands))
+    assert llm_core._is_endpoint_unhealthy("u1", "dead")
+    # Second turn: dead endpoint is skipped entirely.
+    calls.clear()
+    asyncio.run(run(cands))
+    assert "dead" not in calls, f"unhealthy endpoint should be skipped: {calls}"
+    assert calls == ["live"]
+
+
+def test_all_unhealthy_still_tries(monkeypatch):
+    """If EVERY candidate is cooling, try anyway rather than hard-fail."""
+    _reset_breaker()
+    # Cool the only endpoint.
+    llm_core._mark_endpoint_status_failure("u1", "m1", 401)
+    assert llm_core._is_endpoint_unhealthy("u1", "m1")
+    calls = []
+
+    async def fake_stream(url, model, messages, **kw):
+        calls.append(model)
+        yield 'data: {"delta": "ok"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("u1", "m1", {})], [{"role": "user", "content": "hi"}]
+        ):
+            out.append(c)
+        return out
+
+    chunks = asyncio.run(run())
+    assert calls == ["m1"], "all-unhealthy chain must still attempt the candidate"
+    assert any('"delta": "ok"' in c for c in chunks)
+    # Success clears the breaker.
+    assert not llm_core._is_endpoint_unhealthy("u1", "m1")
+
+
+def test_retry_after_header_is_honored(monkeypatch):
+    """Retry-After (parsed into the error chunk) drives the backoff delay, capped at 15s."""
+    _reset_breaker()
+    delays = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+
+    monkeypatch.setattr(llm_core.asyncio, "sleep", fake_sleep)
+    calls = []
+
+    async def fake_stream(url, model, messages, **kw):
+        calls.append(model)
+        if len(calls) == 1:
+            yield 'event: error\ndata: {"status": 429, "text": "rate", "retry_after": 3.0}\n\n'
+        else:
+            yield 'data: {"delta": "ok"}\n\n'
+            yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+
+    async def run():
+        out = []
+        async for c in llm_core.stream_llm_with_fallback(
+            [("u1", "m1", {})], [{"role": "user", "content": "hi"}]
+        ):
+            out.append(c)
+        return out
+
+    asyncio.run(run())
+    assert delays == [3.0], f"Retry-After must set the delay: {delays}"

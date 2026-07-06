@@ -78,6 +78,25 @@ DEAD_HOST_COOLDOWN = 20.0
 _HOST_FAIL_THRESHOLD = 2
 _dead_hosts: Dict[str, float] = {}
 _host_fails: Dict[str, int] = {}
+
+# ── Provider circuit-breaker (HTTP-status based) ──
+# Separate from the connect-error dead-host mechanism above: an endpoint can be
+# perfectly reachable (TCP connects fine) yet return a fatal HTTP status every
+# request — e.g. 401 after API credits die. That case used to keep the dead
+# primary first in the fallback chain and eat a failed round-trip EVERY agent
+# round (observed: 12 wasted 400s over ~30 min after Anthropic credits ran out).
+# So we trip a per-endpoint breaker keyed by (host, model): a single auth-style
+# status (401/402/403) cools immediately; repeated transient/other pre-content
+# 4xx/5xx cool after _ENDPOINT_FAIL_THRESHOLD consecutive failures. A success
+# clears the state. Cooldown length is settings-configurable
+# (`provider_circuit_breaker_cooldown_seconds`, default below).
+_ENDPOINT_CIRCUIT_DEFAULT_COOLDOWN = 180.0
+_ENDPOINT_FAIL_THRESHOLD = 3
+# Statuses that cool an endpoint on the FIRST occurrence (auth/permission/quota
+# — retrying is pointless until the operator fixes credentials or billing).
+_ENDPOINT_HARD_STATUSES = frozenset({401, 402, 403})
+_unhealthy_endpoints: Dict[str, float] = {}   # "host|model" -> unix ts cooldown expiry
+_endpoint_status_fails: Dict[str, int] = {}   # "host|model" -> consecutive pre-content HTTP failures
 # Guards the two maps above. The synchronous llm_call() runs inside FastAPI's
 # threadpool (sync routes such as /sessions/auto-sort) while llm_call_async()
 # runs on the event loop, so these maps are mutated from multiple OS threads.
@@ -253,6 +272,63 @@ def _clear_host_dead(url: str) -> None:
     with _host_health_lock:
         _dead_hosts.pop(key, None)
         _host_fails.pop(key, None)
+
+
+def _endpoint_key(url: str, model: str) -> str:
+    """Circuit-breaker key: an endpoint is a (host, model) pair — one model on a
+    host can 401 (its key died) while another on the same host is fine."""
+    return f"{_host_key(url)}|{model or ''}"
+
+
+def _circuit_cooldown_seconds() -> float:
+    """Settings-configurable breaker cooldown; falls back to the default."""
+    try:
+        from src.settings import get_setting
+        val = get_setting("provider_circuit_breaker_cooldown_seconds",
+                           _ENDPOINT_CIRCUIT_DEFAULT_COOLDOWN)
+        val = float(val)
+        # Bound to something sane: never below 30s (too churny to help) or
+        # above 30 min (a genuinely-recovered endpoint would stay locked out).
+        return max(30.0, min(val, 1800.0))
+    except Exception:
+        return _ENDPOINT_CIRCUIT_DEFAULT_COOLDOWN
+
+
+def _is_endpoint_unhealthy(url: str, model: str) -> bool:
+    key = _endpoint_key(url, model)
+    with _host_health_lock:
+        exp = _unhealthy_endpoints.get(key)
+        if exp is None:
+            return False
+        if time.time() >= exp:
+            _unhealthy_endpoints.pop(key, None)
+            _endpoint_status_fails.pop(key, None)
+            return False
+        return True
+
+
+def _mark_endpoint_status_failure(url: str, model: str, status: Optional[int]) -> bool:
+    """Record a pre-content HTTP failure for (url, model). Auth-style statuses
+    (401/402/403) trip the breaker immediately; other statuses trip it after
+    _ENDPOINT_FAIL_THRESHOLD consecutive failures. Returns True when the
+    endpoint is now cooled (so callers can log accurately)."""
+    key = _endpoint_key(url, model)
+    hard = status in _ENDPOINT_HARD_STATUSES
+    with _host_health_lock:
+        n = _endpoint_status_fails.get(key, 0) + 1
+        _endpoint_status_fails[key] = n
+        if hard or n >= _ENDPOINT_FAIL_THRESHOLD:
+            _unhealthy_endpoints[key] = time.time() + _circuit_cooldown_seconds()
+            return True
+        return False
+
+
+def _clear_endpoint_unhealthy(url: str, model: str) -> None:
+    """A real success clears any breaker state for this endpoint."""
+    key = _endpoint_key(url, model)
+    with _host_health_lock:
+        _unhealthy_endpoints.pop(key, None)
+        _endpoint_status_fails.pop(key, None)
 
 
 # Shared async HTTP client. Reusing one client keeps connections warm:
@@ -1008,6 +1084,162 @@ def _anthropic_rejects_temperature(model: str) -> bool:
 # ODYSSEUS_MISTRAL_REASONING_EFFORT (e.g. set to "medium" for cheaper chat).
 _MISTRAL_REASONING_EFFORT = os.getenv("ODYSSEUS_MISTRAL_REASONING_EFFORT", "high")
 
+
+def _resolve_anthropic_effort(explicit=None):
+    """Resolve the Anthropic reasoning-effort value.
+
+    Precedence: an explicit per-call value (a caller may thread one later) >
+    the `anthropic_effort` setting > None (omit). Returning None means "send
+    no output_config" — the correct default, since some models (e.g.
+    claude-fable-5) reject an explicit thinking/effort config. Lazy-imports
+    settings to avoid a circular import at module load."""
+    if explicit is not None:
+        val = explicit
+    else:
+        try:
+            from src.settings import get_setting
+            val = get_setting("anthropic_effort", None)
+        except Exception:
+            val = None
+    if val is None:
+        return None
+    val = str(val).strip()
+    return val or None
+
+# Reasoning-effort selector ("Default"/"Off"/"Low"/"Medium"/"High" in the UI) —
+# a single conservative mapping from the UI's effort string to whatever knob
+# (if any) each provider's API actually accepts. "default" always means "send
+# nothing, let the provider/model pick" and is handled by the caller before
+# this is even invoked (see apply_reasoning_effort's early return).
+#
+# Deliberately narrower than a full per-model matrix: when a provider/model's
+# support for a param is uncertain, we omit rather than risk a 400 (project
+# rule — see apply_reasoning_effort's docstring). This trades completeness for
+# never breaking an existing working chat.
+#
+# Anthropic has no model-prefix list here — it is a deliberate no-op in
+# apply_reasoning_effort (see that function's docstring); the UI selector
+# reaches Anthropic through the pre-existing `effort=` kwarg / output_config
+# mechanism instead (see stream_llm's Anthropic branch in this same module).
+#
+# Gemini tiers where the OpenAI-compat `reasoning_effort: "none"` value is
+# documented as legal (thinking can be fully disabled). Pro-tier 2.5/3.x models
+# require *some* thinking budget and reject "none" — so "off" is a no-op there
+# rather than a guessed value that risks a 400.
+_GEMINI_NONE_EFFORT_MODEL_PATTERNS = ("flash",)
+_GEMINI_REASONING_MODEL_PATTERNS = ("gemini-2.5", "gemini-3")
+_ZAI_THINKING_MODEL_PATTERNS = ("glm-4.5", "glm-4.6", "glm-5")
+_QWEN3_MODEL_PATTERNS = ("qwen3", "qwen-3")
+
+
+def _model_startswith(model: str, prefixes: tuple) -> bool:
+    if not model:
+        return False
+    m = model.lower().rsplit("/", 1)[-1]
+    return any(m.startswith(p) for p in prefixes)
+
+
+def _model_contains(model: str, patterns: tuple) -> bool:
+    if not model:
+        return False
+    m = model.lower()
+    return any(p in m for p in patterns)
+
+
+def apply_reasoning_effort(payload: Dict, model: str, endpoint_url: str, effort: Optional[str],
+                            messages: Optional[List[Dict]] = None) -> None:
+    """Apply the UI's reasoning-effort selector to an outgoing request, in place.
+
+    `effort` is one of "off" / "low" / "medium" / "high", or None/"default" —
+    "default"/None means "send nothing" and is a no-op (the caller may also
+    skip calling this entirely in that case; handled here too so every call
+    site doesn't need to duplicate the check).
+
+    Provider mapping (conservative: omit over a param the provider might 400
+    on — this project's stated rule for uncertain support):
+      - Anthropic: this project already has an independent reasoning-effort
+        mechanism (`_resolve_anthropic_effort` / `output_config={"effort":...}`,
+        wired through `_build_anthropic_payload`'s `effort=` kwarg) which is
+        NOT touched here — merging a second `thinking` mechanism into the same
+        payload risks sending two conflicting reasoning configs to models that
+        only accept one, and `_build_anthropic_payload` already documents that
+        it deliberately never sends `thinking`. Anthropic is therefore a no-op
+        in THIS helper by design; the UI selector reaches Anthropic via the
+        `effort=` kwarg threaded separately (stream_llm's existing parameter),
+        not through payload mutation here. See the call site in agent_loop.py.
+      - OpenAI o-series / gpt-5 family: "reasoning_effort": low/medium/high;
+        "off" -> "minimal" for gpt-5-family (the only family where that value
+        is documented), omitted for o-series (no "minimal" tier there).
+      - Gemini OpenAI-compat: "reasoning_effort": low/medium/high on 2.5+/3.x
+        models; "off" -> "none" ONLY on flash-tier models where disabling
+        thinking entirely is documented as legal, otherwise omitted.
+      - Z.AI GLM (glm-4.5+/glm-5 only): "thinking": {"type": "enabled"} for
+        low/medium/high (no granularity control), {"type": "disabled"} for off.
+      - DeepSeek: no reasoning-effort param exists on the chat models -> always
+        omitted, including "off".
+      - Ollama / self-hosted OpenAI-compat, qwen3 family only: no payload
+        field — "off" appends the "/no_think" soft-switch token to the last
+        user message instead. Requires `messages` (the same list `payload`
+        was/will be built from) to be passed so the mutation can be applied;
+        a no-op if `messages` is not supplied.
+      - Everything else (unrecognized host/model): no-op.
+    """
+    if not effort or effort == "default":
+        return
+    effort = effort.lower()
+    if effort not in ("off", "low", "medium", "high"):
+        return
+
+    if _host_match(endpoint_url, "anthropic.com"):
+        return  # handled via the separate `effort=` kwarg path — see docstring.
+
+    if _host_match(endpoint_url, "openai.com"):
+        is_gpt5 = _model_startswith(model, ("gpt-5",))
+        is_o_series = _model_startswith(model, ("o1", "o3", "o4"))
+        if effort == "off":
+            if is_gpt5:
+                payload["reasoning_effort"] = "minimal"
+            # o-series has no "minimal"/off tier — omit rather than guess.
+            return
+        if is_gpt5 or is_o_series:
+            payload["reasoning_effort"] = effort
+        return
+
+    if _host_match(endpoint_url, "generativelanguage.googleapis.com"):
+        if not _model_contains(model, _GEMINI_REASONING_MODEL_PATTERNS):
+            return
+        if effort == "off":
+            if _model_contains(model, _GEMINI_NONE_EFFORT_MODEL_PATTERNS):
+                payload["reasoning_effort"] = "none"
+            return  # pro-tier: disabling thinking entirely isn't legal — omit.
+        payload["reasoning_effort"] = effort
+        return
+
+    if _host_match(endpoint_url, "z.ai") or _host_match(endpoint_url, "bigmodel.cn"):
+        if not _model_contains(model, _ZAI_THINKING_MODEL_PATTERNS):
+            return
+        payload["thinking"] = {"type": "disabled" if effort == "off" else "enabled"}
+        return
+
+    if _host_match(endpoint_url, "deepseek.com"):
+        return  # no effort param on any DeepSeek chat model — always omit.
+
+    # Ollama (native or OpenAI-compat) and any other local/self-hosted
+    # OpenAI-compat surface: only the qwen3 "/no_think" soft switch is
+    # recognized, and only for "off". Everything else here is a no-op.
+    if effort == "off" and messages and _model_contains(model, _QWEN3_MODEL_PATTERNS):
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content")
+                if isinstance(content, str):
+                    m["content"] = content + "\n/no_think"
+                elif isinstance(content, list):
+                    # Multimodal content list — append a trailing text block
+                    # rather than guessing which block is "the text".
+                    content.append({"type": "text", "text": "/no_think"})
+                break
+
+
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = (
     "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax",
@@ -1097,8 +1329,15 @@ def _convert_openai_content_to_anthropic(content):
     return converted
 
 
-def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None):
-    """Convert OpenAI-style messages to Anthropic format."""
+def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None, effort=None):
+    """Convert OpenAI-style messages to Anthropic format.
+
+    `effort` (optional) threads a reasoning-effort level into the request as
+    ``output_config={"effort": ...}``. Resolved from the `anthropic_effort`
+    setting when not passed explicitly; None (the default) omits it entirely
+    — required for models that reject an explicit config (e.g. claude-fable-5).
+    Deliberately does NOT send a `thinking` param.
+    """
     system_parts = []
     chat_messages = []
     for m in messages:
@@ -1179,6 +1418,11 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     # returns HTTP 400. Omit it for those models; older Claude models still take it.
     if not _anthropic_rejects_temperature(model):
         payload["temperature"] = temperature
+    # Reasoning-effort: only present when explicitly configured. Omitting is the
+    # safe default — some models reject an explicit thinking/effort config.
+    _eff = _resolve_anthropic_effort(effort)
+    if _eff is not None:
+        payload["output_config"] = {"effort": _eff}
     if system_parts:
         system_text = "\n\n".join(system_parts)
         # Send `system` as a structured text block so we can attach a prompt-cache
@@ -1916,7 +2160,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False):
+                     tool_choice_none: bool = False, effort: Optional[str] = None,
+                     reasoning_effort: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -1924,6 +2169,20 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
       - data: {"type": "tool_calls", ...}  — accumulated native tool calls (before DONE)
       - event: error                       — errors
       - data: [DONE]                       — end of stream
+
+    `effort` and `reasoning_effort` are two independent knobs, deliberately not
+    merged:
+      - `effort` is the pre-existing Anthropic-only `output_config={"effort":
+        ...}` value (see `_resolve_anthropic_effort`), sourced from the
+        `anthropic_effort` setting or an explicit per-call override.
+      - `reasoning_effort` is the newer UI reasoning-effort selector
+        ("off"/"low"/"medium"/"high"/"default"), applied via
+        `apply_reasoning_effort` for every non-Anthropic provider. For
+        Anthropic it is translated into the SAME `effort` kwarg above
+        (conservatively — see `apply_reasoning_effort`'s docstring for why a
+        second, conflicting Anthropic mechanism is not introduced) rather than
+        stacked alongside it; an explicit `effort=` always wins if both are
+        somehow passed, since that is the pre-existing, narrower-scoped knob.
     """
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
@@ -1942,10 +2201,29 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     else:
         messages_copy = non_sys
 
+    # qwen3 "/no_think" soft switch (reasoning_effort="off") mutates the
+    # message list itself, not a payload field — apply once here, before any
+    # provider branch builds its payload from messages_copy, so it's never
+    # duplicated between the native-Ollama and OpenAI-compat branches below.
+    # Independent of `effort` (the separate, Anthropic-only knob) — a qwen3
+    # model reached through a local Ollama endpoint is never also an
+    # Anthropic call, so there is no real scenario where both are meaningful
+    # at once, but the check below intentionally does not couple the two.
+    if reasoning_effort:
+        apply_reasoning_effort({}, model, url, reasoning_effort, messages=messages_copy)
+
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        _anthropic_effort = effort
+        if _anthropic_effort is None and reasoning_effort and reasoning_effort not in ("default", "off"):
+            # Reuse the existing output_config={"effort":...} mechanism rather
+            # than introducing a second, conflicting Anthropic reasoning path —
+            # see apply_reasoning_effort's docstring. "off"/"default" both mean
+            # "don't pass anything" here since there is no established
+            # "explicitly disabled" value for this existing mechanism.
+            _anthropic_effort = reasoning_effort
+        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools, effort=_anthropic_effort)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}
@@ -1989,6 +2267,12 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
+        # UI reasoning-effort selector — OpenAI/Gemini/Z.AI get a payload field;
+        # DeepSeek/unrecognized hosts are always a no-op (see docstring). The
+        # qwen3 "/no_think" message mutation for this same knob already ran
+        # above, before messages_copy was baked into this payload.
+        if reasoning_effort:
+            apply_reasoning_effort(payload, model, url, reasoning_effort)
         _apply_local_cache_affinity(payload, url, session_id)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
@@ -2079,8 +2363,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                 _clear_host_dead(target_url)
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
-                    friendly = _format_upstream_error(r.status_code, raw, target_url)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    yield _build_upstream_error_chunk(r.status_code, raw, target_url, r.headers)
                     return
                 async for line in r.aiter_lines():
                     if not line:
@@ -2135,6 +2418,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     if provider == "anthropic":
         _anth_input_tokens = 0
         _anth_output_tokens = 0
+        _anth_cache_read = 0
+        _anth_cache_write = 0
+        _anth_actual_model = ""
         # Track tool_use blocks: {index: {id, name, arguments_json}}
         _anth_tool_blocks: Dict[int, Dict] = {}
         _anth_block_idx = -1
@@ -2145,8 +2431,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                 _clear_host_dead(target_url)
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
-                    friendly = _format_upstream_error(r.status_code, raw, target_url)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    yield _build_upstream_error_chunk(r.status_code, raw, target_url, r.headers)
                     return
                 async for line in r.aiter_lines():
                     # SSE allows "data:value" with no space after the colon
@@ -2188,16 +2473,27 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                     if partial and _anth_tool_blocks[idx].get("name") in ("create_document", "update_document", "edit_document"):
                                         yield f'data: {json.dumps({"type": "tool_call_delta", "index": idx, "name": _anth_tool_blocks[idx]["name"], "arg_delta": partial})}\n\n'
                         elif evt == "message_start":
-                            _u = j.get("message", {}).get("usage", {})
+                            _msg = j.get("message", {}) or {}
+                            _u = _msg.get("usage", {})
                             _anth_input_tokens = _u.get("input_tokens", 0)
+                            # The model that actually served this response. On a
+                            # fallback/alias the served model can differ from the
+                            # requested `model`; persist it downstream so metadata
+                            # records what really ran, not just what was asked.
+                            _served = _msg.get("model")
+                            if isinstance(_served, str) and _served.strip():
+                                _anth_actual_model = _served.strip()
                             # Surface prompt-cache effectiveness: cache_read > 0 means the
                             # stable system+tools prefix was served from cache this round.
-                            _c_read = _u.get("cache_read_input_tokens", 0)
-                            _c_write = _u.get("cache_creation_input_tokens", 0)
-                            if _c_read or _c_write:
+                            # Retain the counts (not just log them) so the usage event can
+                            # forward them — a cache_read token is billed ~0.1x, so cost is
+                            # unauditable without them.
+                            _anth_cache_read = _u.get("cache_read_input_tokens", 0) or 0
+                            _anth_cache_write = _u.get("cache_creation_input_tokens", 0) or 0
+                            if _anth_cache_read or _anth_cache_write:
                                 logger.info(
                                     "[anthropic-cache] read=%s write=%s fresh_input=%s",
-                                    _c_read, _c_write, _anth_input_tokens,
+                                    _anth_cache_read, _anth_cache_write, _anth_input_tokens,
                                 )
                         elif evt == "message_delta":
                             _anth_output_tokens = j.get("usage", {}).get("output_tokens", 0)
@@ -2213,8 +2509,25 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                         "arguments": tb["arguments"],
                                     })
                                 yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
-                            if _anth_input_tokens or _anth_output_tokens:
-                                yield f'data: {json.dumps({"type": "usage", "data": {"input_tokens": _anth_input_tokens, "output_tokens": _anth_output_tokens}})}\n\n'
+                            if _anth_input_tokens or _anth_output_tokens or _anth_cache_read or _anth_cache_write:
+                                _usage_data = {
+                                    "input_tokens": _anth_input_tokens,
+                                    "output_tokens": _anth_output_tokens,
+                                }
+                                # Only attach cache fields when non-zero so non-cached
+                                # responses stay lean and downstream code can treat a
+                                # missing key as zero.
+                                if _anth_cache_read:
+                                    _usage_data["cache_read_tokens"] = _anth_cache_read
+                                if _anth_cache_write:
+                                    _usage_data["cache_creation_tokens"] = _anth_cache_write
+                                # Report the served model (may differ from requested on
+                                # an alias/fallback) so metadata records what ran.
+                                if _anth_actual_model:
+                                    _usage_data["model"] = _anth_actual_model
+                                    if not _same_model_identity(_anth_actual_model, model):
+                                        _usage_data["requested_model"] = model
+                                yield f'data: {json.dumps({"type": "usage", "data": _usage_data})}\n\n'
                             yield "data: [DONE]\n\n"
                             return
                         elif evt == "error":
@@ -2248,6 +2561,15 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     _first_content_sent = False
     _in_think_tag = False        # True while consuming <think>…</think> content
     _think_open_stripped = False  # opening <think> tag already removed
+    # Hold-back buffer for the plain-<think> auto-detect below. A provider can
+    # split "<think>" across multiple SSE deltas (e.g. first chunk is just
+    # "<th"), and stripped.lower().startswith("<think") fails on that partial
+    # chunk alone — which permanently sets _first_content_sent=True and
+    # disables auto-detect for the rest of the round (observed live: a
+    # continuation round's <think> streamed as plain text). Buffer content
+    # until it's unambiguously not (or unambiguously is) a "<think" prefix,
+    # mirroring the harmony router's existing suffix-hold approach.
+    _think_detect_buf = ""
     _harmony_router = _HarmonyStreamRouter()
     _harmony_active = False       # sticky: gpt-oss harmony <|channel|> stream detected
     _actual_model = ""
@@ -2283,8 +2605,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             _clear_host_dead(target_url)
             if r.status_code != 200:
                 raw = (await r.aread()).decode(errors="replace")
-                friendly = _format_upstream_error(r.status_code, raw, target_url)
-                yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                yield _build_upstream_error_chunk(r.status_code, raw, target_url, r.headers)
                 return
 
             async for line in r.aiter_lines():
@@ -2392,6 +2713,30 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                 # Covers Qwen3-derived models (Qwopus, QwQ forks) whose
                                                 # names don't match _THINKING_MODEL_PATTERNS but still
                                                 # emit literal <think> markup via llama.cpp --jinja.
+                                                #
+                                                # The prefix check below needs the WHOLE "<think" in one
+                                                # chunk. A provider that splits it across deltas (first
+                                                # chunk just "<th") fails the check, falls to the "else"
+                                                # below, and permanently sets _first_content_sent=True —
+                                                # disabling auto-detect for the rest of the round. So while
+                                                # still undecided, hold back short content that could still
+                                                # be a "<think" prefix and resolve once we have enough of it
+                                                # (or it's clearly not a match), mirroring the harmony
+                                                # router's suffix-hold buffering above.
+                                                if not _first_content_sent and not _thinking_model and not _in_think_tag:
+                                                    _think_detect_buf += content
+                                                    _buf_stripped = _think_detect_buf.lstrip()
+                                                    _probe = _buf_stripped[:len("<think")].lower()
+                                                    if len(_buf_stripped) < len("<think") and "<think"[:len(_probe)] == _probe:
+                                                        # Too short to decide yet AND still a plausible
+                                                        # prefix — keep holding, emit nothing this chunk.
+                                                        continue
+                                                    # Resolved: either long enough to check for real, or it
+                                                    # already diverged from "<think" — replay the full held
+                                                    # buffer as `content`/`stripped` through the normal path.
+                                                    content = _think_detect_buf
+                                                    stripped = _buf_stripped
+                                                    _think_detect_buf = ""
                                                 if not _first_content_sent and not _thinking_model and not _in_think_tag and stripped.lower().startswith("<think"):
                                                     _thinking_model = True
                                                     _in_think_tag = True
@@ -2519,6 +2864,52 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
 
 
+def _parse_retry_after(headers) -> Optional[float]:
+    """Parse a Retry-After header (seconds form only; HTTP-date form is rare on
+    LLM APIs and not worth the parse). Returns seconds capped at 15s, or None."""
+    if not headers:
+        return None
+    try:
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:
+        raw = None
+    if not raw:
+        return None
+    try:
+        secs = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if secs < 0:
+        return None
+    return min(secs, 15.0)
+
+
+def _build_upstream_error_chunk(status: int, raw: str, target_url: str, resp_headers=None) -> str:
+    """Build the `event: error` SSE chunk for a non-200 upstream response.
+
+    Centralizes three things the per-provider branches all need:
+      - a friendly message (_format_upstream_error),
+      - the raw upstream body (truncated) — logged at WARNING for 4xx so the
+        ACTUAL cause survives (the real "credit balance too low" text was
+        previously lost; only the generic friendly string was kept),
+      - a parsed Retry-After (seconds) so the fallback layer can honor it.
+    """
+    friendly = _format_upstream_error(status, raw, target_url)
+    body = (raw or "")[:500]
+    if 400 <= status < 500:
+        # 4xx bodies carry the real reason (bad key, exhausted credits, invalid
+        # request). Persist it at WARNING; the friendly string alone hid it.
+        logger.warning(
+            "[upstream-error] %s %s -> %s | body: %s",
+            status, _host_key(target_url), friendly, body,
+        )
+    payload = {"status": status, "text": friendly, "raw": body}
+    _ra = _parse_retry_after(resp_headers)
+    if _ra is not None:
+        payload["retry_after"] = _ra
+    return f'event: error\ndata: {json.dumps(payload)}\n\n'
+
+
 def _summarize_stream_error(err_chunk: Optional[str]) -> str:
     """Pull a short human reason out of an `event: error` SSE chunk for the
     fallback notice. Returns a generic message if it can't be parsed."""
@@ -2537,16 +2928,67 @@ def _summarize_stream_error(err_chunk: Optional[str]) -> str:
     return "primary model failed"
 
 
+# Pre-content transient statuses worth retrying the SAME candidate on before
+# advancing: rate-limit (429) and server-side 5xx. 400/401/403 are NOT here —
+# they're deterministic (bad request / auth / permission), so retrying just
+# burns another round-trip; they trip the circuit breaker instead.
+_RETRYABLE_STREAM_STATUSES = frozenset({429, 500, 502, 503, 504})
+_STREAM_RETRY_MAX = 2          # extra attempts at the same candidate
+_STREAM_RETRY_BASE_DELAY = 0.5  # exponential backoff base (s): 0.5, 1.0, ...
+_STREAM_RETRY_MAX_DELAY = 15.0  # cap on any single backoff / Retry-After wait
+
+
+def _error_chunk_status(chunk: Optional[str]) -> Optional[int]:
+    """Extract the HTTP status from an `event: error` SSE chunk, if present."""
+    if not chunk:
+        return None
+    try:
+        for line in chunk.split("\n"):
+            if line.startswith("data: "):
+                j = json.loads(line[6:])
+                s = j.get("status")
+                return int(s) if s is not None else None
+    except Exception:
+        pass
+    return None
+
+
+def _error_chunk_retry_after(chunk: Optional[str]) -> Optional[float]:
+    """Extract a parsed Retry-After (seconds) from an `event: error` chunk."""
+    if not chunk:
+        return None
+    try:
+        for line in chunk.split("\n"):
+            if line.startswith("data: "):
+                j = json.loads(line[6:])
+                ra = j.get("retry_after")
+                return float(ra) if ra is not None else None
+    except Exception:
+        pass
+    return None
+
+
 async def stream_llm_with_fallback(candidates, messages, **kwargs):
-    """Wrap stream_llm with an ordered fallback chain.
+    """Wrap stream_llm with an ordered fallback chain + a per-endpoint circuit
+    breaker + same-candidate transient retry.
 
     `candidates` is a list of (url, model, headers). Each is tried in order,
     but only retried on a *pre-content* failure — i.e. an ``event: error``
     that arrives before any assistant text / tool-call data has been yielded.
     Once a candidate has emitted real output we never switch (that would
     duplicate streamed tokens); a later error from that candidate passes
-    through unchanged. The dead-host cooldown in stream_llm makes repeat
-    attempts at an offline primary effectively instant.
+    through unchanged.
+
+    Three reliability layers, all pre-content only:
+      1. Circuit breaker: an endpoint (host, model) that just 401'd / repeatedly
+         failed is SKIPPED so a dead primary stops eating a round-trip every
+         agent round. If EVERY candidate is broken, we try anyway (better a
+         long-shot attempt than an instant hard failure).
+      2. Same-candidate retry: on a transient pre-content status (429/5xx) or a
+         connect error, retry the SAME candidate up to _STREAM_RETRY_MAX times
+         with exponential backoff, honoring Retry-After (capped at 15s), before
+         advancing. 400/401/403 are never retried (they trip the breaker).
+      3. Ordered fallback: then advance to the next candidate as before.
 
     Yields the same SSE chunk protocol as stream_llm.
     """
@@ -2555,52 +2997,102 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
         yield f'event: error\ndata: {json.dumps({"error": "No model endpoint configured", "status": 503})}\n\n'
         return
 
-    primary_model = cands[0][1]
+    # Circuit breaker: prefer healthy candidates, but never fail outright just
+    # because all are cooling — fall back to the full list so a transient global
+    # blip can't wedge chat.
+    healthy = [(u, m, h) for (u, m, h) in cands if not _is_endpoint_unhealthy(u, m)]
+    if healthy and len(healthy) < len(cands):
+        skipped = [m for (u, m, h) in cands if _is_endpoint_unhealthy(u, m)]
+        logger.warning(f"[circuit] skipping unhealthy candidate(s) {skipped}; {len(healthy)} healthy left")
+        run_cands = healthy
+    elif not healthy:
+        logger.warning("[circuit] all candidates unhealthy — trying anyway rather than hard-failing")
+        run_cands = cands
+    else:
+        run_cands = cands
+
+    primary_model = run_cands[0][1]
     last_error = None
-    for i, (url, model, headers) in enumerate(cands):
-        is_last = (i == len(cands) - 1)
+    for i, (url, model, headers) in enumerate(run_cands):
+        is_last = (i == len(run_cands) - 1)
         emitted = False
-        retried = False
-        async for chunk in stream_llm(url, model, messages, headers=headers, **kwargs):
-            if chunk.startswith("event: error"):
-                if not emitted and not is_last:
-                    # Pre-content failure with fallbacks left — swallow and
-                    # move to the next candidate.
-                    last_error = chunk
-                    retried = True
-                    if i == 0:
-                        logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
-                    else:
-                        logger.warning(f"[fallback] candidate {model} failed; trying next")
-                    break
-                yield chunk
-                continue
-            # Any data chunk other than the terminal [DONE] means real output.
-            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
-                try:
-                    event_data = json.loads(chunk[6:])
-                except Exception:
-                    event_data = {}
-                if event_data.get("type") == "model_actual":
+        advance = False  # move to the next candidate after this one
+        attempt = 0
+        while True:
+            emitted = False
+            got_error = None  # the pre-content error chunk this attempt produced
+            async for chunk in stream_llm(url, model, messages, headers=headers, **kwargs):
+                if chunk.startswith("event: error"):
+                    if not emitted:
+                        # Pre-content failure. Decide retry-same vs advance vs surface.
+                        got_error = chunk
+                        break
+                    # Post-content error: pass through unchanged (can't switch now).
                     yield chunk
                     continue
-                # First real output from a NON-primary candidate: tell the client
-                # the selected model failed and another answered. Without this the
-                # fallback is invisible — a misconfigured provider looks like it
-                # works because the reply is shown under the originally selected
-                # model's name (e.g. a Bedrock/Claude endpoint that 400s every
-                # request but appears fine because another model silently answered).
-                if not emitted and i > 0:
-                    yield ('data: ' + json.dumps({
-                        "type": "fallback",
-                        "selected_model": primary_model,
-                        "answered_by": model,
-                        "reason": _summarize_stream_error(last_error),
-                    }) + '\n\n')
-                emitted = True
-            yield chunk
-        if not retried:
-            return  # candidate finished (success, or terminal error already sent)
+                # Any data chunk other than the terminal [DONE] means real output.
+                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                    try:
+                        event_data = json.loads(chunk[6:])
+                    except Exception:
+                        event_data = {}
+                    if event_data.get("type") == "model_actual":
+                        yield chunk
+                        continue
+                    if not emitted:
+                        # Real output — this endpoint is healthy; clear any breaker
+                        # state and (if a non-primary answered) announce the switch.
+                        _clear_endpoint_unhealthy(url, model)
+                        if i > 0:
+                            yield ('data: ' + json.dumps({
+                                "type": "fallback",
+                                "selected_model": primary_model,
+                                "answered_by": model,
+                                "reason": _summarize_stream_error(last_error),
+                            }) + '\n\n')
+                    emitted = True
+                yield chunk
+
+            if got_error is None:
+                # Candidate finished (success or a post-content terminal error
+                # already forwarded). Done with the whole chain.
+                return
+
+            # Pre-content failure handling.
+            last_error = got_error
+            status = _error_chunk_status(got_error)
+            # Feed the circuit breaker (connect errors surface as 503 here too;
+            # the connect path already marks the host, this also flags the model).
+            _cooled = _mark_endpoint_status_failure(url, model, status)
+            _retryable = (status is None) or (status in _RETRYABLE_STREAM_STATUSES)
+            # Auth/permission/bad-request are deterministic — never retry same.
+            _hard = status in _ENDPOINT_HARD_STATUSES or status == 400
+            if _retryable and not _hard and attempt < _STREAM_RETRY_MAX:
+                attempt += 1
+                ra = _error_chunk_retry_after(got_error)
+                if ra is not None:
+                    delay = min(ra, _STREAM_RETRY_MAX_DELAY)
+                else:
+                    delay = min(_STREAM_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                                _STREAM_RETRY_MAX_DELAY)
+                logger.warning(
+                    f"[retry] {model} pre-content {status or 'connect'} — "
+                    f"retry {attempt}/{_STREAM_RETRY_MAX} in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                continue  # retry SAME candidate
+            # Out of same-candidate retries (or a hard status): advance.
+            _tail = f" (endpoint cooled {_circuit_cooldown_seconds():.0f}s)" if _cooled else ""
+            if not is_last:
+                if i == 0:
+                    logger.warning(f"[fallback] primary {model} failed before output ({status}){_tail}; trying fallback")
+                else:
+                    logger.warning(f"[fallback] candidate {model} failed ({status}){_tail}; trying next")
+                advance = True
+            break
+        if not advance:
+            # Last candidate exhausted its retries — surface the error.
+            break
     # Every candidate failed pre-content — surface the last error.
     if last_error:
         yield last_error

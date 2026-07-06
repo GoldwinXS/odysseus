@@ -30,3 +30,36 @@ def test_tiny_tool_less_prompt_not_cached():
 def test_large_system_only_is_cached():
     p = _payload(system="z" * 5000, tools=None)
     assert p["system"][0].get("cache_control") == {"type": "ephemeral"}
+
+
+# ── effort / output_config ──
+
+def test_effort_omitted_by_default(monkeypatch):
+    """No setting, no explicit value → no output_config (some models reject it)."""
+    monkeypatch.setattr(llm_core, "_resolve_anthropic_effort", lambda explicit=None: None)
+    p = _payload()
+    assert "output_config" not in p
+
+
+def test_explicit_effort_sets_output_config():
+    p = llm_core._build_anthropic_payload(
+        "claude", [{"role": "user", "content": "hi"}], 0.0, 1000, effort="high"
+    )
+    assert p["output_config"] == {"effort": "high"}
+
+
+def test_effort_from_setting(monkeypatch):
+    """Settings-driven default: anthropic_effort flows into output_config."""
+    import src.settings as settings
+    monkeypatch.setattr(settings, "get_setting",
+                        lambda key, default=None: "low" if key == "anthropic_effort" else default)
+    p = _payload()
+    assert p["output_config"] == {"effort": "low"}
+
+
+def test_no_thinking_param_ever():
+    """We deliberately never send a `thinking` param (fable models reject it)."""
+    p = llm_core._build_anthropic_payload(
+        "claude", [{"role": "user", "content": "hi"}], 0.0, 1000, effort="high"
+    )
+    assert "thinking" not in p
