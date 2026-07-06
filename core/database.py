@@ -3,7 +3,7 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import event, create_engine, Column, String, Text, Boolean, DateTime, Integer, Float, ForeignKey, JSON, Index, func, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -147,8 +147,25 @@ class Session(TimestampMixin, Base):
     message_count = Column(Integer, default=0)
     total_input_tokens = Column(Integer, default=0)
     total_output_tokens = Column(Integer, default=0)
+    # Anthropic prompt-cache accounting. cache_read = prefix served from cache
+    # this session (~0.1x price); cache_creation = prefix written to cache
+    # (~1.25x one-time premium). Kept separate from total_input_tokens so the
+    # true billed cost is auditable (a cache_read token is NOT priced like a
+    # fresh input token). Non-Anthropic providers simply leave these at 0.
+    total_cache_read_tokens = Column(Integer, default=0)
+    total_cache_creation_tokens = Column(Integer, default=0)
+    # Cumulative server-priced USD cost for this session. Accumulated per turn
+    # from the SERVED model + cache-aware rates (src/pricing.py), so it stays
+    # correct when a fallback answered a turn and when prompt-cache reads/writes
+    # dominate. Local/self-hosted endpoints contribute 0. Stored as REAL.
+    total_cost_usd = Column(Float, default=0.0)
     mode = Column(String, nullable=True)  # 'agent', 'chat', or 'research'
     crew_member_id = Column(String, nullable=True)  # links to crew_members.id
+    # Small free-form per-session preference blob (JSON object). Currently
+    # holds only {"reasoning_effort": "off"|"low"|"medium"|"high"} when the
+    # session overrides the global reasoning_effort_default setting, but kept
+    # generic so future per-session UI prefs don't each need their own column.
+    prefs = Column(JSON, nullable=True, default=dict)
 
     # Relationship to chat messages
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
@@ -176,7 +193,11 @@ class Session(TimestampMixin, Base):
             'folder': self.folder,
             'total_input_tokens': self.total_input_tokens or 0,
             'total_output_tokens': self.total_output_tokens or 0,
+            'total_cache_read_tokens': self.total_cache_read_tokens or 0,
+            'total_cache_creation_tokens': self.total_cache_creation_tokens or 0,
+            'total_cost_usd': self.total_cost_usd or 0.0,
             'crew_member_id': self.crew_member_id,
+            'prefs': self.prefs or {},
         }
 
 class ChatMessage(Base):
@@ -1147,6 +1168,68 @@ def _migrate_add_token_columns():
         except Exception:
             pass
 
+
+def _migrate_add_cache_token_columns():
+    """Add Anthropic prompt-cache token accounting columns to sessions.
+
+    Separate from _migrate_add_token_columns so older DBs that already have
+    total_input/output_tokens still pick these up (idempotent PRAGMA check)."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        added = False
+        if "total_cache_read_tokens" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN total_cache_read_tokens INTEGER DEFAULT 0")
+            added = True
+        if "total_cache_creation_tokens" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN total_cache_creation_tokens INTEGER DEFAULT 0")
+            added = True
+        if added:
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added cache-token accounting columns to sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Migration check for cache-token columns failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_add_cost_column():
+    """Add the cumulative USD cost column to sessions.
+
+    Separate + idempotent (mirrors _migrate_add_cache_token_columns) so older
+    DBs that already carry the token/cache columns still pick this up. Stored
+    as REAL (SQLite affinity) defaulting to 0."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "total_cost_usd" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN total_cost_usd REAL DEFAULT 0")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added 'total_cost_usd' column to sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Migration check for total_cost_usd column failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_owner_to_table(table_name: str, index_name: str):
     """Generic helper: add owner TEXT column + index to a table if missing."""
     import sqlite3
@@ -1609,6 +1692,19 @@ def _migrate_add_crew_member_id():
     except Exception as e:
         logging.getLogger(__name__).warning(f"crew_member_id migration: {e}")
 
+def _migrate_add_session_prefs_column():
+    """Add prefs column (free-form per-session JSON preference blob) to sessions."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(sessions)"))]
+            if "prefs" not in cols:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN prefs TEXT"))
+                conn.commit()
+                logging.getLogger(__name__).info("Added prefs column to sessions")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"prefs migration: {e}")
+
+
 def _migrate_add_assistant_columns():
     """Add is_default_assistant + timezone columns to crew_members for the personal-assistant feature."""
     try:
@@ -1834,6 +1930,8 @@ def init_db():
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()
+    _migrate_add_cache_token_columns()
+    _migrate_add_cost_column()
     _migrate_add_mode_column()
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
@@ -1865,6 +1963,7 @@ def init_db():
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
     _migrate_backfill_task_folders()
+    _migrate_add_session_prefs_column()
 
 
 def _migrate_backfill_task_folders():

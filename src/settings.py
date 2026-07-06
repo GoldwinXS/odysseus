@@ -40,6 +40,22 @@ DEFAULT_SETTINGS = {
     "image_gen_enabled": False,
     "image_model": "",
     "image_quality": "medium",
+    # ── Video generation (generate_video tool) ──
+    # Admin gate, mirroring image_gen_enabled. Off by default.
+    "video_gen_enabled": False,
+    # LOCAL sidecar (docker/video, host port 8102). Empty -> the MCP server's
+    # default http://host.docker.internal:8102 (the app runs in Docker and
+    # reaches host services via host.docker.internal).
+    "video_local_url": "",
+    # CLOUD backend (provider-agnostic, fal.ai-style queue API by default).
+    # The key is a secret: settings.py's admin-set path treats any key ending
+    # in "_key"/containing "api_key" as a credential, so it can only be set in
+    # the Settings UI (never from chat) — the feature fails with a clear
+    # "Set video_cloud_api_key in Settings" message when it is empty.
+    "video_cloud_api_key": "",
+    "video_cloud_model": "fal-ai/ltx-video",
+    "video_cloud_base_url": "https://queue.fal.run",
+    "video_cloud_auth_scheme": "Key",
     "vision_model": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).
@@ -109,6 +125,7 @@ DEFAULT_SETTINGS = {
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
     "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
+    "subagent_max_rounds": 12,  # tool-loop rounds per background sub-agent
     # Soft input-token budget for the agent loop. The DEFAULT value (6000) is the
     # "auto" sentinel: it means "scale the budget to the model's context window"
     # (#1230) — so long-context models aren't capped at 6000. Set ANY OTHER value
@@ -149,6 +166,12 @@ DEFAULT_SETTINGS = {
     "task_model_fallbacks": [],
     "default_endpoint_id": "",
     "default_model": "",
+    # Reasoning-effort selector shown in the composer ("Default"/"Off"/"Low"/
+    # "Medium"/"High"). "default" means send no override — the provider/model's
+    # own default applies (see apply_reasoning_effort in src/llm_core.py for
+    # the per-provider mapping). New chats start from this value; a session
+    # may override it for itself via the session-prefs endpoint.
+    "reasoning_effort_default": "default",
     # Optional prose style used only for normal document writing/editing.
     # Email replies use email_writing_style instead because greetings,
     # signatures, and mailbox identity rules are medium-specific.

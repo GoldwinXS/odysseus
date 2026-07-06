@@ -913,6 +913,68 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         except KeyError:
             raise HTTPException(404, f"Session {session_id} not found")
 
+    # Small free-form per-session preference blob. Currently only
+    # `reasoning_effort` uses this; kept generic (whitelisted keys, merged with
+    # any existing prefs rather than replacing the whole blob) so a future
+    # per-session UI toggle doesn't need its own endpoint or DB column.
+    _SESSION_PREF_KEYS = {"reasoning_effort"}
+    _REASONING_EFFORT_VALUES = {"default", "off", "low", "medium", "high"}
+
+    @router.get("/session/{session_id}/prefs")
+    def get_session_prefs(request: Request, session_id: str):
+        """Read the session's small prefs JSON blob — used to restore the
+        composer's per-session reasoning-effort selection on session switch."""
+        _verify_session_owner(request, session_id, session_manager)
+        db = SessionLocal()
+        try:
+            db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
+            if not db_session:
+                raise HTTPException(404, f"Session {session_id} not found")
+            return {"prefs": db_session.prefs or {}}
+        finally:
+            db.close()
+
+    @router.post("/session/{session_id}/prefs")
+    async def set_session_prefs(request: Request, session_id: str):
+        """Merge-update the session's small prefs JSON blob (whitelisted keys only)."""
+        _verify_session_owner(request, session_id, session_manager)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Body must be a JSON object")
+        updates = {k: v for k, v in body.items() if k in _SESSION_PREF_KEYS}
+        if "reasoning_effort" in updates:
+            val = str(updates["reasoning_effort"] or "default").strip().lower()
+            if val not in _REASONING_EFFORT_VALUES:
+                raise HTTPException(400, f"Invalid reasoning_effort value: {val!r}")
+            updates["reasoning_effort"] = val
+        if not updates:
+            raise HTTPException(400, "No recognized pref keys in body")
+
+        db = SessionLocal()
+        try:
+            db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
+            if not db_session:
+                raise HTTPException(404, f"Session {session_id} not found")
+            merged = dict(db_session.prefs or {})
+            merged.update(updates)
+            db_session.prefs = merged
+            db_session.updated_at = utcnow_naive()
+            db.commit()
+            if session_id in session_manager.sessions:
+                session_manager.sessions[session_id].prefs = merged
+            return {"status": "success", "prefs": merged}
+        except HTTPException:
+            raise
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error updating session {session_id} prefs: {e}")
+            raise HTTPException(500, "Failed to update session prefs")
+        finally:
+            db.close()
+
     @router.post("/session/{session_id}/compact")
     async def compact_session(request: Request, session_id: str):
         """Summarize older messages into one compacted history entry."""
