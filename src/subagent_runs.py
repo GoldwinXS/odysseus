@@ -300,6 +300,14 @@ def start(
     return rec
 
 
+def running_count(session_id: Optional[str]) -> int:
+    """How many sub-agent runs are currently in flight for this parent session.
+    Used to tell a genuine "it's running in the background" statement (a real
+    run exists) from a hallucinated dispatch claim (none registered)."""
+    return sum(1 for rec in _UPDATES.get(session_id or "", [])
+               if rec.get("status") == "running")
+
+
 def find_running(session_id: str, subagent_id: str) -> Optional[dict]:
     """Return the run record for a RUNNING sub-agent in this session, or None if
     it doesn't exist / already finished. Used by send_to_subagent to validate a

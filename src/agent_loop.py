@@ -800,6 +800,26 @@ _COOKBOOK_CONTEXT_RE = re.compile(
     r"gpu box|ajax|qwen|gemma|llama|mistral|minimax)\b",
     re.IGNORECASE,
 )
+# "I dispatched a sub-agent" — but didn't. The model ends its turn ASSERTING
+# (past/present tense) that it launched a background sub-agent, yet no
+# spawn_agent call fired and no run is registered. Seen with opus-4.8 as an
+# orchestrator: it narrated the dispatch (even parroting the server ack
+# verbatim) without emitting the tool call, so the registry stayed empty and the
+# user waited on a sub-agent that never existed. Matched only at a command/claim
+# boundary — a legitimate "the sub-agent finished and reported X" (a real prior
+# run) does NOT match, and stream_agent_loop's running-count guard further
+# suppresses the nudge whenever a real run is actually in flight.
+_FALSE_DISPATCH_RE = re.compile(
+    r"(?:"
+    r"dispatch(?:ed|ing)?\b[^.\n]{0,40}\b(?:sub-?)?agent"
+    r"|spawn(?:ed|ing)?\b[^.\n]{0,40}\b(?:sub-?)?agent"
+    r"|(?:sub-?)?agent\b[^.\n]{0,30}\bdispatched\b"
+    r"|background sub-?agent (?:is )?dispatched"
+    r"|will arrive here as a separate message"
+    r"|running in the background"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _is_explicit_continuation(text: str) -> bool:
@@ -3262,6 +3282,9 @@ async def stream_agent_loop(
         r"\b[^.\n]{0,140}",
         re.IGNORECASE,
     )
+
+    _false_dispatch_nudged = False  # one correction per turn, then let it end (see _FALSE_DISPATCH_RE)
+
     _awaiting_user = False  # set by ask_user → end the turn and wait for a choice
 
     # Document streaming state (persists across rounds)
@@ -3882,6 +3905,46 @@ async def stream_agent_loop(
                     # never re-verify an unchanged state in a loop.
                     _effectful_used = False
                     continue
+            # ── False-dispatch supervisor ─────────────────────────────
+            # The model is ending the turn CLAIMING it launched a background
+            # sub-agent, but no spawn_agent fired this turn (reaching here means
+            # no tool block) and none is registered as running. Reaching for
+            # spawn_agent isn't possible inside a sub-agent (recursion blocked)
+            # or when the tool is disabled, so only nudge when it's actually
+            # available. One sharp correction, then let the turn end.
+            if (session_id
+                    and not _false_dispatch_nudged
+                    and not guide_only
+                    and "spawn_agent" not in (disabled_tools or set())):
+                _fd_text = _strip_think_blocks(cleaned_round).strip()
+                if _fd_text and _FALSE_DISPATCH_RE.search(_fd_text):
+                    _real_run = False
+                    try:
+                        from src import subagent_runs
+                        _real_run = subagent_runs.running_count(session_id) > 0
+                    except Exception:
+                        _real_run = False
+                    if not _real_run:
+                        _false_dispatch_nudged = True
+                        logger.info("[agent] false-dispatch nudge on round %s: claimed a "
+                                    "sub-agent dispatch but none registered", round_num)
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "You just told the user a background sub-agent was "
+                                "dispatched (or is running), but you did NOT call the "
+                                "spawn_agent tool — no sub-agent is registered, so nothing "
+                                "is running and the user is waiting on a result that will "
+                                "never come. Do NOT describe or announce a dispatch in "
+                                "prose. If you want a sub-agent, emit the actual "
+                                "spawn_agent tool call now as your action this turn. If you "
+                                "decided not to dispatch one, say so plainly in one "
+                                "sentence and do the work yourself."
+                            ),
+                        })
+                        yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                        full_response += "\n\n"
+                        continue
             # ── Intent-without-action supervisor ─────────────────────
             # Catch "Let me tail the output" / "I'll check the logs" /
             # "Let me investigate" patterns where the model announces an
