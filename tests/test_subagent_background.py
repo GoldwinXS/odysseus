@@ -536,6 +536,7 @@ def _clean_resume_state():
     agent_runs._RUNS.clear()
     subagent_runs._resume_count.clear()
     subagent_runs._resume_running.clear()
+    subagent_runs._failure_resume_count.clear()
 
 
 def _live_run(session_id):
@@ -601,8 +602,65 @@ async def test_server_resume_starts_detached_turn_when_idle(fake_env, monkeypatc
     assert subagent_runs._resume_count.get("res-idle") == 1
 
 
-async def test_no_server_resume_on_error(fake_env, monkeypatch):
-    # An errored sub-agent delivers the failure notice but MUST NOT resume.
+async def test_generic_failure_resumes_parent(fake_env, monkeypatch):
+    # A GENERIC (non-provider) failure now WAKES the parent so it can decide the
+    # next step — this fixes the hang-forever bug where a parent that spawned a
+    # sub-agent and ended its turn waited forever on a timed-out child. The wake
+    # is framed as a FAILURE and routed through the (tighter) failure cap.
+    async def boom_loop(*args, **kwargs):
+        raise RuntimeError("kaboom")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", boom_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append((session_id, framed))
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    await mit.spawn_agent("do a thing", session_id="res-err", owner="u")
+    await _wait_done("res-err")
+    await asyncio.sleep(0.02)
+
+    assert len(calls) == 1                              # failure woke the parent
+    assert calls[0][0] == "res-err"
+    assert "FAILED" in (calls[0][1] or "")             # framed as a failure notice
+    # Consumed the FAILURE cap (not the success cap).
+    assert subagent_runs._failure_resume_count.get("res-err") == 1
+    assert subagent_runs._resume_count.get("res-err", 0) == 0
+
+
+async def test_provider_error_does_not_resume(fake_env, monkeypatch):
+    # A provider/credits failure (429 / spend cap / auth) must NOT resume: the
+    # next spawn would hit the same wall and burn tokens in a spawn/fail/resume
+    # loop. It delivers the failure notice only.
+    async def rl_loop(*args, **kwargs):
+        yield "event: error\ndata: " + json.dumps({"status": 429, "text": "Provider rate-limited the request (429)."}) + "\n\n"
+        yield _sse({"delta": "The model returned an empty response. Please try again or switch to a different model."})
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_agent_loop", rl_loop)
+    calls = []
+
+    async def _capture(session_id, framed=None, owner=None):
+        calls.append(session_id)
+
+    monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
+
+    await mit.spawn_agent("do a thing", session_id="res-prov", owner="u")
+    await _wait_done("res-prov")
+    await asyncio.sleep(0.02)
+
+    assert calls == []                                  # no resume on provider error
+    assert subagent_runs._failure_resume_count.get("res-prov", 0) == 0
+    upd = subagent_runs.get_updates("res-prov")
+    assert upd["updates"][0]["resume"] is None          # not flagged server-handled
+
+
+async def test_failure_resume_capped(fake_env, monkeypatch):
+    # Repeated generic failures must not ping-pong the parent: the tighter failure
+    # cap bounds consecutive failure-driven resumes.
     async def boom_loop(*args, **kwargs):
         raise RuntimeError("kaboom")
         yield  # pragma: no cover
@@ -615,14 +673,13 @@ async def test_no_server_resume_on_error(fake_env, monkeypatch):
 
     monkeypatch.setattr("src.chat_flows.start_server_resume_turn", _capture)
 
-    await mit.spawn_agent("do a thing", session_id="res-err", owner="u")
-    await _wait_done("res-err")
-    await asyncio.sleep(0.02)
+    for _ in range(subagent_runs._MAX_FAILURE_RESUMES + 2):
+        await mit.spawn_agent("t", session_id="res-fcap", owner="u")
+        await _wait_done("res-fcap")
+        await asyncio.sleep(0.02)
+        subagent_runs._UPDATES.pop("res-fcap", None)
 
-    assert calls == []                                  # no resume on error
-    assert subagent_runs._resume_count.get("res-err", 0) == 0
-    upd = subagent_runs.get_updates("res-err")
-    assert upd["updates"][0]["resume"] is None          # not flagged server-handled
+    assert len(calls) == subagent_runs._MAX_FAILURE_RESUMES
 
 
 async def test_server_resume_cap_of_three(fake_env, monkeypatch):

@@ -26,7 +26,9 @@ SERVER_RESUME_PROMPT = (
     "The background sub-agent you dispatched has finished — its result is in the "
     "message directly above. Review it, incorporate the findings, and continue: "
     "give the outcome or the next step. Do not dispatch another sub-agent unless "
-    "it is genuinely necessary."
+    "it is genuinely necessary. If it is not, continue directly from these "
+    "findings; if a genuine gap remains, re-dispatch ONE sub-agent with a "
+    "narrower, more specific scope and an explicitly higher max_rounds."
 )
 
 

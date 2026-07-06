@@ -62,122 +62,11 @@ def _load_mcp_disabled_map() -> Dict[str, set]:
         db.close()
     return disabled_map
 
-# System prompt that tells the LLM about available tools.
-# Always injected — the LLM decides whether to use them.
-_AGENT_PREAMBLE = """\
-You are an AI assistant with tool access. You can run shell commands, execute Python, search the web, \
-read/write files, create and edit documents, generate images, manage memories, and more. \
-To use a tool, write a fenced code block with the tool name as the language tag. \
-The block executes automatically and you see the output."""
-
-_AGENT_RULES = """\
-## Rules
-- Only use tools when needed. Don't search for things you already know.
-- For web lookup/search/latest/current requests, use `web_search` or `web_fetch`. Do NOT use `bash`, `python`, `curl`, `requests`, or scraping code for web lookup unless web tools are disabled or already failed.
-- These exact tags execute automatically. For showing code examples, use ```shell, ```sh, ```py, etc. instead.
-- Multiple tool blocks per response OK. 60s timeout per tool, 10K char output limit.
-- Code/content >15 lines → ```create_document (NOT in chat). Short snippets OK in chat.
-- Editing an existing document: ALWAYS use ```edit_document with FIND/REPLACE blocks. Do NOT rewrite the whole document with ```update_document unless genuinely changing more than half of it.
-- BIAS TOWARD ACTION on edit requests. If the user says "edit out X", "remove the Y paragraph", "change Z" — JUST DO IT with your best interpretation. Don't ask for clarification on minor ambiguity. The user can undo or re-prompt if wrong.
-- AFTER A TOOL SUCCEEDS, do not second-guess. The success message ("Document edited: v2, 1 edit") means it worked. Reply in ONE short sentence confirming what was done. No re-checking, no replaying the diff in your head, no validation theater.
-- AFTER A TOOL FAILS (timeout, error, "Unknown action", "not found"), DO NOT GO SILENT. The user expects a follow-up: either retry with a fix (e.g. correct args, longer-running form, run `tail -f /tmp/foo.log` to see progress, split into smaller steps), OR explicitly tell them "this didn't work, want me to try X instead?". A failed tool is not a stopping condition — only a successful one is.
-- YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; you have plenty of rounds, so don't rush to quit just because you've made a few calls. There are exactly three ways to end a turn: (1) DONE — before you declare it, sanity-check that every concrete thing the user asked for actually exists or succeeded (file written, edit applied, command exited clean); then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you genuinely can't proceed (a capability is missing, permission denied, or data you can't obtain), so say plainly what's blocking you, in a sentence or two, and stop; (3) keep going with the single most useful next step. The only wrong moves are trailing off mid-task without one of these, and repeating a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
-- BULK email actions ("delete all those", "mark all as read", "archive these", "delete all spam", "mark these 19 read") → use the `bulk_email` tool ONCE with either the exact `uids` list from the latest `list_emails` result or `all_unread: true`. NEVER just say you deleted/archived/marked messages unless a delete/archive/mark/bulk email tool call succeeded. NEVER loop mark_email_read / archive_email / delete_email one message at a time — that floods the context and can blow the token budget. One bulk_email call handles the whole set.
-- Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
-- "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
-- Plain "list/show/check my inbox/emails" means latest inbox mail, including read messages. Do not set `unread_only: true` unless the user explicitly asks for unread/needs attention.
-- Multiple email accounts: if tool output says "Other accounts" or the user asks "my Gmail?", "other inbox?", "work mail?", "custom domain mail?", or names any mailbox/account, DO NOT answer from memory. Call `list_email_accounts` if needed, then call `list_emails`/`read_email`/`bulk_email` with the exact `account` value for that mailbox. Account names are user-defined labels; if the user typo-matches a known account, use the closest listed account instead of claiming it does not exist. NEVER use `app_api` or `/api/email/accounts` to discover email accounts; that route is owner-filtered in tool context and can falsely return empty.
-- User identity facts/preferences ("my name is <name>", "I live in <place>", "I prefer concise replies", "call me <name>") → use `manage_memory` with action=add. NEVER use `manage_contact` for facts about the user unless the user explicitly says to create/update a contact and provides contact details such as an email or phone.
-- "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate.
-- "Do X every morning / daily / on a schedule / automatically" (e.g. "summarize my inbox every morning") → this is a request to CREATE A SCHEDULED TASK, not to do X once right now. Call `manage_tasks` with action=create (prompt = what to do, schedule + cron/time). Do NOT just perform the action inline this turn — the user wants it to recur. After creating, return a clickable `[Task name](#task-<id>)` link and tell them it'll run on schedule and show in the Tasks panel. If you also want to show a sample of this run, do that AFTER creating the task, not instead of it.
-
-## UI conventions
-- When you reference an entity by ID in your reply, render it as a STANDARD markdown link with a hash-prefixed anchor. The frontend converts these into clickable jump buttons:
-  - Sessions / chats: `[Name](#session-<id>)`
-  - Documents: `[Title](#document-<id>)`
-  - Notes: `[Title](#note-<id>)`
-  - Gallery images: `[Caption](#image-<id>)`
-  - Emails (use the UID from list_emails/read_email output): `[Subject](#email-<uid>)`
-  - Calendar events (use the uid from manage_calendar): `[Summary](#event-<uid>)` — opens the calendar on that day
-  - Tasks: `[Task name](#task-<id>)`
-  - Skills: `[skill-name](#skill-<name>)`
-  - Research jobs: `[Topic](#research-<session_id>)`
-- The format is `[link text](#kind-<id>)` — text in square brackets, anchor in parens. NOT `[name] [#kind-id]` and NOT `[#kind-id]`. That's plain text and the user can't click it.
-- Use this inside lists, tables, prose — anywhere. Tables: `| Name | Open |` rows like `| Big Chat | [open](#session-abc123) |` work fine.
-- Examples:
-  - After `create_session` returns id `89effa28`: "Created [New Chat](#session-89effa28) — click to switch."
-  - Listing five sessions:
-    ```
-    1. [Big Chat](#session-abc123) — 2h ago
-    2. [Code Review](#session-def456) — 5h ago
-    3. [Note Taking](#session-ghi789) — 1d ago
-    ```
-"""
-
-_API_AGENT_RULES = """\
-## Rules
-- Prefer native tool/function calling when tools are needed.
-- Only call tools when they materially help answer the request.
-- You MUST use tools to take action — do not describe what you would do. Act, don't narrate.
-- For web lookup/search/latest/current requests, call `web_search` or `web_fetch`. Do NOT use shell, Python, curl, requests, or scraping code for web lookup unless web tools are unavailable or already failed.
-- Keep answers concise unless the user asks for depth.
-- For long code or content, use document tools instead of pasting large blocks into chat.
-- Editing an existing document: ALWAYS use `edit_document` with find/replace. Only use `update_document` for genuine full rewrites (>50% changed) — do NOT echo the entire file back for small edits.
-- If the active editor document is an email draft/compose window, treat that open email as the target for "write this", "write the email", "reply with...", "make it say...", "draft this", and similar requests. Do NOT create another document, search/list/manage documents, or open a different reply unless the user explicitly asks. Edit the open email draft with `edit_document` or `update_document`; preserve To/Cc/Bcc/Subject/In-Reply-To/References/X-* header lines unless the user asks to change them.
-- "Give suggestions / feedback / review / how can I improve this / what would make it better" about the OPEN document → call `suggest_document`, do NOT write a prose list of ideas in chat. It creates inline accept/reject bubbles on the doc. Give concrete `find`/`replace`/`reason` items. To suggest an ADDITION (e.g. "add a bow to the SVG", a new section), set `find` to a short existing anchor snippet and `replace` to that same snippet PLUS the new content. Only answer in prose when no document is open, or the request is purely conceptual with no concrete change to propose.
-- BIAS TOWARD ACTION on edit requests. If the user says "edit out X", "remove the Y paragraph", "change Z" — call the edit tool with your best interpretation. Don't ask for clarification on minor ambiguity. The user can undo.
-- AFTER A TOOL SUCCEEDS, do not second-guess. A success response means it worked. Reply in ONE short sentence confirming what was done. No verification thinking, no re-analyzing — move on.
-- AFTER A TOOL FAILS, DO NOT GO SILENT. The user expects a follow-up: retry with a fix, run a diagnostic (`tail`, `ls`, `which`), or explicitly tell them what didn't work and what you'll try next. Failure is not a stopping condition.
-- YOU DECLARE WHEN THE JOB IS DONE — not a timer. Keep taking concrete steps while the task still needs them; don't quit early just because you've made a few calls. Three ways to end a turn: (1) DONE — before declaring it, verify every concrete deliverable the user asked for actually exists or succeeded; then stop calling tools and write the final answer (that IS your "done" signal); (2) BLOCKED — you can't proceed (missing capability, permission denied, unobtainable data), so state plainly what's blocking you and stop; (3) keep going with the single most useful next step. Never trail off mid-task without (1) or (2), and never repeat a call you already ran.
-- Calendar: call `manage_calendar` with `action=list_calendars` FIRST before create/update/delete operations.
-- "Create/add/write a note" / "notes" / "todos" / "remind me to X at <time>" → use `manage_notes`. Do NOT store notes in `manage_memory`; memory is for persistent facts/preferences about the user, not note content. For reminders, include a `due_date`; for todos, use `note_type=checklist` when appropriate. `manage_tasks` is for RECURRING background AI jobs, NOT for one-off user reminders.
-- "Disable/turn off/enable/turn on <tool>" (shell, search, research, browser, documents, incognito, etc.) → call `ui_control` with `toggle <name> <on|off>`. Aliases accepted: shell→bash, search→web, deepresearch→research, documents→document_editor. NEVER record this as a memory — the user wants the toggle flipped, not a note about preferring it.
-- "Research X" / "do research on X" / "look into Y" / "deep dive on Z" → call `trigger_research` with `topic`. This starts a live job that appears in the Deep Research sidebar (streams progress + final report). **Do NOT use `web_search` for these** — saw the agent do a plain web_search for "do research on X" when the user wanted the deep-research job. "research X" is a deep-research request, not a quick lookup. (web_search is only for a single quick fact mid-task.) Do NOT POST /api/research/start via app_api either — blocked. After starting, tell the user it's running in the Deep Research sidebar. Only if the user explicitly wants it inline/quick should you fall back to web_search.
-- "Open/show <panel>" (documents, library, gallery, email, inbox, sessions, brain/memories, skills, settings, notes, cookbook) → call `ui_control` with `open_panel <name>`. Panel aliases: library/doc/docs/document→documents, images→gallery, mail/inbox/emails→email, chats/history→sessions, memory/memories→brain, preferences→settings, models/serve/serving→cookbook. CRITICAL: "open memory/memories/brain" / "open skills" / "open notes" / "open documents" / "open cookbook" means OPEN THE PANEL — call `ui_control`, NOT a manage/list tool. The "manage_*" tools list contents in chat; `ui_control open_panel` opens the visual modal the user is asking for.
-- "Write/draft a reply saying X" for an open/read email → call `ui_control` with `action="open_email_reply"`, the email `uid`/`folder`, `mode="reply"`, and `body` containing the drafted reply. This opens the same email compose document as clicking Reply and DOES NOT send. Do NOT call `reply_to_email` unless the user explicitly says to send immediately.
-- "Open/start a reply", "open a reply to <sender>", "draft a reply window" with no requested body → find/read the email if needed, then call `ui_control` with `open_email_reply <uid> <folder> reply`.
-- Bulk email actions ("delete all those", "archive these", "mark all read") require a real email tool call. Use `bulk_email` once with UIDs from the latest `list_emails` result and the same `account`; never claim success without the tool result.
-- Email UIDs are the values after `UID:` in tool output, not list row numbers. For example, row `1.` with `UID: 90186` must use `"90186"`, never `"1"`.
-- "Last/latest/newest email" means call `list_emails` with `max_results: 1`, `unread_only: false`, and the right `account`, then read the UID returned by that tool if full content is needed. NEVER use a table row number like "#18" as an email UID.
-- Plain "list/show/check my inbox/emails" means latest inbox mail, including read messages. Do not set `unread_only: true` unless the user explicitly asks for unread/needs attention.
-- Multiple email accounts: if tool output says "Other accounts" or the user asks "my Gmail?", "other inbox?", "work mail?", "custom domain mail?", or names any mailbox/account, DO NOT answer from memory or infer it is the same inbox. Call `list_email_accounts` if needed, then call `list_emails`/`read_email`/`bulk_email` with the exact `account` value for that mailbox. Account names are user-defined labels; if the user typo-matches a known account, use the closest listed account instead of claiming it does not exist. NEVER use `app_api` or `/api/email/accounts` to discover email accounts; that route is owner-filtered in tool context and can falsely return empty.
-- User identity facts/preferences ("my name is <name>", "I live in <place>", "I prefer concise replies", "call me <name>") → use `manage_memory` with action=add. NEVER use `manage_contact` for facts about the user unless the user explicitly says to create/update a contact and provides contact details such as an email or phone.
-- You are running INSIDE Odysseus — there is no OpenWebUI, ChatGPT, or external chat backend to query. All chats/sessions live in THIS app and are accessed via `list_sessions` (or `manage_session` with `action=list`), and deleted via `manage_session` with `action=delete`. Do NOT shell out to find sqlite files, curl localhost:8080, or grep for routers — those don't exist here. If `list_sessions` returns rows, that IS the source of truth.
-- After `list_sessions`, preserve the returned `[Chat title](#session-<id>)` links in your user-facing reply. Do not rewrite chat lists as plain tables with non-clickable titles.
-- "Cookbook" = the LLM-serving subsystem (NOT chat sessions, NOT a recipe app). Routing:
-  • "What's running" / "what's serving" / "show my cookbook" / "is anything up" → **first action MUST be `list_served_models` (no args)**. The tool is ALWAYS available. Do not run `ps aux`, do not `curl localhost:8000`, do not `which vllm`. Even if you don't remember seeing the tool listed, it IS available — call it. The output IS the source of truth (it tracks diffusion models, vLLM, SGLang, llama.cpp, Ollama, etc. — anything spawned via the cookbook, including remote hosts that `ps aux` here can't see).
-  • "What's downloading" / "show downloads" → `list_downloads` (always available).
-  • "What models do I have" → `list_cached_models` (always available).
-  • "Kill / stop / shut down" → `stop_served_model` (or `cancel_download`) with the session_id from the list.
-  • Searching for a model → `search_hf_models`.
-  • Downloading or serving a model → these run on a SERVER. If the user names one ("on gpu-box", "on the gpu box") pass `host=`. If they DON'T name one, the tool defaults to the cookbook's currently-selected server (NOT localhost). When there are multiple servers and it's genuinely ambiguous which they mean, call `list_cookbook_servers` and ask. Only download to localhost when the user explicitly says "locally" / "on this machine" (pass `local=true`).
-  • Image/inpainting/diffusion serve requests ("serve inpaint", "SDXL inpainting", "image model") → use `serve_model` with the built-in Diffusers command: `python3 scripts/diffusion_server.py --model <repo> --port 8100` (or another free port). Do NOT invent modules like `diffusers_api_server`, and do NOT use bash/ssh/pip directly. The Cookbook route copies `scripts/diffusion_server.py` to remote hosts and registers the image endpoint.
-  • Launching a known model ("run SD 3.5", "start the inpaint model", "serve qwen") → **FIRST** `list_serve_presets` to find the saved launch template, **THEN** `serve_preset {name: "..."}`. Do NOT fabricate a tmux command — the user already saved working ones from the UI. Only fall back to raw `serve_model` if no preset matches.
-  • Launching a model the user names ("serve minimax m2.7 on gpu-box") with NO preset → `serve_model {repo_id, cmd, host}`. The cookbook route OWNS tmux session creation AND state-file registration AND UI live-refresh — bypassing it produces an orphan the UI can never see. After launching, call `list_served_models` to verify readiness. If it reports a diagnosis and suggested adjusted command, retry with `serve_model` using that command instead of asking the user to debug raw tmux logs.
-  • Adopting an already-running tmux session (someone or a prior bash launch started a server, but it's not in the cookbook) → `adopt_served_model {host, tmux_session, model, port}`. This registers it in cookbook_state.json AND adds it as a chat endpoint so the user can pick it in the model dropdown. Use this whenever you find a running server that the cookbook doesn't know about.
-  • After ANY successful serve (preset or raw or adopted), the cookbook's serve flow auto-adds the model as an endpoint. If for some reason it didn't (e.g. the launch was external), call `adopt_served_model` to fix both at once, or `manage_endpoints` with action=add to register the URL manually.
-  **Anti-pattern (CRITICAL — saw the agent do this and it produced an orphan session invisible to the UI):** `ssh <host> 'tmux new-session ... vllm serve ...'` via bash. THIS IS WRONG even when it "works". The launch must go through `serve_model` so the cookbook route creates the tmux session AND writes the task to cookbook_state.json. If the user asks for a launch and you reach for bash/ssh/tmux, STOP — call `serve_model` instead. Bash launches don't show up in the Cookbook UI, can't be `stop_served_model`'d, and don't survive a UI refresh.
-  Anti-pattern (DO NOT do this — saw it twice): "I don't see list_served_models in my tool list, let me try bash ps aux." → wrong. The tool IS available. Just call it.
-  Anti-pattern: POSTing to `/api/cookbook/state` via `app_api` — that overwrites the whole state file (presets and all). Blocked. Use serve_preset / serve_model / stop_served_model.
-
-## UI conventions
-- When referencing an entity by ID, render it as a STANDARD markdown link with a hash-prefixed anchor — the frontend renders these as clickable jump buttons:
-  - Sessions / chats: `[Name](#session-<id>)`
-  - Documents: `[Title](#document-<id>)`
-  - Notes: `[Title](#note-<id>)`
-  - Gallery images: `[Caption](#image-<id>)`
-  - Emails (use the UID from list_emails/read_email output): `[Subject](#email-<uid>)`
-  - Calendar events (use the uid from manage_calendar): `[Summary](#event-<uid>)` — opens the calendar on that day
-  - Tasks: `[Task name](#task-<id>)`
-  - Skills: `[skill-name](#skill-<name>)`
-  - Research jobs: `[Topic](#research-<session_id>)`
-- The format is `[link text](#kind-<id>)` — text in square brackets, anchor in parens. NOT `[name] [#kind-id]` and NOT `[#kind-id]`. That's plain text and the user can't click it.
-- Use this inside lists, tables, prose — anywhere. Tables: `| Big Chat | [open](#session-abc123) |` works.
-- Examples:
-  - After `create_session` returns id `89effa28`: "Created [New Chat](#session-89effa28) — click to switch."
-  - Listing sessions: "1. [Big Chat](#session-abc123) — 2h ago, 2. [Code Review](#session-def456) — 5h ago\""""
-
+# NOTE: earlier, verbose definitions of _AGENT_PREAMBLE / _AGENT_RULES /
+# _API_AGENT_RULES used to live here. They were dead code — unconditionally
+# shadowed by the lean redefinitions below (Python keeps the last binding) and
+# never read, since the first use is in _assemble_prompt further down. Removed
+# to stop them misleading readers into editing strings that never ship.
 _AGENT_PREAMBLE = """\
 You are an AI assistant with tool access. Only the tools listed below are available for this turn.
 To use a tool, write a fenced code block with the tool name as the language tag. The block executes automatically and you see the output."""
@@ -194,6 +83,7 @@ _AGENT_RULES = """\
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
 - For multi-step work, call `update_plan` to record and tick off a checklist so progress stays visible and the thread stays coherent.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
+- Before each tool call, write a few words saying what you are about to do (e.g. "Checking sprite rendering."). Keep it to a single line; do not narrate results — the tool output speaks for itself.
 """
 
 _API_AGENT_RULES = """\
@@ -211,6 +101,7 @@ _API_AGENT_RULES = """\
 - Finish only when the user's concrete request is actually done, or clearly state that you are blocked.
 - For multi-step work, call `update_plan` to record and tick off a checklist so progress stays visible and the thread stays coherent.
 - User identity facts/preferences ("my name is X", "call me X", "I live in X") use `manage_memory`, not contacts.
+- Before each tool call, write a few words saying what you are about to do (e.g. "Checking sprite rendering."). Keep it to a single line; do not narrate results — the tool output speaks for itself.
 """
 
 _LINK_RULES = """\
@@ -248,11 +139,7 @@ _DOMAIN_RULES = {
     "cookbook": """\
 ## Cookbook/model-serving rules
 - Cookbook is the LLM-serving subsystem.
-- "What's running/serving" starts with `list_served_models`. "What's downloading" uses `list_downloads`.
-- Launch known models by checking `list_serve_presets` before raw `serve_model`.
-- Downloads/serves run on a Cookbook server; pass the named `host` when the user names one.
-- Do not launch model servers manually with bash/ssh/tmux. Use `serve_model`/`serve_preset` so the UI can track and stop them.
-- After a successful serve, verify with `list_served_models`; if an external server is running but invisible, use `adopt_served_model`.""",
+- For conventions (which tool first, manual-launch pitfalls), read the 'cookbook-conventions' skill.""",
     "notes_calendar_tasks": """\
 ## Notes/calendar/tasks rules
 - Notes/todos/reminders use `manage_notes`, not memory.
@@ -480,10 +367,10 @@ Bulk delete/archive/mark emails. Use this for "delete all those" after listing e
 Calendar event management (CalDAV). Actions: `list_events`, `create_event`, `update_event`, `delete_event`, `list_calendars`. \
 For `list_events`: {action: "list_events", start: "YYYY-MM-DDT00:00:00", end: "YYYY-MM-DDT00:00:00", calendar?}; resolve month/week phrases yourself from the Current date and time context and do not pass a loose `query` field. Prefer `start`/`end`; start_time/end_time, start_date/end_date, and from/to aliases are accepted. \
 For `create_event`: {summary, dtstart, dtend?, duration?, calendar?, location?, description?, reminder_minutes?, rrule?}. \
-For `update_event`: {uid, summary?, dtstart?, dtend?, all_day?, location?, description?, event_type?, importance?, rrule?}. Pass `rrule: ""` to remove recurrence and make a repeating event a single event. \
+For `update_event`: {uid, summary?, dtstart?, dtend?, all_day?, location?, description?, event_type?, importance?, rrule?}. \
 `dtstart` accepts natural language ("tomorrow at 1pm", "in 2 hours", "next monday 9am") or ISO ("2026-05-12T13:00:00"). \
 If `dtend` omitted, defaults to dtstart+1h (or +1d when `all_day: true`). \
-For a RECURRING event pass `rrule` as an iCalendar RRULE string, e.g. `"FREQ=WEEKLY;BYDAY=MO"` (every Monday), `"FREQ=DAILY;COUNT=10"`, or `"FREQ=MONTHLY;BYMONTHDAY=1"` — create ONE event with the rrule, do not loop creating many events. Do not pass `rrule` for "next Wednesday only", "just this once", or any single occurrence. \
+For recurring events, read the 'calendar-recurrence' skill first. \
 If the user asks for a reminder/alarm before the event, pass `reminder_minutes` as an integer; do not write reminder text into the event description and do NOT also call `manage_notes` for the same reminder because calendar reminders are routed through Notes automatically. \
 `calendar` accepts a name ("Main") or short-id prefix.""",
     "spawn_agent": "- ```spawn_agent``` — Spawn/dispatch a sub-agent that runs a full tool-using loop on a self-contained task IN THE BACKGROUND and delivers its result back into the chat when done (returns immediately — do NOT wait for it). Content = the task. Do NOT add a `model:` line — a default sub-agent model is configured and the harness routes it; only pin `model: <name>` for a specific reason (e.g. the task needs vision and the default can't see images), and if so call `list_models` first to get a real vision-capable name rather than guessing. The sub-agent has files/shell/browser tools but CANNOT spawn more agents. Use to dispatch/delegate a focused subtask, e.g. `spawn_agent` then `screenshot localhost:1338 and list what looks visually wrong`.",
@@ -512,26 +399,7 @@ If the user asks for a reminder/alarm before the event, pass `reminder_minutes` 
 ```
 GENERIC LOOPBACK to allowed Odysseus internal endpoints. Use this whenever the user wants something the UI can do but there's NO named tool for it. Many UI buttons hit /api/* endpoints — you can hit allowed ones. Auth is handled automatically.
 
-**Discovery first.** If you're not sure of the path, call `{"action":"endpoints","filter":"<keyword>"}` (e.g. filter='calendar' or 'gallery' or 'theme') to list available endpoints with their methods + summaries. Then call with action='call'.
-
-**Common surfaces (use `endpoints` with filter to discover the full set per domain):**
-- Calendar: `/api/calendar/events`, `/api/calendar/calendars`, `/api/calendar/events/{uid}`
-- Cookbook: `/api/cookbook/gpus`, `/api/cookbook/state`, `/api/cookbook/setup`, `/api/cookbook/packages`, `/api/cookbook/hf-latest`, `/api/model/cached`. Do NOT use `app_api` for package installs, engine rebuilds, or PID signalling.
-- Gallery: `/api/gallery/list`, `/api/gallery/delete`, `/api/gallery/{id}`, `/api/gallery/albums`
-- Library / Documents: list all via `/api/documents/library`; docs in a session via `/api/documents/{session_id}`; a single doc via `/api/document/{id}` (singular) and its history via `/api/document/{id}/versions` (singular). Note the plural `/api/documents/...` vs singular `/api/document/{id}` split.
-- Memory: `/api/memory`, `/api/memory/{id}`, `/api/memory/search`
-- Notes: `/api/notes`, `/api/notes/{id}`
-- Tasks: `/api/tasks`, `/api/tasks/{id}/run`, `/api/tasks/notifications`
-- Sessions: `/api/sessions`, `/api/session/{id}`, `/api/session/{id}/truncate`
-- Themes: `/api/prefs/themes`, `/api/prefs/custom-themes`
-- Settings: `/api/settings`, `/api/prefs/{key}`
-- Research: `/api/research/start`, `/api/research/tasks` (note: `/api/research/report/{id}` renders HTML — to READ a report's text use the `manage_research` tool with `action:read`, not this endpoint)
-- Compare: `/api/compare/sessions`, `/api/compare/start`
-- Email: use named email tools (`list_email_accounts`, `list_emails`, `read_email`, `send_email`, `reply_to_email`). Do NOT use `/api/email/accounts`; it is owner-filtered in tool context and may falsely return empty.
-- Endpoints (model providers): `/api/endpoints`, `/api/endpoints/{id}`
-- Shell: do NOT use `app_api` for `/api/shell/*`; use named command tooling instead.
-
-Body for POST/PUT/PATCH goes in `body` (object). Query params in `query` (object). Returns the parsed JSON of the response.
+**Discovery first.** If you're not sure of the path, call `{"action":"endpoints","filter":"<keyword>"}` (e.g. filter='calendar' or 'gallery' or 'theme') to list available endpoints with their methods + summaries. Then call with action='call'. Full endpoint catalog: read the 'app-api-endpoints' skill.
 
 **When to prefer named tools over app_api:** if a named wrapper exists (list_email_accounts, list_emails, read_email, manage_calendar, manage_notes, list_served_models, etc.) USE IT — it has nicer output formatting and clearer schema. Reach for `app_api` only when there's no wrapper for what you need.
 
@@ -1928,6 +1796,8 @@ def _build_base_prompt(
     disabled = set(disabled_tools or [])
     if not get_setting("image_gen_enabled", False):
         disabled.add("generate_image")
+    if not get_setting("video_gen_enabled", False):
+        disabled.add("generate_video")
 
     if relevant_tools is not None:
         # RAG mode: trust the relevant_tools set as already-composed.
@@ -2182,8 +2052,16 @@ def _compute_final_metrics(
     prep_timings: Optional[Dict[str, float]] = None,
     backend_gen_tps: float = 0,
     backend_prefill_tps: float = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
 ) -> dict:
-    """Compute token counts, TPS, and build the final metrics dict."""
+    """Compute token counts, TPS, and build the final metrics dict.
+
+    ``real_input_tokens``/``real_output_tokens`` and the two cache-token
+    counters are PER-TURN SUMS accumulated across every agent round (not the
+    last round's values). Cache keys follow llm_core's lean convention:
+    attached only when non-zero, so downstream treats a missing key as 0.
+    """
     if has_real_usage:
         input_tokens = real_input_tokens
         output_tokens = real_output_tokens
@@ -2222,6 +2100,12 @@ def _compute_final_metrics(
         "usage_source": "real" if has_real_usage else "estimated",
         "model": model,
     }
+    # Per-turn Anthropic prompt-cache sums — only when non-zero (lean events;
+    # routes/chat_helpers/database are wired to forward these unchanged).
+    if cache_read_tokens:
+        metrics["cache_read_tokens"] = cache_read_tokens
+    if cache_creation_tokens:
+        metrics["cache_creation_tokens"] = cache_creation_tokens
     if backend_prefill_tps and backend_prefill_tps > 0:
         metrics["prefill_tps"] = round(backend_prefill_tps, 2)
     if prep_timings:
@@ -2539,6 +2423,87 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+# ── Broad-exploration loop-breaker (two-stage) ──────────────────────────────
+# A DIFFERENT circling shape than the exact-signature / similarity detectors
+# above: a model that keeps making DISTINCT read-only/introspection calls
+# (never repeating one exactly, so neither of those breakers fires) without
+# ever writing a real answer. Observed with Gemini: 50 distinct read-only
+# tool calls in one turn, no answer text, 2.19M input tokens over 373s.
+#
+# Two stages, NOT a single hard tripwire — a real investigation can
+# productively make 50+ distinct read-only calls, and a model doing genuine
+# deep exploration must not be killed just for taking a while:
+#   Stage 1 (NUDGE, nothing terminates): after N1 consecutive read-only rounds
+#     with no answer text, inject a visible check-in note asking the model to
+#     briefly state progress, then continue. A model that's actually making
+#     progress just answers the check-in and keeps going — the streak resets
+#     on ANY real answer text, including that reply.
+#   Stage 2 (handshake): only if ANOTHER N2 read-only rounds pass AFTER the
+#     nudge with STILL no answer text (i.e. it couldn't even summarize its own
+#     progress) does the same "declare done or blocked" handshake the
+#     exact-signature loop-breaker uses actually fire. Termination pressure
+#     only lands on the aimless case, never the productive one.
+_READ_ONLY_EXPLORATION_TOOLS = frozenset({
+    "ls", "bash", "grep", "read_file", "get_workspace", "glob",
+})
+# JSON `action` values (or the bare/whole content, for tools that take a
+# single verb) that make a manage_* call read-only/introspective rather than
+# a mutation — e.g. manage_agents' own docstring: "(empty) or 'list' -> list
+# running/recently-finished sub-agents".
+_MANAGE_TOOL_READONLY_ACTIONS = frozenset({"", "list", "status", "view", "get", "search"})
+_DEFAULT_BROAD_EXPLORATION_NUDGE_ROUNDS = 10   # tunable via agent_broad_exploration_nudge_rounds (stage 1)
+_DEFAULT_BROAD_EXPLORATION_HANDSHAKE_ROUNDS = 10  # tunable via agent_broad_exploration_handshake_rounds (stage 2, AFTER the nudge)
+
+
+def _is_readonly_exploration_block(block) -> bool:
+    """True when a tool_block is a read-only/introspection call: one of the
+    fixed exploration tools, or a manage_* call whose action is a read-only
+    verb (list/status/view/get/search) rather than a mutation."""
+    if block.tool_type in _READ_ONLY_EXPLORATION_TOOLS:
+        return True
+    if not block.tool_type.startswith("manage_"):
+        return False
+    raw = (block.content or "").strip()
+    if not raw:
+        return True   # empty content = the tool's own "default to list" case
+    if raw.lower() in _MANAGE_TOOL_READONLY_ACTIONS:
+        return True
+    if raw.startswith("{"):
+        try:
+            args = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if isinstance(args, dict):
+            action = str(args.get("action", "")).strip().lower()
+            return action in _MANAGE_TOOL_READONLY_ACTIONS
+    return False
+
+
+def _broad_exploration_nudge_rounds() -> int:
+    """Stage 1: how many consecutive read-only-only, answer-free rounds before
+    a visible check-in note is injected (does not terminate anything). Tunable
+    via agent_broad_exploration_nudge_rounds; falls back to the default."""
+    try:
+        v = int(get_setting("agent_broad_exploration_nudge_rounds", _DEFAULT_BROAD_EXPLORATION_NUDGE_ROUNDS)
+                 or _DEFAULT_BROAD_EXPLORATION_NUDGE_ROUNDS)
+        return v if v >= 1 else _DEFAULT_BROAD_EXPLORATION_NUDGE_ROUNDS
+    except (TypeError, ValueError):
+        return _DEFAULT_BROAD_EXPLORATION_NUDGE_ROUNDS
+
+
+def _broad_exploration_handshake_rounds() -> int:
+    """Stage 2: how many FURTHER consecutive read-only-only, answer-free
+    rounds AFTER the stage-1 nudge before the "declare done or blocked"
+    handshake fires. Tunable via agent_broad_exploration_handshake_rounds;
+    falls back to the default."""
+    try:
+        v = int(get_setting("agent_broad_exploration_handshake_rounds", _DEFAULT_BROAD_EXPLORATION_HANDSHAKE_ROUNDS)
+                 or _DEFAULT_BROAD_EXPLORATION_HANDSHAKE_ROUNDS)
+        return v if v >= 1 else _DEFAULT_BROAD_EXPLORATION_HANDSHAKE_ROUNDS
+    except (TypeError, ValueError):
+        return _DEFAULT_BROAD_EXPLORATION_HANDSHAKE_ROUNDS
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -2566,8 +2531,14 @@ async def stream_agent_loop(
     _is_teacher_run: bool = False,
     suppress_low_signal: bool = False,
     tool_events_sink: Optional[list] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
+
+    `reasoning_effort` ("off"/"low"/"medium"/"high", or None/"default" for no
+    override) is the UI's reasoning-effort selector — threaded straight through
+    to every `stream_llm_with_fallback` call this turn makes; see
+    `apply_reasoning_effort` in llm_core.py for the per-provider mapping.
 
     Yields SSE events:
       - data: {"delta": "text"}                             (text chunks)
@@ -2666,6 +2637,8 @@ async def stream_agent_loop(
         direct_actual_model = model
         real_input_tokens = 0
         real_output_tokens = 0
+        _direct_cache_read = 0
+        _direct_cache_write = 0
         try:
             async for chunk in stream_llm_with_fallback(
                 [(endpoint_url, model, headers)] + list(fallbacks or []),
@@ -2676,6 +2649,7 @@ async def stream_agent_loop(
                 tools=None,
                 timeout=int(get_setting("agent_stream_timeout_seconds", 300) or 300),
                 session_id=session_id,
+                reasoning_effort=reasoning_effort,
             ):
                 if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                     try:
@@ -2688,6 +2662,8 @@ async def stream_agent_loop(
                         direct_actual_model = usage.get("model") or direct_actual_model
                         real_input_tokens += usage.get("input_tokens", 0) or 0
                         real_output_tokens += usage.get("output_tokens", 0) or 0
+                        _direct_cache_read += usage.get("cache_read_tokens", 0) or 0
+                        _direct_cache_write += usage.get("cache_creation_tokens", 0) or 0
                         continue
                     if data.get("type") == "model_actual":
                         direct_actual_model = data.get("model") or direct_actual_model
@@ -2729,6 +2705,14 @@ async def stream_agent_loop(
             "tool_calls": 0,
             "direct_low_signal": True,
         }
+        # Same lean convention as _compute_final_metrics: cache keys only
+        # when non-zero; downstream treats missing as 0.
+        if _direct_cache_read:
+            metrics["cache_read_tokens"] = _direct_cache_read
+        if _direct_cache_write:
+            metrics["cache_creation_tokens"] = _direct_cache_write
+        if reasoning_effort and reasoning_effort != "default":
+            metrics["reasoning_effort"] = reasoning_effort
         yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -3048,16 +3032,27 @@ async def stream_agent_loop(
         else:
             messages.insert(0, {"role": "system", "content": PLAN_MODE_DIRECTIVE})
     elif approved_plan and approved_plan.strip() and not guide_only:
-        # EXECUTING an approved plan. Pin the checklist as a top-of-context
-        # system note so a long plan on a weak model survives history
-        # truncation — the agent can always re-read the plan instead of losing
-        # the thread. (The first system message is kept by the context trimmer.)
+        # EXECUTING an approved plan. The checklist is re-sent by the frontend
+        # every turn and CHANGES whenever the user ticks a checkbox / the model
+        # calls update_plan. Prepending it into the (large, tool-laden) system
+        # message therefore rewrote the system prompt byte-for-byte on every
+        # plan mutation — invalidating the Anthropic prefix cache (tools+system
+        # sit at position 0) and paying the 1.25x cache-write penalty each time.
+        # Inject it as a standalone USER-role note near the last user message
+        # instead — exactly like _datetime_message / the sub-agent context note
+        # below — so the static system prefix stays byte-identical across turns
+        # while the model still re-reads the current plan every turn. The note's
+        # framing ("provided here every turn ... just read it below") is
+        # placement-agnostic and still reads correctly as a user-role message.
         _plan_note = build_active_plan_note(approved_plan)
-        if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = _plan_note + "\n\n" + (messages[0].get("content") or "")
-        else:
-            messages.insert(0, {"role": "system", "content": _plan_note})
-        logger.info("[plan] pinned approved plan (%d chars) for execution turn", len(approved_plan))
+        if _plan_note:
+            _plan_luidx = 0
+            for _pi in range(len(messages) - 1, -1, -1):
+                if messages[_pi].get("role") == "user":
+                    _plan_luidx = _pi
+                    break
+            messages.insert(_plan_luidx, {"role": "user", "content": _plan_note})
+            logger.info("[plan] injected approved plan (%d chars) as user-role note for execution turn", len(approved_plan))
     if guide_only:
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = GUIDE_ONLY_DIRECTIVE + "\n\n" + (messages[0].get("content") or "")
@@ -3090,6 +3085,11 @@ async def stream_agent_loop(
     prep_timings["prompt_build"] = time.time() - _t2
 
     _t3 = time.time()
+    # Effective trim budget/reserve, remembered past this block so the round
+    # loop below can re-trim mid-turn with the SAME numbers (None when the
+    # soft budget is disabled/unset, matching this block's own skip condition).
+    _mid_turn_trim_budget: Optional[int] = None
+    _mid_turn_reserve_tokens: Optional[int] = None
     try:
         from src.context_compactor import trim_for_context
         from src.context_budget import compute_input_token_budget, DEFAULT_HARD_MAX, DEFAULT_BUDGET, budget_is_explicit as _budget_is_explicit
@@ -3137,6 +3137,8 @@ async def stream_agent_loop(
                     reserve_tokens,
                 )
                 messages = trimmed_messages
+            _mid_turn_trim_budget = effective_budget
+            _mid_turn_reserve_tokens = reserve_tokens
     except Exception as e:
         logger.warning("[agent] Soft context trim skipped: %s", e)
     prep_timings["context_trim"] = time.time() - _t3
@@ -3174,6 +3176,13 @@ async def stream_agent_loop(
     _verifier_instruction = _extract_last_user_message(messages)
     real_input_tokens = 0   # Accumulated real usage from API
     real_output_tokens = 0
+    # Per-turn SUMS of Anthropic prompt-cache usage across rounds. llm_core
+    # attaches cache_read_tokens / cache_creation_tokens to the usage event
+    # only when non-zero (missing = 0); accumulate here so the final metrics
+    # event carries turn totals for cost attribution downstream (see the
+    # handoff note in routes/chat_routes.py's agent-mode metrics handler).
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
     last_round_input_tokens = 0  # Last round's input tokens (for context % peak)
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
@@ -3193,6 +3202,41 @@ async def stream_agent_loop(
     # lets a legit batch (e.g. 18 calendar events at once) through.
     _call_freq: collections.Counter = collections.Counter()
     _force_answer = False  # set by loop-breaker → next round runs with NO tools
+
+    # Broad-exploration loop-breaker (two-stage): consecutive rounds of
+    # read-only/introspection-only tool calls (never repeating exactly, so the
+    # exact-signature/similarity detectors above don't fire) with no real
+    # answer text. _broad_exploration_streak counts read-only-only, answer-
+    # free rounds; _broad_exploration_nudge_fired remembers whether stage 1's
+    # check-in note has already gone out for the CURRENT streak, so stage 2
+    # only counts rounds AFTER that nudge. Any real answer text (including a
+    # reply to the nudge itself) resets both. Limits resolved once per turn
+    # (a settings lookup each).
+    _broad_exploration_streak = 0
+    _broad_exploration_nudge_fired = False
+    _broad_exploration_nudge_limit = _broad_exploration_nudge_rounds()
+    _broad_exploration_handshake_limit = _broad_exploration_handshake_rounds()
+
+    # Per-turn memo for get_workspace: it takes no args and reports static
+    # per-turn state (the active workspace folder), so calling it more than
+    # once a turn is pure waste — observed 9x in one session. Scoped to this
+    # call of stream_agent_loop only (a local, not module/global state), so
+    # nothing leaks across turns or sessions.
+    _workspace_memo: Optional[tuple] = None  # (desc, result) once resolved this turn
+
+    # Similarity loop detector: the exact-signature detector above only catches
+    # byte-identical repeats. A model can also thrash by re-reading OVERLAPPING
+    # (not identical) ranges of the same file, or re-editing the same old_string
+    # repeatedly with different new_string each time — neither trips the exact
+    # signature. Observed: one turn re-read overlapping ranges of the same file
+    # 12x and re-edited the same old_string 3x. path -> list of (start, end)
+    # line ranges already served this turn (read_file); path -> set of
+    # old_string values already applied via edit_file this turn.
+    _read_ranges_by_path: Dict[str, list] = {}
+    _edit_oldstrings_by_path: Dict[str, set] = {}
+    # (kind, path) pairs already nudged this turn, so the one-line system note
+    # fires once per region/edit rather than every repeat after the 2nd.
+    _similarity_notes_given: set = set()
     # Supervisor: how many times we've nudged the model after it announced
     # an action without emitting the tool call. Capped to prevent a model
     # that *can't* call the tool from looping forever.
@@ -3373,6 +3417,7 @@ async def stream_agent_loop(
             tool_choice_none=_ody_doc_finetune_mode,
             timeout=agent_stream_timeout,
             session_id=session_id,
+            reasoning_effort=reasoning_effort,
         ):
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -3466,6 +3511,9 @@ async def stream_agent_loop(
                         round_input = u.get("input_tokens", 0)
                         real_input_tokens += round_input
                         real_output_tokens += u.get("output_tokens", 0)
+                        # Anthropic prompt-cache usage — keys absent when zero.
+                        cache_read_tokens += u.get("cache_read_tokens", 0) or 0
+                        cache_creation_tokens += u.get("cache_creation_tokens", 0) or 0
                         last_round_input_tokens = round_input
                         has_real_usage = True
                         # Backend-reported TRUE generation speed (llama.cpp
@@ -3720,7 +3768,43 @@ async def stream_agent_loop(
         # persisted text either — otherwise it streams once and then disappears
         # on reload (#3222 follow-up).
         cleaned_round = strip_tool_blocks(round_response, skip_fenced=(_is_api_model and not used_native and not guide_only)).strip()
-        round_texts.append(cleaned_round)
+        # Channel-based reasoning (DeepSeek reasoning_content, vLLM
+        # --reasoning-parser, Anthropic/Gemini thinking blocks — anything that
+        # arrived as a `{"thinking": true}` SSE delta this round, accumulated
+        # above into `round_reasoning`) streams live to the client but was
+        # never captured anywhere persisted: round_texts only ever held the
+        # VISIBLE text, so a reload lost the thinking entirely (top complaint).
+        # Prepend it here as an inline <think> tag — the exact shape the
+        # history renderer already parses for the non-agent chat path
+        # (routes/chat_helpers.py's _extract_thinking_meta /
+        # static/js/markdown.js's extractThinkingBlocks both accept
+        # `<think time="N">...</think>` immediately followed by the reply).
+        # Only THIS persisted-history copy changes: `cleaned_round` itself
+        # stays visible-only, since it also feeds the caption heuristic below
+        # and the claimed-done / intent-nudge / real-text checks further down,
+        # none of which should react to thinking content.
+        if round_reasoning.strip():
+            _round_elapsed = round(time.time() - _round_start, 2)
+            _think_tag = f'<think time="{_round_elapsed}">' if _round_elapsed > 0 else '<think>'
+            _round_text_for_history = _think_tag + round_reasoning.strip() + '</think>' + (
+                ('\n\n' + cleaned_round) if cleaned_round else ''
+            )
+        else:
+            _round_text_for_history = cleaned_round
+        round_texts.append(_round_text_for_history)
+
+        # Tool-call caption: the short plain-text lead-in the model wrote before
+        # calling tools this round, persisted so the frontend renders the same
+        # caption live and on reload instead of re-deriving it with a duplicated
+        # 120-char heuristic. <think> blocks are stripped first — thinking is
+        # never a caption. Only kept when short (<=120 chars) and single-
+        # paragraph (no blank-line break): a short lead-in like "Let me check
+        # that file." is a caption; a multi-paragraph explanation is not.
+        _round_caption_text = _strip_think_blocks(cleaned_round).strip()
+        if _round_caption_text and len(_round_caption_text) <= 120 and not re.search(r"\n\s*\n", _round_caption_text):
+            _round_caption = _round_caption_text
+        else:
+            _round_caption = None
 
         # ── FIX 2: unconvertible tool calls must not vanish ──────────────
         # A native tool call that failed function_call_to_tool_block() was
@@ -3846,6 +3930,12 @@ async def stream_agent_loop(
                 })
                 # Visible signal in the stream so the user knows we caught it.
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                # Separator in accumulated response — this round's text and the
+                # next round's text are otherwise concatenated with no boundary
+                # (observed: "...12.5 KB.index.html (12542 B)..." glued together
+                # in persisted content). Mirrors the separator every other
+                # round-continuation path below already applies.
+                full_response += "\n\n"
                 continue
             # FINAL DRAIN: the model produced no tool call and is about to end the
             # turn. Before ending, drain the steering queue one last time — a
@@ -3886,6 +3976,97 @@ async def stream_agent_loop(
         _recent_call_sigs.append(_sig)
         for _b in tool_blocks:
             _call_freq[f"{_b.tool_type}:{(_b.content or '').strip()[:120]}"] += 1
+
+        # ── Similarity loop detector (near-duplicate reads/edits) ──────
+        # The exact-signature detector above only catches byte-identical
+        # repeats. Two near-duplicate shapes it misses:
+        #   - read_file: overlapping (not identical) offset/limit ranges on
+        #     the same path — e.g. re-reading lines 1-200 then 150-350.
+        #   - edit_file: the same old_string on the same path repeated,
+        #     regardless of new_string (a model retrying a failed/rejected
+        #     edit with slightly different replacement text each time).
+        # On the 2nd occurrence, inject a one-line system note (same
+        # mechanism as the exact-signature loop-breaker's system message
+        # below) so the model acts on what it already has instead of
+        # re-reading/re-editing the same region a 3rd, 4th, ... time.
+        for _b in tool_blocks:
+            if _b.tool_type not in ("read_file", "edit_file"):
+                continue
+            _raw = (_b.content or "").strip()
+            _args = {}
+            if _raw.startswith("{"):
+                try:
+                    _args = json.loads(_raw)
+                except (json.JSONDecodeError, TypeError):
+                    _args = {}
+            _path = str(_args.get("path", "") or "").strip()
+            if not _path:
+                continue
+
+            if _b.tool_type == "read_file":
+                try:
+                    _rd_offset = int(_args.get("offset") or 0)
+                    _rd_limit = int(_args.get("limit") or 0)
+                except (TypeError, ValueError):
+                    _rd_offset, _rd_limit = 0, 0
+                _rd_start = max(_rd_offset, 1)
+                # No limit = whole file from start; treat as an effectively
+                # unbounded range so it overlaps any prior range on this path.
+                _rd_end = (_rd_start + _rd_limit) if _rd_limit > 0 else float("inf")
+                _ranges = _read_ranges_by_path.setdefault(_path, [])
+                _overlap_found = False
+                for (_prev_start, _prev_end) in _ranges:
+                    _ov_start = max(_rd_start, _prev_start)
+                    _ov_end = min(_rd_end, _prev_end)
+                    _ov_len = _ov_end - _ov_start
+                    if _ov_len <= 0:
+                        continue
+                    _this_len = _rd_end - _rd_start
+                    if _this_len == float("inf") or _this_len <= 0:
+                        _overlap_found = True
+                        break
+                    if (_ov_len / _this_len) > 0.5:
+                        _overlap_found = True
+                        break
+                _ranges.append((_rd_start, _rd_end))
+                # 2nd occurrence = THIS read already overlaps a previously
+                # served range (read #1 establishes the range with nothing to
+                # overlap; read #2 overlapping it is the 2nd occurrence — fire
+                # now, not on a 3rd). Note once per path per turn so a model
+                # that keeps re-reading isn't nagged every single round.
+                _note_key = ("read", _path)
+                if _overlap_found and _note_key not in _similarity_notes_given:
+                    _similarity_notes_given.add(_note_key)
+                    logger.info(f"[agent] similarity loop-breaker: repeated overlapping read of {_path} on round {round_num}")
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"You already read/edited this region of {_path} this "
+                            "turn — act on what you found; do not re-read it."
+                        ),
+                    })
+
+            elif _b.tool_type == "edit_file":
+                _old_string = _args.get("old_string", "")
+                if not _old_string:
+                    continue
+                _seen = _edit_oldstrings_by_path.setdefault(_path, set())
+                _repeat_edit = _old_string in _seen
+                _seen.add(_old_string)
+                # Same "2nd occurrence fires now" semantics as read above:
+                # the repeat itself (2nd identical old_string) is the trigger.
+                _note_key = ("edit", _path)
+                if _repeat_edit and _note_key not in _similarity_notes_given:
+                    _similarity_notes_given.add(_note_key)
+                    logger.info(f"[agent] similarity loop-breaker: repeated old_string edit on {_path} on round {round_num}")
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"You already read/edited this region of {_path} this "
+                            "turn — act on what you found; do not re-read it."
+                        ),
+                    })
+
         # "Real" answer text = round text minus <think> blocks. Empty-think
         # rounds (just "<think>\n\n</think>" + a tool call) must not read as
         # progress, so strip think before checking.
@@ -3900,9 +4081,53 @@ async def stream_agent_loop(
         # Distinct calls to one tool (a real batch) are legitimate work, so we
         # count identical call signatures, not raw per-tool-type totals.
         _runaway = _detect_runaway_call(_call_freq)
-        if _stuck_rounds >= 4 or _runaway:
-            reason = (f"calling {_runaway} with identical arguments over and over" if _runaway
-                      else "repeating the same tool calls without new progress")
+        # Broad exploration (two-stage) = N consecutive rounds of read-only/
+        # introspection calls with no real answer text — DISTINCT calls every
+        # round (so neither exact-signature nor similarity detectors above
+        # ever fire), but genuinely no progress toward an answer (observed
+        # with Gemini: 50 distinct read-only calls, no answer text, 2.19M
+        # input tokens/373s). Any real answer text — including a reply to the
+        # stage-1 nudge — OR a round that isn't purely read-only, resets BOTH
+        # the streak and the nudge-fired flag, so a later streak gets its own
+        # fresh nudge instead of skipping straight to stage 2.
+        if tool_blocks and not _real_text and all(_is_readonly_exploration_block(b) for b in tool_blocks):
+            _broad_exploration_streak += 1
+        else:
+            _broad_exploration_streak = 0
+            _broad_exploration_nudge_fired = False
+        # Stage 1: NUDGE, nothing terminates. Fires once per streak, visible
+        # in the transcript (same injected-system-note mechanism as the other
+        # loop-breakers), then the round proceeds NORMALLY — this round's
+        # tool_blocks still execute below. A model that's actually making
+        # progress just answers the check-in (which counts as real answer
+        # text and resets the streak above) and keeps going.
+        if _broad_exploration_streak >= _broad_exploration_nudge_limit and not _broad_exploration_nudge_fired:
+            _broad_exploration_nudge_fired = True
+            logger.info(
+                f"[agent] broad-exploration stage 1 (nudge) fired on round {round_num}: "
+                f"{_broad_exploration_streak} consecutive read-only rounds with no answer text"
+            )
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Check-in: in one or two sentences, state what you have learned "
+                    "so far and what you still need; then continue."
+                ),
+            })
+        _broad_exploration_handshake_hit = (
+            _broad_exploration_nudge_fired
+            and _broad_exploration_streak >= _broad_exploration_nudge_limit + _broad_exploration_handshake_limit
+        )
+        if _stuck_rounds >= 4 or _runaway or _broad_exploration_handshake_hit:
+            if _runaway:
+                reason = f"calling {_runaway} with identical arguments over and over"
+            elif _broad_exploration_handshake_hit:
+                reason = (
+                    f"{_broad_exploration_streak} consecutive read-only exploration rounds with no "
+                    "answer text (did not respond to the stage-1 check-in either)"
+                )
+            else:
+                reason = "repeating the same tool calls without new progress"
             logger.warning(f"[agent] loop-breaker tripped on round {round_num} ({reason}); sig={_sig[:80]!r}")
             # The model has been executing tools, so its results are already
             # in context. Force ONE tool-free round to converge: write the
@@ -3994,61 +4219,70 @@ async def stream_agent_loop(
                 }
                 logger.info("Tool blocked before start by policy: %s", block.tool_type)
             else:
-                yield (
-                    f'data: {json.dumps({"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num})}\n\n'
-                )
+                _tool_start_evt = {"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num}
+                if _round_caption:
+                    _tool_start_evt["caption"] = _round_caption
+                yield f'data: {json.dumps(_tool_start_evt)}\n\n'
 
-                # Streaming progress for long-running tools (bash, python).
-                # The bash/python branches inside _direct_fallback emit
-                # periodic {elapsed_s, tail} payloads via this callback;
-                # we forward each one as a `tool_progress` SSE event so
-                # the UI can render live elapsed-time + tail-of-output.
-                _progress_q: asyncio.Queue = asyncio.Queue()
-                async def _push_progress(payload):
-                    await _progress_q.put(payload)
+                if block.tool_type == "get_workspace" and _workspace_memo is not None:
+                    # Already resolved this turn (no-arg, static-per-turn query)
+                    # — reuse it instead of a real dispatch round-trip. Observed
+                    # 9x real calls with identical no-args in one session.
+                    desc, result = _workspace_memo
+                else:
+                    # Streaming progress for long-running tools (bash, python).
+                    # The bash/python branches inside _direct_fallback emit
+                    # periodic {elapsed_s, tail} payloads via this callback;
+                    # we forward each one as a `tool_progress` SSE event so
+                    # the UI can render live elapsed-time + tail-of-output.
+                    _progress_q: asyncio.Queue = asyncio.Queue()
+                    async def _push_progress(payload):
+                        await _progress_q.put(payload)
 
-                async def _run_tool():
-                    try:
-                        return await execute_tool_block(
-                            block,
-                            session_id=session_id,
-                            disabled_tools=disabled_tools,
-                            tool_policy=tool_policy,
-                            owner=owner,
-                            progress_cb=_push_progress,
-                            workspace=workspace,
-                            relevant_tools=_relevant_tools,
-                        )
-                    finally:
-                        # Sentinel so the drainer knows to stop.
-                        await _progress_q.put(None)
-
-                _tool_task = asyncio.create_task(_run_tool())
-                # Drain progress events as they arrive — block until the
-                # next event OR the tool finishes (sentinel = None).
-                #
-                # If this generator is cancelled while a tool is in flight (a
-                # sub-agent stop() / the 240s timeout cancels us at one of the
-                # awaits below), the tool task would otherwise keep running
-                # detached — a runaway bash/browser the cancel was meant to
-                # stop. Cancel and await it before re-raising so nothing leaks.
-                try:
-                    while True:
-                        evt = await _progress_q.get()
-                        if evt is None:
-                            break
-                        yield (
-                            f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
-                        )
-                    desc, result = await _tool_task
-                except asyncio.CancelledError:
-                    if not _tool_task.done():
-                        _tool_task.cancel()
+                    async def _run_tool():
                         try:
-                            await _tool_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    raise
+                            return await execute_tool_block(
+                                block,
+                                session_id=session_id,
+                                disabled_tools=disabled_tools,
+                                tool_policy=tool_policy,
+                                owner=owner,
+                                progress_cb=_push_progress,
+                                workspace=workspace,
+                                relevant_tools=_relevant_tools,
+                            )
+                        finally:
+                            # Sentinel so the drainer knows to stop.
+                            await _progress_q.put(None)
+
+                    _tool_task = asyncio.create_task(_run_tool())
+                    # Drain progress events as they arrive — block until the
+                    # next event OR the tool finishes (sentinel = None).
+                    #
+                    # If this generator is cancelled while a tool is in flight (a
+                    # sub-agent stop() / the 240s timeout cancels us at one of the
+                    # awaits below), the tool task would otherwise keep running
+                    # detached — a runaway bash/browser the cancel was meant to
+                    # stop. Cancel and await it before re-raising so nothing leaks.
+                    try:
+                        while True:
+                            evt = await _progress_q.get()
+                            if evt is None:
+                                break
+                            yield (
+                                f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
+                            )
+                        desc, result = await _tool_task
+                    except asyncio.CancelledError:
+                        if not _tool_task.done():
+                            _tool_task.cancel()
+                            try:
+                                await _tool_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        raise
+                    if block.tool_type == "get_workspace":
+                        _workspace_memo = (desc, result)
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -4343,6 +4577,8 @@ async def stream_agent_loop(
                 "output": output_text,
                 "exit_code": result.get("exit_code"),
             }
+            if _round_caption:
+                tool_event["caption"] = _round_caption
             if result.get("image_url"):
                 for ik in ("image_url", "image_prompt", "image_model", "image_size", "image_quality"):
                     if result.get(ik):
@@ -4448,6 +4684,33 @@ async def stream_agent_loop(
                 ),
             })
 
+        # Mid-turn re-trim: the pre-loop trim above only runs ONCE, before round
+        # 1. Tool results appended every round (large file reads, command output)
+        # can push the running message list back over the same budget mid-turn —
+        # observed: a single turn reaching 1.55M summed input tokens against a 1M
+        # window. Re-trim with the SAME budget/reserve whenever the current
+        # estimate exceeds it; cheap to check (a token estimate), and skipped
+        # entirely when the soft budget is disabled (mirrors the pre-loop guard).
+        if _mid_turn_trim_budget is not None:
+            _mt_before = estimate_tokens(messages)
+            if _mt_before > _mid_turn_trim_budget:
+                try:
+                    _mt_trimmed = trim_for_context(
+                        messages,
+                        _mid_turn_trim_budget,
+                        reserve_tokens=_mid_turn_reserve_tokens,
+                    )
+                    _mt_after = estimate_tokens(_mt_trimmed)
+                    if _mt_after < _mt_before:
+                        logger.info(
+                            "[agent] mid-turn re-trim round=%s: %s -> %s tokens (budget=%s, reserve=%s)",
+                            round_num, _mt_before, _mt_after,
+                            _mid_turn_trim_budget, _mid_turn_reserve_tokens,
+                        )
+                        messages = _mt_trimmed
+                except Exception as _mt_err:
+                    logger.warning("[agent] mid-turn re-trim skipped: %s", _mt_err)
+
         # Hand browser screenshots to the MODEL, not just the UI. The tool
         # result text only says "[Screenshot captured]", so without this a
         # multimodal model takes a screenshot it can never actually see (and
@@ -4521,8 +4784,15 @@ async def stream_agent_loop(
         prep_timings=prep_timings,
         backend_gen_tps=backend_gen_tps,
         backend_prefill_tps=backend_prefill_tps,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
     )
     metrics["requested_model"] = requested_model
+    # Persisted so the msg-footer "..." details can show what reasoning-effort
+    # level (if any) this turn actually requested — "default"/None is a no-op
+    # override, so only record an explicit choice.
+    if reasoning_effort and reasoning_effort != "default":
+        metrics["reasoning_effort"] = reasoning_effort
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.

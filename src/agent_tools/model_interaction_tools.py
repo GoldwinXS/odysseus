@@ -119,21 +119,132 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
 # further (depth is capped at exactly 1 — no fork bombs), concurrency is
 # bounded, each run is round- and time-limited.
 _SUBAGENT_SEMAPHORE = asyncio.Semaphore(3)   # max concurrent sub-agents
-_SUBAGENT_MAX_ROUNDS = 12                     # tool-loop rounds per sub-agent
-_SUBAGENT_TIMEOUT_S = 600                     # default wall-clock cap per sub-agent
-                                              # (was 240 — real coding sub-agents
-                                              # routinely exceeded it; tunable via
-                                              # the subagent_timeout_seconds setting)
+_SUBAGENT_MAX_ROUNDS = 100                    # RUNAWAY BACKSTOP, not a working ceiling
+                                              # — a sub-agent making genuine progress
+                                              # must never be killed just for taking
+                                              # many rounds. (Raised from 12, then 30: a
+                                              # sub-agent investigating a 282KB JS file
+                                              # deterministically hit the old 12-round
+                                              # cap before finishing, causing the parent
+                                              # to re-dispatch the same scope 3x instead
+                                              # of getting one real answer.) Circling is
+                                              # caught by _SUBAGENT_LOOP_REPEATS and the
+                                              # stall/wall-clock watchdogs below, not by
+                                              # this cap. Tunable via subagent_max_rounds
+                                              # (settings.json may pin a lower value).
+_SUBAGENT_TIMEOUT_S = 3600                    # wall-clock cap — a GENEROUS SAFETY
+                                              # BACKSTOP, not the primary guard. Stall
+                                              # detection (below) is what kills hangs;
+                                              # this only stops a truly runaway run that
+                                              # somehow keeps emitting. Default 1h; the
+                                              # user does NOT want subagents hamstrung by
+                                              # artificial time limits. Tunable via
+                                              # subagent_timeout_seconds, and a value of
+                                              # 0 (or negative) DISABLES the backstop
+                                              # entirely (stall detection still applies).
+_SUBAGENT_STALL_S = 180                       # PRIMARY guard: kill a sub-agent that emits
+                                              # NOTHING (no delta/thinking/tool event) for
+                                              # this long — that's a hung blocking command,
+                                              # not slow-but-live work. A live worker streams
+                                              # progress well inside this window. Tunable via
+                                              # subagent_stall_timeout_seconds.
+_SUBAGENT_LOOP_REPEATS = 3                    # kill if the SAME tool call (name+args)
+                                              # repeats this many times consecutively —
+                                              # a stuck loop burning rounds/time.
 
 def _subagent_timeout() -> int:
-    """Live per-sub-agent wall-clock cap. Tunable so a slow model/task can be
-    given more headroom without a code change; falls back to the default."""
+    """Live wall-clock SAFETY BACKSTOP, in seconds. Tunable via
+    subagent_timeout_seconds. Returns 0 to mean DISABLED (no wall-clock kill —
+    stall detection is then the only time-based guard), so the user can turn the
+    backstop off entirely. Falls back to the generous default on bad config."""
     try:
         from src.settings import get_setting
-        v = int(get_setting("subagent_timeout_seconds", _SUBAGENT_TIMEOUT_S) or _SUBAGENT_TIMEOUT_S)
-        return v if v > 0 else _SUBAGENT_TIMEOUT_S
+        raw = get_setting("subagent_timeout_seconds", _SUBAGENT_TIMEOUT_S)
+        if raw is None:
+            return _SUBAGENT_TIMEOUT_S
+        v = int(raw)
+        # <= 0 is an explicit "disable the backstop" signal, not a fallback.
+        return v if v >= 0 else 0
     except Exception:
         return _SUBAGENT_TIMEOUT_S
+
+
+def _subagent_stall_timeout() -> int:
+    """Live silence-watchdog window: max seconds with no SSE activity before the
+    sub-agent is treated as hung and killed. Tunable; falls back to the default."""
+    try:
+        from src.settings import get_setting
+        v = int(get_setting("subagent_stall_timeout_seconds", _SUBAGENT_STALL_S) or _SUBAGENT_STALL_S)
+        return v if v > 0 else _SUBAGENT_STALL_S
+    except Exception:
+        return _SUBAGENT_STALL_S
+
+
+_SUBAGENT_WRAPUP_GRACE_S = 90                  # graceful wind-down window: when a
+                                              # stall/wall/loop kill fires, first
+                                              # STEER the worker to stop and write a
+                                              # final summary, then give it this long
+                                              # to comply before hard-killing. Tunable
+                                              # via subagent_wrapup_grace_seconds; 0
+                                              # disables the courtesy wrap-up (kill
+                                              # immediately, old behaviour).
+_SUBAGENT_WRAPUP_STALL_GRACE_S = 30            # SHORTER grace for a stall kill: a
+                                              # truly wedged loop can't respond to a
+                                              # steer, so we don't wait the full window
+                                              # for it — attempt the steer but kill
+                                              # fast if no NEW activity appears.
+
+
+def _subagent_wrapup_grace(kill_reason: str) -> int:
+    """Grace window (seconds) to let a sub-agent write a final summary after a
+    wind-down steer, before it is hard-killed. Shorter for a stall kill (a wedged
+    worker likely can't respond) than for a wall-clock/loop kill (the worker is
+    alive, just over-budget). 0 disables the wrap-up entirely. Tunable via
+    subagent_wrapup_grace_seconds (applies to the non-stall window; the stall
+    window is derived as the min of that and the short stall grace)."""
+    try:
+        from src.settings import get_setting
+        raw = get_setting("subagent_wrapup_grace_seconds", _SUBAGENT_WRAPUP_GRACE_S)
+        base = _SUBAGENT_WRAPUP_GRACE_S if raw is None else int(raw)
+    except Exception:
+        base = _SUBAGENT_WRAPUP_GRACE_S
+    if base <= 0:
+        return 0   # wrap-up disabled → caller hard-kills immediately
+    if kill_reason == "stall":
+        # A stalled worker probably can't answer; give it only a short window.
+        return min(base, _SUBAGENT_WRAPUP_STALL_GRACE_S)
+    return base
+
+
+def _subagent_max_rounds() -> int:
+    """Live tool-loop round cap per sub-agent. Tunable via
+    subagent_max_rounds. Falls back to the hardcoded default on bad/missing
+    config. Clamped to >= 1 so a misconfig can't zero-out the loop."""
+    try:
+        from src.settings import get_setting
+        raw = get_setting("subagent_max_rounds", _SUBAGENT_MAX_ROUNDS)
+        if raw is None:
+            return _SUBAGENT_MAX_ROUNDS
+        v = int(raw)
+        return v if v >= 1 else _SUBAGENT_MAX_ROUNDS
+    except Exception:
+        return _SUBAGENT_MAX_ROUNDS
+
+
+def _subagent_bash_cap(stall_s: int) -> int:
+    """Cap for bash *inside* this sub-agent, so one blocking foreground command
+    (a dev server the model forgot to background) can't sit silent until the STALL
+    watchdog fires. Keyed off the stall window (the primary guard), not the
+    wall-clock backstop — which may be huge or disabled. Takes the smaller of the
+    configured global bash timeout and the stall window, capped at 150s (a single
+    agent bash step rarely needs more; a genuinely long build should stream output,
+    which keeps the stall watchdog fed anyway)."""
+    try:
+        from src.settings import get_setting
+        _cfg = int(get_setting("agent_bash_timeout_seconds", 600) or 600)
+    except Exception:
+        _cfg = 600
+    return max(30, min(_cfg, max(1, stall_s), 150))
 _SUBAGENT_RESULT_CAP = 30000                  # max chars of result delivered (the
                                               # parent sees this verbatim — keep it
                                               # generous so answers aren't truncated)
@@ -180,6 +291,34 @@ _SUBAGENT_SYSTEM_PROMPT = (
 )
 
 
+def _is_provider_error(text: str) -> bool:
+    """Heuristic: does this failure reason point at the PROVIDER being down /
+    rate-limited / out of credits, rather than the task itself failing? Waking the
+    parent to "decide the next step" is pointless when the next spawn would hit the
+    same wall — and worse, it's exactly the spawn/fail/resume token-burn loop the
+    original _deliver comment guarded against. So we suppress the failure-resume in
+    that case and just deliver the notice. Conservative substring match on the
+    reasons the loop actually surfaces (429s, spend/credit caps, auth, provider
+    unreachable)."""
+    t = (text or "").lower()
+    return any(k in t for k in (
+        "rate-limit", "rate limit", "429", "quota", "spend cap", "spend-cap",
+        "credit", "billing", "insufficient", "payment", "unauthorized", "401",
+        "403", "forbidden", "api key", "provider error", "upstream error",
+        "overloaded", "503", "502", "connection error", "unreachable",
+    ))
+
+
+class _SubagentLoopError(Exception):
+    """Raised inside a sub-agent drain when the same tool call repeats
+    consecutively past the loop-detection threshold — the worker is stuck. Carries
+    the offending tool name + repeat count so the delivered failure can name it."""
+    def __init__(self, tool: str, count: int):
+        self.tool = tool
+        self.count = count
+        super().__init__(f"repeated identical {tool} calls x{count}")
+
+
 def _looks_complete(text: str) -> bool:
     """Heuristic: does this read like a finished summary, or narration cut off
     mid-write? Used only to decide whether a round-cap sub-agent needs a wrap-up
@@ -199,6 +338,59 @@ def _looks_complete(text: str) -> bool:
     return False
 
 
+def _send_wrapup_steer(queue_session: str, kill_reason: str, stall_s: int, timeout_s: int) -> bool:
+    """Enqueue a single wind-down steer into a running sub-agent's own steer
+    queue, for either a STALL (silence) or WALL (wall-clock backstop) trigger.
+    Both are check-in nudges, not unconditional stop orders: the watchdog
+    cancels the pending kill and fully resets its clock if genuine new
+    activity (tool calls, real progress) lands during the grace window — a
+    merely-quiet-but-working (or long-but-still-progressing) agent must not be
+    told to abandon a task it's actually still doing. A LOOP trigger is
+    different: it fires from inside the drain loop on a confirmed stuck
+    pattern (the same exact tool call repeated), so that message stays an
+    unconditional stop order. Returns True if it was queued (a live drain loop
+    exists), False if the sub-agent's turn is already over (nothing to steer).
+    The steer lands via agent_runs.enqueue_steer → the sub-agent loop's
+    round-boundary / final drain (agent_loop._inject_steering_messages), same
+    mechanism as send_to_subagent, so the worker sees it as an in-turn user
+    message."""
+    if kill_reason == "stall":
+        msg = (
+            f"[system] Check-in: you've produced no visible activity for {stall_s}s. "
+            "If you are still genuinely working (about to call a tool, mid-thought "
+            "on a real next step), just continue normally — this is not an order to "
+            "stop. If you are actually stuck or done, write a final, self-contained "
+            "plain-text summary of what you found/did and what remains, then END "
+            "YOUR TURN — that summary is what gets reported back if you go quiet "
+            "again, so make it count."
+        )
+    elif kill_reason == "wall":
+        msg = (
+            f"[system] Check-in: you've been running for {timeout_s}s, a very long "
+            "time for one task. If you are still making genuine progress, continue "
+            "normally — this is not an order to stop, just a routine check that "
+            "you're not stuck. If you're actually done or blocked, write a final, "
+            "self-contained plain-text summary of what you found/did and what "
+            "remains, then END YOUR TURN — that summary is what gets reported back "
+            "if you don't respond, so make it count."
+        )
+    else:
+        _why = "you appear stuck in a loop and are being wound down"
+        msg = (
+            f"[system] Your run is being wound down — reason: {_why}. "
+            "IMMEDIATELY STOP all tool work. Do NOT call any more tools. "
+            "Write a final, self-contained plain-text summary of what you found / did "
+            "and what remains, then END YOUR TURN. This summary is the only thing "
+            "reported back, so make it count — you have only a few seconds."
+        )
+    try:
+        from src import agent_runs
+        return agent_runs.enqueue_steer(queue_session, msg, kind="user")
+    except Exception as e:
+        logger.debug("[subagent-wrapup] steer enqueue failed for %s: %s", queue_session, e)
+        return False
+
+
 async def spawn_agent(
     content: str,
     session_id: Optional[str] = None,
@@ -213,13 +405,19 @@ async def spawn_agent(
     its final result is posted into this session as a new message on completion
     (or an error/timeout notice if it fails). Do not wait for or poll it.
 
-    Content: the task/instructions for the sub-agent. An optional first line
-    ``model: <name>`` overrides the model (defaults to this chat's model).
+    Content: the task/instructions for the sub-agent. Optional first line(s)
+    ``model: <name>`` overrides the model (defaults to this chat's model) and
+    ``timeout: <seconds>`` overrides the wall-clock backstop (clamped 60..21600;
+    stall detection still guards the run regardless).
 
     Use for a self-contained unit of work you want done and reported back —
     e.g. "read js/render/models.js, screenshot localhost:1338, and list what
     looks visually wrong." The sub-agent has the normal tools (files, shell,
     browser) but cannot itself spawn more agents.
+
+    You can STEER a running sub-agent mid-flight with
+    ``send_to_subagent(subagent_id, message)`` — e.g. to narrow its focus, add a
+    constraint, or nudge it — and check on it or cancel it with ``manage_agents``.
     """
     import json
     from src.agent_loop import stream_agent_loop
@@ -230,14 +428,37 @@ async def spawn_agent(
     if not task:
         return {"error": "No task provided for the sub-agent"}
 
-    # Optional `model: <name>` override on the first line.
+    # Optional leading directives, parsed off the first line(s) the same way:
+    #   model: <name>        — override the model (defaults to this chat's model)
+    #   timeout: <seconds>   — override the wall-clock cap (clamped 60..3600)
+    # Both may appear (in either order) before the task body; each is consumed
+    # from the front, so the task text starts at the first non-directive line.
     model_spec = None
-    if task.lower().startswith("model:"):
-        first, _, rest = task.partition("\n")
-        model_spec = first.split(":", 1)[1].strip()
-        task = rest.strip()
-        if not task:
-            return {"error": "Sub-agent task was empty after the model: line"}
+    timeout_override: Optional[int] = None
+    while True:
+        low = task.lower()
+        if low.startswith("model:"):
+            first, _, rest = task.partition("\n")
+            model_spec = first.split(":", 1)[1].strip()
+            task = rest.strip()
+            if not task:
+                return {"error": "Sub-agent task was empty after the model: line"}
+        elif low.startswith("timeout:"):
+            first, _, rest = task.partition("\n")
+            _raw = first.split(":", 1)[1].strip()
+            try:
+                # Clamp to a sane range: below 60s a real coding sub-agent can't
+                # get anything done; above 21600s (6h) a runaway ties up a slot far
+                # too long. This overrides the wall-clock BACKSTOP for this spawn;
+                # stall detection still guards it. Junk (non-int) is ignored.
+                timeout_override = max(60, min(21600, int(_raw)))
+            except ValueError:
+                timeout_override = None
+            task = rest.strip()
+            if not task:
+                return {"error": "Sub-agent task was empty after the timeout: line"}
+        else:
+            break
 
     # Default: inherit endpoint/model from the parent chat.
     url = model = headers = None
@@ -287,6 +508,7 @@ async def spawn_agent(
     # so it must not close over anything that could be rebound afterwards.
     _url, _model, _headers, _owner, _task = url, model, headers, owner, task
     _parent_session = session_id
+    _timeout_override = timeout_override   # per-spawn wall-clock cap, or None
     _summary = _task.splitlines()[0][:120] if _task else ""
 
     # Fallback chain if the primary sub-agent model fails (rate-limit / spend
@@ -356,25 +578,41 @@ async def spawn_agent(
     except Exception as _clamp_err:
         logger.debug("sub-agent max_tokens clamp fell back to default: %s", _clamp_err)
 
-    # Populated with the tracked run's id right after subagent_runs.start()
-    # returns, so _deliver (defined here, invoked later) can flag the run for
-    # server-side resume by id. A plain dict works because _deliver reads it at
-    # call time, well after start() has filled it in.
-    _run_meta: Dict[str, Optional[str]] = {"id": None}
+    # Populated with the tracked run's id + ephemeral steer-queue session right
+    # after subagent_runs.start() returns, so _deliver (server-side resume) and
+    # _run_subagent (mid-flight steering) can read them by id. A plain dict works
+    # because both read it at call time, well after start() has filled it in.
+    _run_meta: Dict[str, Optional[str]] = {"id": None, "queue_session": None}
+    # Holds the subagent_runs run record (a dict LIVE in that module's _UPDATES
+    # store — mutating it here is visible to get_updates() with no extra
+    # plumbing) once start() returns, so _drain's per-chunk handler can push
+    # rounds_used/last_tool/last_activity_at/output_tail into it for a parent
+    # checking in mid-run via manage_agents. Same call-time-not-definition-time
+    # closure timing as _run_meta above: empty (never populated) on the
+    # synchronous/no-session fallback, since there is no run record there.
+    _rec_holder: Dict[str, Optional[dict]] = {"rec": None}
 
     def _deliver(error: Optional[str], partial: str) -> None:
         """Post the sub-agent's outcome as an assistant message into the parent
         session. Persists immediately (add_message -> _persist_message commits),
         so it renders on reload even if no client is currently connected.
 
-        Server-side resume (Claude-Code parity): after persisting a SUCCESSFUL
-        result, ensure the parent model actually processes it, server-side —
-        no open browser required:
+        Server-side resume (Claude-Code parity): after persisting the outcome,
+        ensure the parent model actually processes it, server-side — no open
+        browser required:
           * If the parent session has a LIVE agent run, enqueue a steering entry
             (framed as untrusted context) so the running turn reacts next round.
           * Otherwise start a DETACHED main-agent resume turn in the parent
             session (registered in agent_runs so clients can attach/see it).
-        Never resume on error/cancelled/timeout — those deliver the notice only.
+
+        FAILURE also resumes now (this fixes the hang-forever bug: a parent that
+        spawned a subagent and ended its turn would wait forever if that subagent
+        timed out, because failures never woke it). The failure wake is framed to
+        say the subagent FAILED and why, so the parent can decide the next step —
+        but it is guarded HARD against a spawn/fail/resume token loop: a tighter
+        per-session failure cap (subagent_runs.can_failure_resume), and it is
+        SKIPPED entirely when the reason looks like a provider/credits error (the
+        exact concern of the original "never resume on error" comment).
         """
         if not _parent_session:
             return
@@ -401,48 +639,72 @@ async def spawn_agent(
             logger.error(f"spawn_agent delivery failed for session {_parent_session}: {e}", exc_info=True)
             return
 
-        # Only successful completions drive a resume; error/cancelled/timeout
-        # deliver the notice and stop (resuming on those would burn tokens on a
-        # spawn/fail/resume loop against a down provider).
-        if error:
+        # Successful completions always drive a resume. Failures ALSO resume (so a
+        # waiting parent is woken instead of hanging forever) EXCEPT when the reason
+        # is a provider/credits problem — resuming then would just re-hit the wall
+        # and burn tokens in a spawn/fail/resume loop (the original concern).
+        if error and _is_provider_error(error):
+            logger.info("[subagent-resume] provider-type failure for %s — delivered only, no resume", _parent_session)
             return
         try:
-            _maybe_server_resume(partial or "")
+            _maybe_server_resume(partial or "", failed=bool(error), reason=error)
         except Exception as e:
             logger.error("[subagent-resume] resume dispatch failed for %s: %s", _parent_session, e, exc_info=True)
 
-    def _maybe_server_resume(result_text: str) -> None:
-        """Push the sub-agent's result to the parent model, server-side.
+    def _maybe_server_resume(result_text: str, failed: bool = False, reason: Optional[str] = None) -> None:
+        """Push the sub-agent's outcome to the parent model, server-side.
 
         Live turn → enqueue a steering entry (Feature 1's queue). No live turn →
-        start a detached resume turn. Both frame the result via
+        start a detached resume turn. Both frame the content via
         untrusted_context_message so fetched/quoted content can't speak with
         user/assistant authority. Capped + single-fire guarded via subagent_runs.
+
+        ``failed`` frames the wake as a FAILURE notice (subagent timed out / got
+        stuck / errored) and routes it through the tighter failure cap
+        (can_failure_resume) instead of the success cap, so repeated failures can't
+        ping-pong the parent.
         """
         from src import agent_runs, subagent_runs
         from src.prompt_security import untrusted_context_message
 
         sub_id = _run_meta.get("id")
-        # Frame the result as untrusted context (may quote fetched web content).
-        framed = untrusted_context_message(
-            f"background sub-agent {sub_id or ''} ({_model}) result",
-            f"Background sub-agent {sub_id or ''} ({_model}) finished. Full result:\n\n{result_text}",
-        )["content"]
+        # Frame the outcome as untrusted context (may quote fetched web content).
+        if failed:
+            framed = untrusted_context_message(
+                f"background sub-agent {sub_id or ''} ({_model}) FAILED",
+                f"Background sub-agent {sub_id or ''} ({_model}) did NOT complete its task. "
+                f"Reason: {reason or 'unknown failure'}.\n\n"
+                f"Any partial output / activity it produced before stopping:\n\n{result_text or '(none)'}\n\n"
+                "Decide the next step yourself: retry with a narrower task or a different "
+                "model, do the work directly, or tell the user it could not be completed. "
+                "Do NOT simply re-spawn the same task unchanged.",
+            )["content"]
+        else:
+            framed = untrusted_context_message(
+                f"background sub-agent {sub_id or ''} ({_model}) result",
+                f"Background sub-agent {sub_id or ''} ({_model}) finished. Full result:\n\n{result_text}",
+            )["content"]
 
         # 1) A turn is live for the parent session → steer into it (atomic:
-        #    enqueue only succeeds if the run is still running).
+        #    enqueue only succeeds if the run is still running). No cap needed: a
+        #    live turn consumes the steer as one message, no new turn is spawned.
         if agent_runs.enqueue_steer(_parent_session, framed, kind="subagent"):
             if sub_id:
                 subagent_runs.mark_resume(_parent_session, sub_id, "server")
-            logger.info("[subagent-resume] steered result into live turn for %s", _parent_session)
+            logger.info("[subagent-resume] steered %s into live turn for %s",
+                        "FAILURE" if failed else "result", _parent_session)
             return
 
         # 2) No live turn → start a detached server-side resume turn, subject to
-        #    the cap and single-fire guard.
-        if not subagent_runs.can_server_resume(_parent_session):
+        #    the cap (failure path uses the tighter failure cap) and single-fire guard.
+        _can = subagent_runs.can_failure_resume if failed else subagent_runs.can_server_resume
+        if not _can(_parent_session):
             logger.info("[subagent-resume] resume capped/already-running for %s — delivered only", _parent_session)
             return
-        subagent_runs.note_server_resume(_parent_session)
+        if failed:
+            subagent_runs.note_failure_resume(_parent_session)
+        else:
+            subagent_runs.note_server_resume(_parent_session)
         subagent_runs.set_resume_running(_parent_session, True)
         if sub_id:
             subagent_runs.mark_resume(_parent_session, sub_id, "server")
@@ -526,9 +788,61 @@ async def spawn_agent(
         ``deliver`` is set (background mode) the result is also posted into the
         parent session; otherwise it is only returned (synchronous fallback)."""
         collected: list = []
-        stats = {"tools": 0, "hit_cap": False, "error": None, "last_tool": None}
+        # Compact activity log of the tool calls seen, so a sub-agent that spends
+        # all its time in tools (and delivers partial_len=0 text) can still report
+        # "what it did before timing out". Capped in size below.
+        activity: list = []
+        # "rounds" starts at 1 (stream_agent_loop's own round numbering is
+        # 1-based) and is bumped on each agent_step event, so a parent checking
+        # in mid-run via manage_agents sees genuine progress, not just "still
+        # running" with no sense of how far along it is.
+        stats = {"tools": 0, "hit_cap": False, "error": None, "last_tool": None, "rounds": 1}
+        # Watchdog scratch: last time ANY chunk arrived (stall detection), and the
+        # consecutive-identical-tool-call run (loop detection). Mutable containers
+        # so the nested _drain + the watchdog loop share them by reference.
+        wd = {
+            "last_activity": None,      # set to a loop-clock stamp on first chunk
+            "loop_sig": None,           # signature of the last tool call
+            "loop_count": 0,            # how many times it has repeated in a row
+            "loop_tool": None,          # the tool name that is looping (for the msg)
+            "wrapup_sent": False,       # one graceful wind-down steer, max, per run
+        }
+
+        def _note_tool_activity(tool: str, cmd: str) -> None:
+            """Record a tool call in the activity log (capped) and update the
+            consecutive-repeat counter used for loop detection."""
+            if len(activity) < 60:  # cap entries; each line is trimmed below too
+                _line = tool if not cmd else f"{tool}: {cmd}"
+                activity.append(_line[:200])
+            sig = f"{tool}\n{cmd}"
+            if sig == wd["loop_sig"]:
+                wd["loop_count"] += 1
+            else:
+                wd["loop_sig"] = sig
+                wd["loop_count"] = 1
+                wd["loop_tool"] = tool
+
+        def _activity_log(limit: int = 3000) -> str:
+            """The captured activity as a compact, size-bounded block for the
+            delivered failure message. Empty when nothing ran."""
+            if not activity:
+                return ""
+            body = "\n".join(f"  - {a}" for a in activity)
+            if len(body) > limit:
+                body = body[:limit] + "\n  … (activity log truncated)"
+            return body
+
+        # Ephemeral steer-queue session for THIS sub-agent (set by start()).
+        # Threading it as session_id gives the loop a steer queue so the parent
+        # can send_to_subagent() into a running worker; the queue is a bare
+        # mailbox in agent_runs and a NON-PERSISTING ephemeral session in the
+        # manager, so no chat rows are written under it (see subagent_runs). None
+        # in the synchronous no-session fallback (no run record, no mid-flight
+        # steering) — steering only applies to background runs.
+        _queue_session = _run_meta.get("queue_session")
 
         async def _drain():
+            import time as _time
             async for chunk in stream_agent_loop(
                 _url, _model,
                 [
@@ -537,17 +851,19 @@ async def spawn_agent(
                 ],
                 headers=_headers,
                 owner=_owner,
-                session_id=None,                        # ephemeral — not persisted
+                session_id=_queue_session,               # steer-queue mailbox (not persisted)
                 disabled_tools=set(_disabled),           # leaf worker: no recursion, plus
                                                          # the parent turn's disabled policy
                 relevant_tools=set(_sub_tools),          # coding baseline force-included
                 workspace=_workspace,                    # inherit parent's project folder
-                max_rounds=_SUBAGENT_MAX_ROUNDS,
+                max_rounds=_subagent_max_rounds(),
                 max_tokens=_max_tokens,                  # the default 4096 truncated long
                                                          # final summaries mid-word; clamped
                                                          # above to the model's real ceiling
                 fallbacks=_fallbacks,
             ):
+                # Any chunk = the sub-agent is alive; feed the stall watchdog.
+                wd["last_activity"] = asyncio.get_event_loop().time()
                 # Capture a real upstream failure (e.g. 429 rate-limit / spend cap)
                 # so we can report WHY instead of the generic "empty response".
                 if chunk.startswith("event: error"):
@@ -569,30 +885,207 @@ async def spawn_agent(
                         stats["tools"] += 1
                         # Remember the last tool that ran so the round-cap
                         # summary/header can name it (see the exhaustion path).
-                        if d.get("tool"):
-                            stats["last_tool"] = d["tool"]
+                        _tool = d.get("tool")
+                        if _tool:
+                            stats["last_tool"] = _tool
+                        # Log it + update loop detection. `command` is the compact
+                        # display form of the args the loop already computes.
+                        _note_tool_activity(_tool or "tool", str(d.get("command") or ""))
+                        # Conservative loop guard: only EXACT consecutive repeats
+                        # of the same tool+args. Raise a distinct error so the
+                        # watchdog can kill with a "stuck in a loop" reason.
+                        if wd["loop_count"] >= _SUBAGENT_LOOP_REPEATS:
+                            raise _SubagentLoopError(wd["loop_tool"] or "a tool", wd["loop_count"])
                     elif _t == "rounds_exhausted":
                         stats["hit_cap"] = True
+                    elif _t == "agent_step":
+                        # agent_step's round is the round about to START (see
+                        # stream_agent_loop's own docstring/emission sites), so
+                        # this is exactly "rounds used so far" from the
+                        # parent's point of view.
+                        _rnd = d.get("round")
+                        if isinstance(_rnd, int) and _rnd > stats["rounds"]:
+                            stats["rounds"] = _rnd
                     # Accumulate visible answer text only (skip thinking tokens).
                     if "delta" in d and not d.get("thinking"):
                         collected.append(d["delta"])
+                    # Push live progress into the shared run record (if any) so
+                    # a parent calling manage_agents mid-run sees genuine status
+                    # — rounds used, last tool, seconds since activity, and a
+                    # tail of the most recent output — not just "still
+                    # running". _rec_holder is populated once subagent_runs
+                    # .start() returns (see below); empty before that (the
+                    # synchronous/no-session fallback never populates it).
+                    _rec = _rec_holder.get("rec")
+                    if _rec is not None:
+                        _rec["rounds_used"] = stats["rounds"]
+                        _rec["last_tool"] = stats["last_tool"]
+                        _rec["last_activity_at"] = _time.time()
+                        _tail_text = "".join(collected)
+                        if _tail_text:
+                            _rec["output_tail"] = _tail_text[-300:]
 
         error = None
-        _timeout_s = _subagent_timeout()
+        # PRIMARY guard is stall/silence detection. The wall-clock cap is only a
+        # generous SAFETY BACKSTOP: the per-spawn `timeout:` directive wins, else the
+        # configured/default cap; a value of 0 (from a 0/negative setting) means the
+        # backstop is DISABLED and only stall detection bounds the run.
+        _stall_s = _subagent_stall_timeout()
+        _timeout_s = _timeout_override if _timeout_override else _subagent_timeout()
+        # Cap bash INSIDE this sub-agent so one blocking foreground command (a dev
+        # server the model forgot to background) can't sit silent up to the stall
+        # window. Keyed off the stall window (the primary guard), not the wall-clock
+        # backstop which may be huge or disabled. Bound to this task's context.
+        from src.agent_tools import subprocess_tools as _subproc
+        _bash_tok = _subproc.set_subagent_bash_timeout(_subagent_bash_cap(_stall_s))
         try:
             async with _SUBAGENT_SEMAPHORE:
-                await asyncio.wait_for(_drain(), timeout=_timeout_s)
-        except asyncio.TimeoutError:
-            error = f"Sub-agent timed out after {_timeout_s}s"
+                # Watchdog: run the drain as a task and poll it. Kill (cancel) it on
+                # (a) SILENCE for _stall_s — the primary guard: a hung/blocking
+                # command; or (b) total runtime past the wall-clock BACKSTOP (unless
+                # disabled). Loop detection kills from inside _drain. This beats a
+                # blind wait_for: a hang dies ~a stall-window after it wedges instead
+                # of running to the backstop, and the kill reasons are distinct below.
+                _loop = asyncio.get_event_loop()
+                _start = _loop.time()
+                wd["last_activity"] = _start
+                _drain_task = asyncio.ensure_future(_drain())
+                _poll = min(5.0, max(1.0, _stall_s / 4))
+                _kill_reason = None
+                # Grace phase state: once a kill trigger fires we may FIRST steer
+                # the worker to wrap up (write a final summary) and give it a grace
+                # window to comply before hard-killing. _grace_deadline is set when
+                # the wind-down steer goes out; while it is set the normal
+                # stall/wall triggers are suspended (we're deliberately waiting on
+                # the worker) and only the deadline — or the worker finishing —
+                # ends the wait. One wrap-up attempt max (wd["wrapup_sent"]).
+                _grace_deadline = None          # loop-clock time to hard-kill at
+                _grace_last_activity = None     # activity stamp when grace started
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({_drain_task}, timeout=_poll)
+                        if done:
+                            _drain_task.result()   # re-raise any drain exception
+                            break
+                        _now = _loop.time()
+                        if _grace_deadline is not None:
+                            # In the graceful wind-down window. If the worker
+                            # produced genuinely NEW activity since the wind-down
+                            # steer went out, it woke up and is doing real work
+                            # again — a nudged-awake agent is healthy, not one to
+                            # kill. Abort the pending kill entirely (not just note
+                            # it for the final message) and fully reset the stall
+                            # clock so it gets a complete fresh window, exactly as
+                            # if it had never stalled. Re-arm the wrap-up nudge too
+                            # (wrapup_sent=False) so a LATER stall gets its own
+                            # steer instead of silently hard-killing next time.
+                            if wd["last_activity"] and wd["last_activity"] > _grace_last_activity:
+                                logger.info(
+                                    "[subagent-wrapup] %s: new activity during grace — "
+                                    "kill aborted, stall clock reset",
+                                    _queue_session,
+                                )
+                                _grace_deadline = None
+                                _grace_last_activity = None
+                                _kill_reason = None
+                                wd["wrapup_sent"] = False
+                                continue
+                            # Still silent since the steer went out — _drain()
+                            # timestamps last_activity on EVERY chunk (deltas,
+                            # tool events, the final summary text alike), so any
+                            # real output at all would already have re-armed the
+                            # branch above. Nothing new yet: keep waiting out the
+                            # deadline. (A STALL kill uses a short deadline
+                            # precisely because a wedged worker won't produce new
+                            # activity to justify the wait.)
+                            if _now < _grace_deadline:
+                                continue
+                            # Grace expired with no new activity → fall through to
+                            # hard-kill with the ORIGINAL reason recorded before
+                            # the steer.
+                        else:
+                            # (a) Primary: silence for the whole stall window.
+                            if _now - (wd["last_activity"] or _start) > _stall_s:
+                                _kill_reason = "stall"
+                            # (b) Backstop: only when enabled (_timeout_s > 0).
+                            elif _timeout_s and _now - _start > _timeout_s:
+                                _kill_reason = "wall"
+                            if not _kill_reason:
+                                continue
+                            # A trigger fired. Try ONE check-in steer before
+                            # killing: for stall/wall this asks the worker to
+                            # either keep going (if it's genuinely still
+                            # working) or wrap up with a final summary, then
+                            # wait a grace window — new activity during that
+                            # window cancels the kill outright (see above).
+                            _grace = _subagent_wrapup_grace(_kill_reason)
+                            if _grace and not wd["wrapup_sent"] and _queue_session:
+                                if _send_wrapup_steer(_queue_session, _kill_reason, _stall_s, _timeout_s):
+                                    wd["wrapup_sent"] = True
+                                    _grace_deadline = _now + _grace
+                                    _grace_last_activity = wd["last_activity"]
+                                    logger.info(
+                                        "[subagent-wrapup] %s: wind-down steer sent (reason=%s), grace=%ds",
+                                        _queue_session, _kill_reason, _grace,
+                                    )
+                                    continue   # give the worker the grace window
+                            # Wrap-up disabled / already attempted / no queue /
+                            # enqueue failed (turn already ended) → hard-kill now.
+                        # Hard-kill path (trigger with no grace, or grace expired).
+                        _drain_task.cancel()
+                        try:
+                            await _drain_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        break
+                    if _kill_reason:
+                        if not _drain_task.done():
+                            _drain_task.cancel()
+                            try:
+                                await _drain_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        _woke = wd["wrapup_sent"] and _grace_last_activity != wd["last_activity"]
+                        _wrap_note = (
+                            " (wrote a wrap-up summary before stopping)" if _woke
+                            else (" (did not respond to the wind-down request)" if wd["wrapup_sent"] else "")
+                        )
+                        if _kill_reason == "stall":
+                            error = (
+                                f"Sub-agent stalled: no activity for {_stall_s}s "
+                                f"(likely stuck on a blocking command){_wrap_note}"
+                            )
+                        else:
+                            error = f"Sub-agent hit the {_timeout_s}s wall-clock backstop{_wrap_note}"
+                except _SubagentLoopError as _le:
+                    # Drain aborted itself: same tool call repeated too many times.
+                    error = (
+                        f"Sub-agent appears stuck in a loop (repeated identical "
+                        f"{_le.tool} calls x{_le.count}) — stopped it"
+                    )
+                finally:
+                    if not _drain_task.done():
+                        _drain_task.cancel()
+                        try:
+                            await _drain_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
         except asyncio.CancelledError:
             # Deliver whatever it produced before cancellation, then propagate so
-            # the run manager records it as stopped/error and cleans up.
+            # the run manager records it as stopped/error and cleans up. Include the
+            # activity log so a tool-only worker's "(nothing text)" still shows work.
             if deliver:
-                _deliver(error="Sub-agent was cancelled", partial="".join(collected).strip()[:_SUBAGENT_RESULT_CAP])
+                _partial = "".join(collected).strip()
+                _log = _activity_log()
+                if _log:
+                    _partial = (_partial + "\n\nWhat it did before it stopped:\n" + _log).strip()
+                _deliver(error="Sub-agent was cancelled", partial=_partial[:_SUBAGENT_RESULT_CAP])
             raise
         except Exception as e:
             logger.error(f"spawn_agent run failed: {e}")
             error = f"Sub-agent failed: {e}"
+        finally:
+            _subproc.reset_subagent_bash_timeout(_bash_tok)
 
         result = "".join(collected).strip()
         # The loop's generic empty-response placeholder is not a real answer — drop
@@ -614,7 +1107,7 @@ async def spawn_agent(
                 result = _summary
             else:
                 _hdr = (
-                    f"(Hit the {_SUBAGENT_MAX_ROUNDS}-round limit; {stats['tools']} tool "
+                    f"(Hit the {_subagent_max_rounds()}-round limit; {stats['tools']} tool "
                     f"call(s) ran"
                     + (f", last: {stats['last_tool']}" if stats["last_tool"] else "")
                     + ". Work happened but the summary was cut off mid-write.)\n\n"
@@ -634,7 +1127,7 @@ async def spawn_agent(
             elif stats["hit_cap"]:
                 result = (
                     f"(The sub-agent ran {stats['tools']} tool call(s) but hit its "
-                    f"{_SUBAGENT_MAX_ROUNDS}-round limit before writing a summary. "
+                    f"{_subagent_max_rounds()}-round limit before writing a summary. "
                     "Try a narrower task, or spawn it with an explicit fast model.)"
                 )
             elif stats["tools"]:
@@ -644,6 +1137,19 @@ async def spawn_agent(
                 )
             else:
                 result = "(The sub-agent produced no output.)"
+        # On any failure path (timeout / stall / loop / upstream error), a
+        # tool-working sub-agent often has partial_len=0 visible text — so attach
+        # the compact activity log ("What it did before it stopped") to the partial
+        # delivered alongside the failure notice. This is the salvage that makes a
+        # killed-mid-work run still report the tool steps it completed.
+        if error:
+            _log = _activity_log()
+            if _log:
+                _work = "What it did before it stopped:\n" + _log
+                result = (result + "\n\n" + _work).strip() if result else _work
+                if len(result) > _SUBAGENT_RESULT_CAP:
+                    result = result[:_SUBAGENT_RESULT_CAP] + f"\n\n… [truncated at {_SUBAGENT_RESULT_CAP} chars]"
+
         logger.info("[subagent-run] finished session=%s deliver=%s error=%r tools=%d cap=%s result_len=%d",
                     _parent_session, deliver, error, stats["tools"], stats["hit_cap"], len(result))
         if deliver:
@@ -671,8 +1177,14 @@ async def spawn_agent(
     rec = subagent_runs.start(
         _parent_session, _summary, _model, lambda: _run_subagent(deliver=True), owner=_owner
     )
-    # Let _deliver flag this run for server-side resume by id when it finishes.
+    # Let _deliver flag this run for server-side resume by id when it finishes,
+    # and let _run_subagent thread the steer-queue session into the loop.
     _run_meta["id"] = rec["id"]
+    _run_meta["queue_session"] = rec.get("queue_session")
+    # Let _drain's per-chunk handler push live progress into this SAME record
+    # object (it lives in subagent_runs._UPDATES) so manage_agents can report
+    # genuine mid-run status to the parent.
+    _rec_holder["rec"] = rec
     return {
         "result": (
             f"Sub-agent dispatched (id={rec['id']}, model={_model}) and now running in the "
@@ -784,8 +1296,11 @@ async def manage_agents(content: str, session_id: Optional[str] = None, owner: O
       (empty) or "list"      → list running / recently-finished sub-agents
       "stop <id>" / "cancel <id>" → cancel a running sub-agent by its id (e.g. sub_3)
 
-    Use this to check on work you dispatched with spawn_agent, or to stop a
-    sub-agent that is taking too long or is no longer needed.
+    Use this to check on work you dispatched with spawn_agent — like a manager
+    checking in on a report: each running entry shows rounds used so far,
+    seconds since its last activity, the last tool it called, and a tail of
+    its most recent output, so you can judge "it's going fine" vs. deciding to
+    steer it (``send_to_subagent``) or stop it (this tool, ``stop <id>``).
     """
     import time
     from src import subagent_runs
@@ -806,7 +1321,10 @@ async def manage_agents(content: str, session_id: Optional[str] = None, owner: O
             return {"results": f"Cancelling sub-agent {sub_id}. It will post a cancellation notice with any partial output into this chat."}
         return {"results": f"No running sub-agent {sub_id} found (it may have already finished — check the chat for its result)."}
 
-    # Default: list.
+    # Default: list. Running entries carry live progress (rounds used, seconds
+    # since activity, last tool, a tail of recent output) so the parent model
+    # can genuinely assess "is it going fine?" mid-run instead of only seeing
+    # "running Ns" with no sense of progress — like a manager checking in.
     upd = subagent_runs.get_updates(session_id)
     now = upd.get("now") or time.time()
     running, finished = [], []
@@ -815,7 +1333,21 @@ async def manage_agents(content: str, session_id: Optional[str] = None, owner: O
         summ = (u.get("summary") or "").strip()
         model = u.get("model") or "?"
         if u.get("status") == "running":
-            running.append(f"  - {u['id']} [{model}] running {el}s — {summ}")
+            _bits = [f"  - {u['id']} [{model}] running {el}s"]
+            _rounds = u.get("rounds_used")
+            if _rounds is not None:
+                _bits.append(f"round {_rounds}")
+            _since = u.get("seconds_since_activity")
+            if _since is not None:
+                _bits.append(f"last activity {_since}s ago")
+            _last_tool = u.get("last_tool")
+            if _last_tool:
+                _bits.append(f"last tool: {_last_tool}")
+            _line = ", ".join(_bits) + f" — {summ}"
+            _tail = (u.get("output_tail") or "").strip()
+            if _tail:
+                _line += f"\n    recent output: …{_tail[-300:]}"
+            running.append(_line)
         else:
             st = u.get("status")
             if u.get("error"):
@@ -825,7 +1357,7 @@ async def manage_agents(content: str, session_id: Optional[str] = None, owner: O
         return {"results": "No background sub-agents are running or recently finished in this chat."}
     out = []
     if running:
-        out.append(f"{len(running)} running sub-agent(s) (cancel with `manage_agents` then `stop <id>`):")
+        out.append(f"{len(running)} running sub-agent(s) (cancel with `manage_agents` then `stop <id>`, steer with `send_to_subagent`):")
         out.extend(running)
     if finished:
         out.append("Recently finished (results already delivered into this chat):")

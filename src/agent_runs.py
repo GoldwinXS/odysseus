@@ -84,6 +84,39 @@ def has_steering(session_id: str) -> bool:
     run = _RUNS.get(session_id)
     return bool(run and run.steer_queue)
 
+
+# ── Steer-only mailbox (sub-agent steering) ──────────────────────────────
+# A background sub-agent runs stream_agent_loop DIRECTLY (not via start()), so
+# it never gets a _Run entry — which means both enqueue_steer and drain_steering
+# no-op for it, and it can't be steered mid-flight. These helpers register a
+# bare, task-less _Run purely as a steer mailbox for a sub-agent's ephemeral
+# queue session (id ``_subagent_<id>``), so send_to_subagent's enqueue_steer
+# lands and the sub-agent's loop drain_steering picks it up at a round boundary.
+#
+# It is NOT a real detached run: no drain task, no replay buffer fan-out, no
+# subscribers, and no teardown persistence path (that lives in _drain, which we
+# never start here). The caller (subagent_runs / model_interaction_tools) owns
+# the lifecycle and MUST call close_steer_mailbox when the sub-agent finishes.
+
+def register_steer_mailbox(session_id: str) -> None:
+    """Create a steer-only running _Run for a sub-agent's queue session so it can
+    be steered. Idempotent; leaves an existing run in place (never clobbers a
+    real detached run that might, in theory, share the id)."""
+    if session_id in _RUNS:
+        return
+    run = _Run()
+    run.status = "running"   # so enqueue_steer/drain_steering accept it
+    _RUNS[session_id] = run
+
+
+def close_steer_mailbox(session_id: str) -> None:
+    """Tear down a steer-only mailbox created by register_steer_mailbox. Only
+    removes a task-less mailbox run — a real detached run (has a .task) is left
+    alone so this can't accidentally evict live streaming state."""
+    run = _RUNS.get(session_id)
+    if run is not None and run.task is None:
+        _RUNS.pop(session_id, None)
+
 # How long a FINISHED run (and its full replay buffer) is retained after the
 # last subscriber disconnects, so a reconnect within the window can still
 # replay the result. After this, the run is evicted to bound memory — without

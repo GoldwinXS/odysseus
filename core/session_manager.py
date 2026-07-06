@@ -232,6 +232,24 @@ class SessionManager:
 
             msg_id = str(uuid.uuid4())
             msg_time = datetime.utcnow()
+            # Ordering-tie guard: chat_messages has no sequence column, so
+            # history replay relies solely on ORDER BY timestamp. Two messages
+            # persisted in rapid succession (e.g. a fast tool-result save
+            # right after the user message) can land on the same naive-utc
+            # instant, making their relative order ambiguous on reload.
+            # replace_messages() already guards its bulk path with a
+            # timedelta(microseconds=i) offset; mirror that here for the
+            # single-message path by bumping 1us past the last persisted
+            # timestamp for this session when we'd otherwise tie or precede it.
+            _last_ts = (
+                db.query(DbChatMessage.timestamp)
+                .filter(DbChatMessage.session_id == session_id)
+                .order_by(DbChatMessage.timestamp.desc())
+                .limit(1)
+                .scalar()
+            )
+            if _last_ts is not None and msg_time <= _last_ts:
+                msg_time = _last_ts + timedelta(microseconds=1)
             if message.metadata is None:
                 message.metadata = {}
             message.metadata.setdefault('timestamp', _message_timestamp_iso(msg_time))

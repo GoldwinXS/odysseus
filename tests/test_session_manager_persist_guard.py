@@ -15,6 +15,12 @@ def _manager_with(sessions):
 def _session_local(parent_row):
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = parent_row
+    # _persist_message also queries the session's last persisted timestamp
+    # (the ordering-tie guard) via .filter().order_by().limit().scalar() on
+    # the SAME db.query(...) mock. None = "no prior message", the natural
+    # default here — an unconfigured MagicMock() would fail the real code's
+    # `msg_time <= _last_ts` comparison (datetime vs MagicMock).
+    db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.scalar.return_value = None
     return MagicMock(return_value=db), db
 
 

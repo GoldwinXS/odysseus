@@ -63,6 +63,97 @@ _MAX_SERVER_RESUMES = 3
 _resume_count: Dict[str, int] = {}      # session_id -> consecutive server resumes
 _resume_running: set = set()            # session_ids with a resume turn in flight
 
+# Failure-driven resumes are capped SEPARATELY and more tightly than success
+# resumes. A subagent that FAILS (timeout / stall / loop / upstream error) should
+# still wake the parent once so it can decide the next step (the hang-forever bug),
+# but repeated failures must not ping-pong the parent into a spawn/fail/resume
+# token loop — especially against a down/rate-limited provider. This cap bounds
+# consecutive failure-driven resumes per session; it shares the _resume_running
+# in-flight guard with the success path and resets on genuine user activity.
+_MAX_FAILURE_RESUMES = 2
+_failure_resume_count: Dict[str, int] = {}   # session_id -> consecutive failure resumes
+
+# Prefix for a sub-agent's ephemeral STEER-QUEUE session id (mid-flight steering
+# via send_to_subagent). It is NOT a real chat session — no DB row exists for it.
+# The agent loop's steering-injection path (agent_loop._inject_steering_messages)
+# calls sm.get_session(session_id) and sess.add_message() on it; both must be
+# harmless for this id. We satisfy that by registering an in-memory,
+# NON-PERSISTING Session object under this id in the session-manager cache (see
+# _register_ephemeral_session), so get_session finds it (no KeyError from the
+# DB-load path) and add_message appends to history WITHOUT writing a chat_messages
+# row under the fake session. Kept in sync with the check other layers do on the
+# id prefix.
+_QUEUE_SESSION_PREFIX = "_subagent_"
+
+
+def is_queue_session(session_id: Optional[str]) -> bool:
+    """True for a sub-agent's ephemeral steer-queue session id (never a real
+    chat session). Used to skip DB persistence for steered messages."""
+    return bool(session_id) and session_id.startswith(_QUEUE_SESSION_PREFIX)
+
+
+def _register_ephemeral_session(queue_session: str, model: str) -> None:
+    """Register a NON-PERSISTING in-memory Session under the sub-agent's queue id
+    so the loop's steering path can get_session()/add_message() it without either
+    raising KeyError (unknown id → DB load → KeyError) or writing chat rows to the
+    DB under a fake session. Best-effort: if the session manager or core models
+    aren't importable (unit tests that stub them), we skip silently — steering
+    still enqueues/drains via agent_runs; only the loop-side persistence guard is
+    unavailable, and that path is itself guarded by is_queue_session at delivery."""
+    try:
+        from core.models import Session, get_session_manager_instance
+    except Exception:
+        return
+    sm = get_session_manager_instance()
+    if sm is None or not hasattr(sm, "sessions"):
+        return
+    if queue_session in sm.sessions:
+        return
+
+    class _EphemeralSubagentSession(Session):
+        """A queue-only session that never persists. add_message appends to the
+        in-memory history so the loop's assumptions hold, but does NOT call the
+        session manager's _persist_message (which would drop the write AND pop
+        this object from the cache, breaking later steer rounds)."""
+        def add_message(self, message):   # type: ignore[override]
+            self.history.append(message)
+            self.message_count = len(self.history)
+
+    try:
+        sm.sessions[queue_session] = _EphemeralSubagentSession(
+            id=queue_session, name="(sub-agent steer queue)",
+            endpoint_url="", model=model or "", history=[],
+        )
+    except Exception as e:
+        logger.debug("[subagent] ephemeral session register skipped: %s", e)
+
+
+def _drop_ephemeral_session(queue_session: str) -> None:
+    """Remove the ephemeral queue session from the manager cache on teardown."""
+    try:
+        from core.models import get_session_manager_instance
+        sm = get_session_manager_instance()
+        if sm is not None and hasattr(sm, "sessions"):
+            sm.sessions.pop(queue_session, None)
+    except Exception:
+        pass
+
+
+def can_failure_resume(session_id: str) -> bool:
+    """Whether a FAILURE-driven server resume may fire for this session.
+
+    False when a resume turn is already running or the (tighter) failure cap is
+    hit. Independent of the success cap so a normal successful delivery isn't
+    starved by prior failures and vice-versa."""
+    if session_id in _resume_running:
+        return False
+    return _failure_resume_count.get(session_id, 0) < _MAX_FAILURE_RESUMES
+
+
+def note_failure_resume(session_id: str) -> None:
+    """Record that a failure-driven server resume just fired (consumes cap)."""
+    _failure_resume_count[session_id] = _failure_resume_count.get(session_id, 0) + 1
+
 
 def can_server_resume(session_id: str) -> bool:
     """Whether another server-side resume may fire for this session.
@@ -88,9 +179,10 @@ def set_resume_running(session_id: str, running: bool) -> None:
 
 
 def note_user_activity(session_id: str) -> None:
-    """Reset the server-resume cap on genuine user activity (normal send / steer /
-    ack). Mirrors the frontend's resetSubagentAutoResume."""
+    """Reset the server-resume caps (success AND failure) on genuine user activity
+    (normal send / steer / ack). Mirrors the frontend's resetSubagentAutoResume."""
     _resume_count.pop(session_id, None)
+    _failure_resume_count.pop(session_id, None)
 
 
 def _next_id() -> str:
@@ -140,12 +232,17 @@ def start(
     does not touch the session (delivery lives with the caller, which owns the
     session manager and message types).
     """
+    _id = _next_id()
     rec = {
-        "id": _next_id(),
+        "id": _id,
         "status": "running",
         "summary": (summary or "")[:200],
         "model": model or "",
         "owner": owner,   # for per-owner fairness accounting (never serialized)
+        # Ephemeral steer-queue session id for this sub-agent (mid-flight steering
+        # via send_to_subagent). Threaded into stream_agent_loop(session_id=...) so
+        # the loop drains steers; NOT a real chat session (never serialized).
+        "queue_session": f"{_QUEUE_SESSION_PREFIX}{_id}",
         "started_at": time.time(),
         "finished_at": None,
         "error": None,
@@ -159,14 +256,43 @@ def start(
         # detached resume turn itself; the frontend reads it from get_updates
         # and MUST NOT client-fire an auto-resume when it is "server".
         "resume": None,   # None | "server"
+        # Live mid-run progress — pushed by model_interaction_tools' _drain
+        # per-chunk handler (mutating this SAME dict object, since it lives
+        # here in _UPDATES) so a parent checking in via manage_agents sees
+        # genuine status instead of just "still running". None/absent until
+        # the sub-agent's first chunk arrives.
+        "rounds_used": None,        # highest agent_step round seen so far
+        "last_tool": None,          # name of the most recent tool_start
+        "last_activity_at": None,   # time.time() of the most recent chunk
+        "output_tail": None,        # last ~300 chars of visible output so far
         "_task": None,   # asyncio.Task — internal, never serialized (see get_updates)
     }
     _UPDATES.setdefault(session_id, []).append(rec)
+    # Stand up the steer mailbox + ephemeral queue session BEFORE the run starts,
+    # so a send_to_subagent that races an early round still lands. Both are torn
+    # down in _run's finally.
+    _queue = rec["queue_session"]
+    try:
+        from src import agent_runs
+        agent_runs.register_steer_mailbox(_queue)
+    except Exception as e:
+        logger.debug("[subagent] steer mailbox register skipped for %s: %s", _queue, e)
+    _register_ephemeral_session(_queue, model)
     task = asyncio.create_task(_run(session_id, rec, runner))
     rec["_task"] = task
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return rec
+
+
+def find_running(session_id: str, subagent_id: str) -> Optional[dict]:
+    """Return the run record for a RUNNING sub-agent in this session, or None if
+    it doesn't exist / already finished. Used by send_to_subagent to validate a
+    steer target before enqueuing."""
+    for rec in _UPDATES.get(session_id, []):
+        if rec["id"] == subagent_id:
+            return rec if rec.get("status") == "running" else None
+    return None
 
 
 def stop(session_id: str, subagent_id: str) -> bool:
@@ -231,6 +357,16 @@ async def _run(session_id: str, rec: dict, runner: Callable[[], Awaitable[Dict]]
         rec["error"] = str(e)[:1000]
     finally:
         rec["finished_at"] = time.time()
+        # Tear down the steer mailbox + ephemeral queue session — the sub-agent
+        # is no longer running, so it can't be steered any more.
+        _queue = rec.get("queue_session")
+        if _queue:
+            try:
+                from src import agent_runs
+                agent_runs.close_steer_mailbox(_queue)
+            except Exception:
+                pass
+            _drop_ephemeral_session(_queue)
         _schedule_evict(session_id, rec)
 
 
@@ -312,12 +448,18 @@ def context_note(session_id: str) -> Optional[str]:
 
 def get_updates(session_id: str) -> Dict[str, Any]:
     """Poll payload for a session: how many sub-agents are still running, and the
-    (running + recently-finished) records the client can render / de-dupe on."""
+    (running + recently-finished) records the client can render / de-dupe on.
+
+    Also carries live mid-run progress (rounds_used, last_tool, output_tail,
+    seconds_since_activity) so a parent model checking in via manage_agents can
+    say "it's going fine" or decide to steer/stop, rather than seeing only a
+    bare running/done status."""
     lst = _UPDATES.get(session_id, [])
     active = sum(1 for r in lst if r["status"] == "running")
+    _now = time.time()
     return {
         "active": active,
-        "now": time.time(),   # server clock, so the client can show skew-free elapsed
+        "now": _now,   # server clock, so the client can show skew-free elapsed
         "updates": [
             {
                 "id": r["id"],
@@ -332,6 +474,14 @@ def get_updates(session_id: str) -> Dict[str, Any]:
                 # server-side (steer into a live turn or a detached resume
                 # turn). The client must NOT client-fire an auto-resume for it.
                 "resume": r.get("resume"),
+                # Live progress (None until the sub-agent's first chunk lands).
+                "rounds_used": r.get("rounds_used"),
+                "last_tool": r.get("last_tool"),
+                "output_tail": r.get("output_tail"),
+                "seconds_since_activity": (
+                    max(0, int(_now - r["last_activity_at"]))
+                    if r.get("last_activity_at") else None
+                ),
             }
             for r in lst
         ],

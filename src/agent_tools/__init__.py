@@ -23,7 +23,7 @@ from .subprocess_tools import BashTool, PythonTool
 from .web_tools import WebSearchTool, WebFetchTool
 from .filesystem_tools import ReadFileTool, WriteFileTool, EditFileTool, LsTool, GlobTool, GrepTool, GetWorkspaceTool
 from .document_tools import CreateDocumentTool, UpdateDocumentTool, EditDocumentTool, SuggestDocumentTool, ManageDocumentTool
-from .interaction_tools import AskUserTool, UpdatePlanTool
+from .interaction_tools import AskUserTool, UpdatePlanTool, SendToSubagentTool
 from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool, SpawnAgentTool, ManageAgentsTool
 from .bg_job_tools import ManageBgJobsTool
 from .discovery_tools import SearchToolsTool
@@ -57,6 +57,7 @@ TOOL_HANDLERS = {
     "ask_teacher": AskTeacherTool().execute,
     "spawn_agent": SpawnAgentTool().execute,
     "manage_agents": ManageAgentsTool().execute,
+    "send_to_subagent": SendToSubagentTool().execute,
     "list_models": ListModelsTool().execute,
     "manage_bg_jobs": ManageBgJobsTool().execute,
     "search_tools": SearchToolsTool().execute,
@@ -72,7 +73,12 @@ TOOL_HANDLERS.update(ADMIN_TOOL_HANDLERS)
 # Constants (re-exported for backward compatibility — single source of truth
 # is src.constants; always prefer importing from there for new code)
 # ---------------------------------------------------------------------------
-MAX_AGENT_ROUNDS = 50
+# Runaway backstop, not a working ceiling — a healthy agentic turn should never
+# get killed just for taking many rounds on a big task. Circling/looping is
+# caught by the runaway-call and similarity-loop detectors in agent_loop.py's
+# round loop, not by this cap. The agent_max_rounds setting (see
+# src/chat_flows.py) overrides this default for a live turn.
+MAX_AGENT_ROUNDS = 200
 SHELL_TIMEOUT = 60
 PYTHON_TIMEOUT = 30
 
@@ -81,12 +87,12 @@ TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_fi
              "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "search_tools",
              "create_document", "update_document", "edit_document",
              "search_chats",
-             "chat_with_model", "spawn_agent", "manage_agents",
+             "chat_with_model", "spawn_agent", "manage_agents", "send_to_subagent",
              "create_session", "list_sessions",
              "send_to_session",
              "pipeline",
              "manage_session", "manage_memory", "list_models",
-             "ui_control", "generate_image", "ask_user", "update_plan",
+             "ui_control", "generate_image", "generate_video", "ask_user", "update_plan",
              "manage_tasks", "api_call", "ask_teacher", "manage_skills",
              "suggest_document",
              "manage_endpoints", "manage_mcp", "manage_webhooks",
