@@ -828,6 +828,24 @@ _FALSE_DISPATCH_RE = re.compile(
 )
 
 
+def _endpoint_caches_prompts(url: str) -> bool:
+    """True for endpoints where a STABLE full tool set pays off — i.e. the
+    provider caches the prompt prefix so re-sending the same big tools+system
+    block turn-to-turn is served from cache (~0.1x) instead of re-billed. Tools
+    sit at the FRONT of the cache prefix, so per-turn RAG tool churn otherwise
+    busts the ENTIRE cache. Anthropic (explicit cache_control) is confirmed;
+    Gemini-implicit / DeepSeek / Moonshot can be added once verified. For a
+    NON-caching provider (z.ai, novita, most local), sending all tools every turn
+    is a pure cost increase, so default to False and keep per-turn RAG."""
+    if not url:
+        return False
+    try:
+        from src.llm_core import _host_match
+        return _host_match(url, "anthropic.com")
+    except Exception:
+        return "anthropic.com" in url
+
+
 def _is_explicit_continuation(text: str) -> bool:
     """Only these terse replies may inherit older user turns for tool retrieval."""
     return bool(_EXPLICIT_CONTINUATION_RE.match(str(text or "").strip()))
@@ -2760,6 +2778,31 @@ async def stream_agent_loop(
     _t1 = time.time()
     if _relevant_tools:
         logger.info(f"[tool-rag] Using caller-provided relevant_tools ({len(_relevant_tools)} tools)")
+    # PROMPT-CACHE STABILITY (cost). Per-turn RAG changes the tool SET on every
+    # message; since tools are at the FRONT of an Anthropic cache prefix, any
+    # change busts the whole cache (tools+system+history) → each turn re-pays the
+    # full write price (~10x observed on real "hello" turns). For a caching
+    # endpoint, send a STABLE full tool set so the entire prefix caches
+    # turn-to-turn; the ~17k of tool schemas are then read from cache at ~0.1x.
+    # Non-caching providers keep per-turn RAG (fewer input tokens they pay for
+    # every turn with no cache discount).
+    if not guide_only and not _relevant_tools and _endpoint_caches_prompts(endpoint_url):
+        try:
+            from src.tool_index import ALWAYS_AVAILABLE
+            _stable = set(TOOL_SECTIONS.keys()) | set(ALWAYS_AVAILABLE)
+            if mcp_mgr:
+                try:
+                    for _mt in mcp_mgr.get_all_tools(_mcp_disabled_map):
+                        if not _mt.get("is_disabled") and _mt.get("name"):
+                            _stable.add(_mt["name"])
+                except Exception as _e:
+                    logger.debug("[tool-cache] MCP tool enumerate skipped: %s", _e)
+            _stable -= set(disabled_tools or set())
+            _relevant_tools = _stable
+            logger.info("[tool-cache] cache-capable endpoint → stable full tool set (%d tools) for prompt-cache stability", len(_relevant_tools))
+        except Exception as _e:
+            logger.warning("[tool-cache] stable tool set failed, falling back to RAG: %s", _e)
+            _relevant_tools = None
     if not guide_only and not _relevant_tools and _low_signal_turn:
         from src.tool_index import ALWAYS_AVAILABLE
         if workspace:
