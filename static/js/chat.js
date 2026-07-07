@@ -2871,11 +2871,12 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
                   // (next text/thinking bubble or turn end — see the collapse
                   // calls at those points below).
                   threadWrap._allEvents = [];
-                  // Collapsed by DEFAULT even while streaming: show just the
-                  // one-line "Using tools…" summary with the animated pulse line
-                  // (user preference). Click to expand; auto-stays collapsed
-                  // when the block ends.
-                  chatRenderer.ensureAgentThreadSummary(threadWrap, { startExpanded: false });
+                  // Expanded WHILE STREAMING so the user sees each tool call as
+                  // it happens (and the pulse line runs down the live chips),
+                  // then auto-collapses to the one-line "Using tools…" summary
+                  // when the block ends. Resting/history threads stay collapsed
+                  // (collapsed-by-default), so this is live-visibility only.
+                  chatRenderer.ensureAgentThreadSummary(threadWrap, { startExpanded: true });
                 }
                 threadWrap.dataset.round = String(_thisRound);
                 threadWrap.classList.add('streaming');
