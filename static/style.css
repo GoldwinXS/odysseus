@@ -9708,6 +9708,15 @@ body.fullwidth-chat .chat-history {
 .agent-thread.collapsed .agent-thread-node {
   display: none;
 }
+/* Collapsed-by-default while streaming (user preference): the chips are hidden,
+   but keep a full-height rail below the "Using tools…" summary so the synapse
+   pulse animates as ONE continuous line down the thread — independent of whether
+   the chips are expanded or collapsed. Height is removed the moment the block
+   ends (the `.streaming` class is dropped), snapping back to the compact
+   summary. Applies whether or not it connects to a bubble above/below. */
+.agent-thread.streaming.collapsed {
+  min-height: 4.25rem;
+}
 
 /* Mobile: constrain thread content */
 @media (max-width: 768px) {

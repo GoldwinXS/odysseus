@@ -114,7 +114,13 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
     // mdToHtml wraps a lone line in a <p>...</p>, which would break the row's
     // flex layout, so unwrap that single outer paragraph after rendering.
     const mdInline = (s) => {
-      const html = markdownModule.mdToHtml(markdownModule.squashOutsideCode(String(s == null ? '' : s)));
+      // Strip a leading block marker (list bullet / ordinal / heading) FIRST:
+      // a plan step whose text starts with "- ", "* ", "1. ", or "## " would
+      // otherwise make mdToHtml emit a <ul>/<ol>/<hN> block, which the lone-<p>
+      // unwrap below misses — injecting a doubled bullet + broken block into the
+      // compact flex row (the checkbox is already drawn separately).
+      const src = String(s == null ? '' : s).replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+|#{1,6}\s+)/, '');
+      const html = markdownModule.mdToHtml(markdownModule.squashOutsideCode(src));
       const m = html.match(/^<p>([\s\S]*)<\/p>$/);
       return m ? m[1] : html;
     };
@@ -2825,7 +2831,11 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
                   // (next text/thinking bubble or turn end — see the collapse
                   // calls at those points below).
                   threadWrap._allEvents = [];
-                  chatRenderer.ensureAgentThreadSummary(threadWrap, { startExpanded: true });
+                  // Collapsed by DEFAULT even while streaming: show just the
+                  // one-line "Using tools…" summary with the animated pulse line
+                  // (user preference). Click to expand; auto-stays collapsed
+                  // when the block ends.
+                  chatRenderer.ensureAgentThreadSummary(threadWrap, { startExpanded: false });
                 }
                 threadWrap.dataset.round = String(_thisRound);
                 threadWrap.classList.add('streaming');
