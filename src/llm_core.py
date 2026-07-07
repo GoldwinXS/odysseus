@@ -1471,6 +1471,30 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             # The breakpoint caches all tool defs preceding it in the request.
             anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = anthropic_tools
+    # Byte-for-byte cache-stability diagnostic. Prompt caching only hits if the
+    # cached prefix is byte-identical turn-to-turn. Log a SHA of exactly what
+    # carries the cache_control breakpoints — the stable system block (bytes
+    # before "## Available tools") and the sorted tool defs — so two consecutive
+    # turns can be diffed: same hash + cache_read=None ⇒ the 5-min TTL expired
+    # (normal); hash CHANGES between same-session turns ⇒ real instability (bug).
+    # Pairs with the [anthropic-cache] read/write log downstream.
+    try:
+        import hashlib as _hl
+        _sys_stable = ""
+        if isinstance(payload.get("system"), list) and payload["system"]:
+            _sys_stable = payload["system"][0].get("text", "")
+        _tools_for_hash = [
+            {k: v for k, v in t.items() if k != "cache_control"}
+            for t in payload.get("tools", [])
+        ]
+        _sys_h = _hl.sha256(_sys_stable.encode("utf-8")).hexdigest()[:16]
+        _tools_h = _hl.sha256(
+            json.dumps(_tools_for_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16]
+        logger.info("[anthropic-cache-hash] stable_sys=%s tools=%s sys_len=%d ntools=%d",
+                    _sys_h, _tools_h, len(_sys_stable), len(_tools_for_hash))
+    except Exception:
+        pass
     return payload
 
 def _build_anthropic_headers(headers):

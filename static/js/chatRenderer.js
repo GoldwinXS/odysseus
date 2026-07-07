@@ -1820,6 +1820,13 @@ export function displayMetrics(messageElement, metrics) {
   // Prefer server-authoritative metadata.cost_usd; else an improved cache-aware
   // estimate priced by the served model. null for non-billable endpoints.
   const cost = turnCost(metrics);
+  // Anthropic prompt cache. Provider total prompt = fresh input + cache_read +
+  // cache_write; the fraction served from cache (billed ~0.1x) is the hit rate.
+  const cacheRead = metrics.cache_read_tokens || 0;
+  const cacheWrite = metrics.cache_creation_tokens || 0;
+  const _promptTotal = inputTokens + cacheRead + cacheWrite;
+  const cacheHitPct = (cacheRead > 0 && _promptTotal > 0) ? Math.round(100 * cacheRead / _promptTotal) : 0;
+  const hasCache = cacheRead > 0 || cacheWrite > 0;
 
   // Nothing useful to show — bail out (only if ALL metrics are missing)
   if (!responseTime && !inputTokens && !outputTokens && tps == null && !ctxPct) return;
@@ -1892,6 +1899,11 @@ export function displayMetrics(messageElement, metrics) {
       <div><span class="ctx-label">Input</span> ${inputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Output</span> ${outputTokens.toLocaleString()} tokens${isReal ? '' : '~'}</div>
       <div><span class="ctx-label">Total</span> ${totalTok.toLocaleString()} tokens</div>
+      ${hasCache ? `<div style="margin-top:4px;padding-top:4px;border-top:1px solid var(--border);">
+        <div><span class="ctx-label">Cache read</span> ${cacheRead.toLocaleString()} tokens <span style="opacity:.6;">(~0.1×)</span></div>
+        <div><span class="ctx-label">Cache write</span> ${cacheWrite.toLocaleString()} tokens</div>
+        <div><span class="ctx-label">Cache hit</span> <span style="color:${cacheHitPct >= 50 ? 'var(--green,#98c379)' : 'var(--color-muted-alt,#6b7280)'};font-weight:600;">${cacheHitPct}%</span> of prompt</div>
+      </div>` : ''}
       <div><span class="ctx-label">Speed</span> ${speedStr}</div>
       <div><span class="ctx-label">Time</span> ${responseTime}s</div>
       ${prepTime != null ? `<div><span class="ctx-label">Prep</span> ${prepTime}s</div>` : ''}
@@ -2069,6 +2081,17 @@ export function displayMetrics(messageElement, metrics) {
     });
   }
 
+  // Compact prompt-cache chip on the stats line (lightning + %) so the user can
+  // SEE Anthropic cache effectiveness at a glance without opening the popup.
+  let cacheChip = null;
+  if (cacheRead > 0) {
+    cacheChip = document.createElement('span');
+    cacheChip.className = 'cache-chip';
+    cacheChip.title = `Prompt cache: ${cacheRead.toLocaleString()} read (~0.1×), ${cacheWrite.toLocaleString()} write — ${cacheHitPct}% of the prompt served from cache`;
+    cacheChip.style.cssText = 'display:inline-flex;align-items:center;gap:1px;color:var(--color-muted-alt,#6b7280);';
+    cacheChip.innerHTML = `<span style="opacity:.45;margin:0 3px;">·</span><svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" style="opacity:.75"><path d="M13 2L4.5 12.5H11l-1 9.5 8.5-10.5H12z"/></svg>${cacheHitPct}%`;
+  }
+
   let footer = messageElement.querySelector('.msg-footer');
   if (!footer) {
     footer = createMsgFooter(messageElement);
@@ -2086,6 +2109,7 @@ export function displayMetrics(messageElement, metrics) {
       footer.appendChild(metricsContainer);
       footer.appendChild(metricsDivider);
     }
+    if (cacheChip) footer.insertBefore(cacheChip, metricsDivider);
     if (ctxRing) {
       const ctxDiv = document.createElement('span');
       ctxDiv.textContent = ' | ';
@@ -2705,11 +2729,19 @@ export function addMessage(role, content, modelName, metadata) {
         }
       }
 
-      const firstWrap = lastMsgAi || lastWrap;
-      if (firstWrap && firstWrap.classList.contains('msg-ai')) {
-        if (metadata?.memories_used?.length) firstWrap._memoriesUsed = metadata.memories_used;
-        firstWrap.appendChild(createMsgFooter(firstWrap));
-        if (metadata) displayMetrics(firstWrap, metadata);
+      // Stats line target: prefer the last AI text bubble, else fall back to the
+      // last tool thread. Previously this required `.msg-ai`, so a tool-ONLY turn
+      // (no closing prose) rendered NO stats line on reload even though it showed
+      // one live — the "I don't see the tok/s / memories UI all the time" bug.
+      const metricsTarget = (lastMsgAi && lastMsgAi.isConnected) ? lastMsgAi : lastWrap;
+      if (metricsTarget) {
+        if (metadata?.memories_used?.length) metricsTarget._memoriesUsed = metadata.memories_used;
+        if (!metricsTarget.querySelector('.msg-footer')) {
+          const _f = createMsgFooter(metricsTarget);
+          if (metricsTarget.classList?.contains('agent-thread')) _f.classList.add('agent-thread-footer');
+          metricsTarget.appendChild(_f);
+        }
+        if (metadata) displayMetrics(metricsTarget, metadata);
       }
 
       if (window.hljs) {
