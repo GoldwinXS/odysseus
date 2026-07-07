@@ -4335,9 +4335,26 @@ async def stream_agent_loop(
                     # awaits below), the tool task would otherwise keep running
                     # detached — a runaway bash/browser the cancel was meant to
                     # stop. Cancel and await it before re-raising so nothing leaks.
+                    # SSE heartbeat: most tools (web_search, web_fetch,
+                    # generate_image, a sub-agent running many rounds) emit NO
+                    # progress events, so this loop would sit silent for the tool's
+                    # whole duration — a long enough gap lets a proxy/browser idle
+                    # timer drop the turn mid-tool (a cause of the heavy-turn
+                    # "pauses"). Wait on the getter with a timeout and, if nothing
+                    # arrives, emit a `: heartbeat` comment (same as the research
+                    # path). The SAME getter future is kept pending across
+                    # heartbeats, so no progress event or the None sentinel is lost.
+                    _pq_get = None
                     try:
                         while True:
-                            evt = await _progress_q.get()
+                            if _pq_get is None:
+                                _pq_get = asyncio.ensure_future(_progress_q.get())
+                            _done, _ = await asyncio.wait({_pq_get}, timeout=15)
+                            if _pq_get not in _done:
+                                yield ": heartbeat\n\n"
+                                continue
+                            evt = _pq_get.result()
+                            _pq_get = None
                             if evt is None:
                                 break
                             yield (
@@ -4345,6 +4362,8 @@ async def stream_agent_loop(
                             )
                         desc, result = await _tool_task
                     except asyncio.CancelledError:
+                        if _pq_get is not None and not _pq_get.done():
+                            _pq_get.cancel()
                         if not _tool_task.done():
                             _tool_task.cancel()
                             try:
