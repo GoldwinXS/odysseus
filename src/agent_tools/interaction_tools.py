@@ -117,7 +117,22 @@ class AskUserTool:
         if isinstance(parsed, dict):
             question = str(parsed.get("question", "")).strip()
             multi = bool(parsed.get("multi") or parsed.get("multiSelect"))
-            for opt in (parsed.get("options") or []):
+            # Normalize `options` to a real list. Models sometimes pass it as a
+            # STRING (a JSON-encoded array, or newline-joined) instead of an
+            # array — iterating that string would yield ONE OPTION PER CHARACTER
+            # ("circles" → c,i,r,c,l,e,s). Coerce back to a list first.
+            _raw_opts = parsed.get("options") or []
+            if isinstance(_raw_opts, str):
+                _s = _raw_opts.strip()
+                try:
+                    _raw_opts = json.loads(_s)
+                except (ValueError, TypeError):
+                    _raw_opts = [ln.strip() for ln in _s.splitlines() if ln.strip()]
+                if isinstance(_raw_opts, str):   # json.loads gave back a bare string
+                    _raw_opts = [_raw_opts]
+            if not isinstance(_raw_opts, list):
+                _raw_opts = [_raw_opts]
+            for opt in _raw_opts:
                 if isinstance(opt, dict):
                     label = str(opt.get("label", "")).strip()
                     descr = str(opt.get("description", "")).strip()
