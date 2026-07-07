@@ -4546,6 +4546,23 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
       pre.dataset.btnPosComputed = '1';
     }, true);
 
+    // Abort a frozen SSE reader and reconnect. The server run is DETACHED — it
+    // keeps generating and saves the full response even though this reader died —
+    // so selectSession's _checkServerStream/resumeStream live-resumes the still-
+    // running run (or reloads the saved full response). Shared by the tab-resume
+    // recovery and the foreground watchdog below.
+    const _recoverFrozenStream = (reason) => {
+      if (currentAbort) { currentAbort._reason = 'recovery'; currentAbort.abort(); }
+      isStreaming = false;
+      if (_webLockRelease) { _webLockRelease(); _webLockRelease = null; }
+      const _submitBtn = document.getElementById('submit');
+      updateSubmitButton('idle', _submitBtn);
+      const _msgInput = document.getElementById('message');
+      if (_msgInput) _msgInput.disabled = false;
+      const _sid = sessionModule && sessionModule.getCurrentSessionId();
+      if (_sid) sessionModule.selectSession(_sid);
+    };
+
     // Tab suspension recovery: when user tabs back in, check if stream froze
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
@@ -4564,38 +4581,31 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
         if (!isStreaming) return;
         const stillStale = Date.now() - _lastReaderActivity;
         if (stillStale < 5000) return; // Came back to life
-
         console.warn('[tab-recovery] Stream confirmed dead. Aborting and reloading session.');
-
-        // Abort the frozen stream, but preserve the visible bubble.
-        if (currentAbort) {
-          currentAbort._reason = 'recovery';
-          currentAbort.abort();
-        }
-        isStreaming = false;
-
-        // Release Web Lock
-        if (_webLockRelease) {
-          _webLockRelease();
-          _webLockRelease = null;
-        }
-
-        // Reset UI state
-        var _submitBtn = document.getElementById('submit');
-        updateSubmitButton('idle', _submitBtn);
-        var _msgInput = document.getElementById('message');
-        if (_msgInput) _msgInput.disabled = false;
-
-        // Reconnect to the session. The server run is DETACHED — it keeps
-        // generating and saves the full response even though this SSE reader
-        // died in the background. Without this, the bubble stays frozen at the
-        // partial forever. selectSession re-runs _checkServerStream/resumeStream,
-        // which live-resumes the still-running run or reloads the saved full
-        // response. Mirrors the document.wasDiscarded path below.
-        var _sid = sessionModule && sessionModule.getCurrentSessionId();
-        if (_sid) sessionModule.selectSession(_sid);
+        _recoverFrozenStream('tab-recovery');
       }, 2000); // 2 second grace period
     });
+
+    // Foreground stall watchdog: the visibilitychange handler above only fires
+    // on a hidden→visible transition, so a stream that freezes while the tab
+    // stays in the FOREGROUND (main-thread jank, a silently-dropped SSE) would
+    // never self-heal. Poll while streaming and recover if the reader goes
+    // silent past the threshold. The server heartbeats every ~15s during a
+    // silent tool call and tokens flow otherwise, so >35s of total reader
+    // silence means the connection is genuinely dead, not just a slow tool.
+    setInterval(() => {
+      if (!isStreaming) return;
+      // Only when the user is actually viewing the streaming session — a
+      // backgrounded stream recovers via resume on re-entry, and selectSession
+      // here would yank a session the user has since navigated away from.
+      const _sid = sessionModule && sessionModule.getCurrentSessionId();
+      if (!_sid || _sid !== _streamSessionId) return;
+      const stale = Date.now() - _lastReaderActivity;
+      if (stale > 35000) {
+        console.warn('[foreground-watchdog] stream silent for ' + Math.round(stale / 1000) + 's — recovering');
+        _recoverFrozenStream('foreground-watchdog');
+      }
+    }, 5000);
 
     // On mobile, fade out welcome text when keyboard opens to prevent overlap
     if (window.innerWidth <= 768) {
