@@ -1125,6 +1125,24 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
     let processingProbeTimer = null;
     let processingProbeAbort = null;
     let _renderStream = () => {};
+    // Live-stream render throttle. _renderStream re-parses markdown over the
+    // WHOLE growing reply (createStreamRenderer + hljs) on every call; invoking
+    // it on every delta is O(N^2) synchronous main-thread work with no paint in
+    // between, which freezes the tab on a heavy turn — and a frozen tab is what
+    // lets the browser drop the SSE mid-turn (saved as stopped=True). The resume
+    // path already coalesces this (renderDeltaThrottled, ~100ms); apply the same
+    // cap with a guaranteed TRAILING render to the live delta path so the last
+    // token still paints even if no structural flush follows. Structural events
+    // (thinking transitions, tool boundaries, turn end) still call _renderStream
+    // directly — they act as immediate flushes and clear any pending timer.
+    let _lastLiveRenderAt = 0;
+    let _liveRenderTimer = null;
+    const _renderStreamThrottled = () => {
+      if (_liveRenderTimer) return;                 // a trailing render is already scheduled
+      const since = Date.now() - _lastLiveRenderAt;
+      if (since >= 80) { _renderStream(); }          // leading edge: enough time passed
+      else { _liveRenderTimer = setTimeout(() => { _liveRenderTimer = null; _renderStream(); }, 80 - since); }
+    };
     let _cancelThinkingTimer = () => {};
     let _removeThinkingSpinner = () => {};
     let timeoutId = null;
@@ -1802,6 +1820,11 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
 
       // Direct render helper for streaming text
       _renderStream = () => {
+        // Any actual render satisfies a pending throttled/trailing render and
+        // resets the throttle clock (keeps immediate flushes and the throttle
+        // in sync; prevents a late trailing render firing after a flush).
+        if (_liveRenderTimer) { clearTimeout(_liveRenderTimer); _liveRenderTimer = null; }
+        _lastLiveRenderAt = Date.now();
         let dt = markdownModule.normalizeThinkingMarkup(stripToolBlocks(_stripDocumentFenceForChat(roundText)));
         const bodyEl = roundHolder.querySelector('.body');
         const contentEl = _ensureStreamLayout(bodyEl);
@@ -2351,7 +2374,7 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
                 } else {
                   // Normal streaming
                   if (spinner && spinner.element) spinner.destroy();
-                  if (!_preambleBuffering) _renderStream();
+                  if (!_preambleBuffering) _renderStreamThrottled();
                   _scheduleThinkingSpinner();
                   // Feed streaming TTS with accumulated text
                   if (streamingTTS) window.aiTTSManager.streamingUpdate(roundText);
