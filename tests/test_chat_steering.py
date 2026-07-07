@@ -173,6 +173,29 @@ def test_subagent_steer_does_not_reset_resume_cap(monkeypatch, _clean_runs):
     assert (sess.messages[0].metadata or {}).get("steer_kind") == "subagent"
 
 
+def test_start_notifies_prev_run_subscribers_superseded(_clean_runs):
+    """A new send for a session must tell the OLD run's subscribers they were
+    superseded, so another device converges onto the new run instead of ending
+    silently on a stale partial (cross-device sync)."""
+    async def _run():
+        prev = _make_live_run("sup-sess")
+        q = asyncio.Queue()
+        prev.subscribers.add(q)                 # a connected client watching the old run
+
+        async def _gen():
+            yield "data: hi\n\n"
+
+        agent_runs.start("sup-sess", _gen())    # a newer send replaces the run
+        got = []
+        while not q.empty():
+            got.append(q.get_nowait())
+        await asyncio.sleep(0.05)               # let the new run's drain finish (no leak)
+        return got
+
+    got = asyncio.run(_run())
+    assert any("event: superseded" in (ev or "") for (_seq, ev) in got)
+
+
 def test_inject_no_live_run_returns_empty(monkeypatch, _clean_runs):
     import src.agent_loop as agent_loop
     assert agent_loop._inject_steering_messages("nope", []) == []

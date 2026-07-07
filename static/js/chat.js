@@ -1941,6 +1941,23 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
           if (line.startsWith('event: ')) {
             const evtType = line.slice(7).trim();
             if (evtType === 'error') _nextIsError = true;
+            else if (evtType === 'superseded') {
+              // Our run was replaced by a newer send (usually another device on
+              // the same conversation). Stop this reader and converge onto the
+              // new run: /api/chat/resume → subscribe() replays the new run's
+              // buffer from the start so both clients render the same turn.
+              try { await reader.cancel(); } catch (_e) {}
+              if (_streamSessionId === streamSessionId) _streamSessionId = null;
+              const _sid = streamSessionId;
+              setTimeout(() => {
+                Promise.resolve(resumeStream(_sid)).then((ok) => {
+                  // The new run may not be registered yet during the brief
+                  // cancel/replace window (resume 404s → false); retry once.
+                  if (ok === false) setTimeout(() => { try { resumeStream(_sid); } catch (_e) {} }, 500);
+                }).catch(() => {});
+              }, 0);
+              break;
+            }
             continue;
           }
           if (line.startsWith('data: ')) {
@@ -4207,6 +4224,19 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
         const parts = buffer.split('\n\n');
         buffer = parts.pop();
         for (const part of parts) {
+          if (part.startsWith('event: superseded') || part.includes('\nevent: superseded')) {
+            // This resumed view's run was replaced by a newer send — re-attach
+            // to the new run so chained sends keep converging across devices.
+            try { await reader.cancel(); } catch (_) {}
+            _resumingStreams.delete(sessionId);
+            const _sid = sessionId;
+            setTimeout(() => {
+              Promise.resolve(resumeStream(_sid)).then((ok) => {
+                if (ok === false) setTimeout(() => { try { resumeStream(_sid); } catch (_e) {} }, 500);
+              }).catch(() => {});
+            }, 0);
+            break readLoop;
+          }
           const line = part.split('\n').find(l => l.startsWith('data: '));
           if (!line) continue;
           const payload = line.slice(6);

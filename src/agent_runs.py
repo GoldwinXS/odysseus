@@ -253,6 +253,16 @@ def start(session_id: str, agen: AsyncGenerator[str, None]) -> _Run:
     prev = _RUNS.get(session_id)
     prev_task: Optional[asyncio.Task] = None
     if prev:
+        # Tell any OTHER client still watching the old run that it's been
+        # replaced by a newer send (typically another device), so they converge
+        # onto the new run instead of ending silently on a stale partial. This
+        # buffered event reaches every subscriber before the cancel-driven end
+        # sentinel closes their SSE; the client re-binds via /api/chat/resume,
+        # whose subscribe() replays the new run's buffer from the start.
+        try:
+            _publish(prev, "event: superseded\ndata: {}\n\n")
+        except Exception:
+            pass
         if prev.task and not prev.task.done():
             prev.task.cancel()
             prev_task = prev.task   # new run awaits this before it starts writing
