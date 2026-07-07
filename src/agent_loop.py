@@ -238,7 +238,8 @@ Or with JSON for fresh news:
 {"query": "<your query>", "time_filter": "day"}
 ```
 Search the web for a SINGLE quick fact/lookup mid-task. For news / "today" / "latest" queries, pass `time_filter` ("day", "week", "month", or "year"). NOT for "research X" / "do research on X" / "look into X" requests — those mean a multi-source DEEP RESEARCH job: use `trigger_research` instead (it runs in the Deep Research sidebar and produces a full report). web_search = one quick query; trigger_research = a researched report.
-Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for web lookup/search/latest/current requests.""",
+Use this instead of `bash`, `curl`, `python`, `requests`, or scraping code for web lookup/search/latest/current requests.
+If the user names something you don't recognize — a library, model, API, product, game, or any capitalized proper noun — assume it likely postdates your training and web_search it before answering from memory or claiming it doesn't exist. Guessing about an unfamiliar name is a common, avoidable error.""",
 
     "web_fetch": """\
 ```web_fetch
