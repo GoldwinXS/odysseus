@@ -17,6 +17,9 @@ const API_BASE = window.location.origin;
 let sessions = [];
 let currentSessionId = null;
 let _sessionNavToken = 0;
+// Expose the current session id so the Agent/Chat mode toggle (app.js) can
+// persist a mode change to the right session (mode is a session property).
+try { window.getCurrentSessionId = () => currentSessionId; } catch (_e) {}
 let _skipAutoSelect = false;
 let _suppressNextSessionLoading = false;
 // A single plain-text (non-tool) history message this large is clipped for
@@ -1956,6 +1959,16 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     // global default when the session has no stored override).
     try { _notifyReasoningEffortSessionChanged(id); } catch (e) {}
     const meta = sessions.find(s => s.id === id);
+
+    // Mode is a SESSION property, authoritative across devices — sync the
+    // Agent/Chat toggle UI to THIS session's persisted mode so it matches what
+    // the backend will actually run (see _resolve_session_mode). UI-only: does
+    // not re-persist. 'research' isn't an agent/chat value → leave as-is.
+    try {
+      if (meta && (meta.mode === 'agent' || meta.mode === 'chat') && window.__odysseusSetChatMode) {
+        window.__odysseusSetChatMode(meta.mode);
+      }
+    } catch (e) {}
 
     // Clear the active-plan bar so the previous session's plan doesn't linger
     // into this one (the plan is client-side/in-memory; a live run in the new

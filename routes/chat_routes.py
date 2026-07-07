@@ -103,6 +103,25 @@ def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
     return sess in variants or sess.startswith(base + "/")
 
 
+def _resolve_session_mode(persisted, client: str) -> str:
+    """Resolve the effective base mode (agent|chat) for a turn.
+
+    Mode is a property of the SESSION, authoritative across every device — not a
+    per-browser toggle. Prefer the session's PERSISTED mode so an agent
+    conversation stays an agent conversation on every client; the client's
+    posted field only SEEDS a brand-new session that has no persisted mode yet.
+    This closes the "opened it on my phone and lost all the tools" bug — a device
+    whose local toggle defaulted to chat could silently downgrade an agent
+    session. Explicit switches go through POST /api/chat/mode/{session_id}.
+    ('research'/'research_pending' aren't agent/chat, so a persisted research
+    marker falls through to the client field, matching prior behaviour.)"""
+    if persisted in ("agent", "chat"):
+        return persisted
+    if client in ("agent", "chat"):
+        return client
+    return "chat"
+
+
 def _clear_orphaned_session_endpoint(sess, owner: str | None = None) -> bool:
     """Clear a session model if its endpoint was deleted from ModelEndpoint."""
     if not getattr(sess, "endpoint_url", ""):
@@ -496,7 +515,18 @@ def setup_chat_routes(
         # Plan mode is not part of the merge-ready UI. Ignore stale clients or
         # manual form posts that still send plan_mode=true.
         plan_mode = False
-        chat_mode = str(form_data.get("mode", "")).lower()  # 'chat' or 'agent'
+        # Mode is a SESSION property, authoritative across devices — not this
+        # browser's toggle. `session` here is the client-sent id (pre-coerce), so
+        # for an EXISTING session it's the real id and its persisted mode wins;
+        # for a brand-new/default session it's blank → persisted is None → the
+        # client's field seeds it. See _resolve_session_mode.
+        _client_mode = str(form_data.get("mode", "")).lower()  # this device's toggle
+        chat_mode = _resolve_session_mode(get_session_mode(session), _client_mode)
+        # The user's real agent/chat choice for this session — persisted below.
+        # Kept separate from `chat_mode`, which the plan/auto-escalation logic
+        # may promote to 'agent' for THIS TURN ONLY (that promotion must not flip
+        # the session's stored mode).
+        _session_base_mode = chat_mode
         # Workspace: confine the agent's file/shell tools to this folder.
         workspace, workspace_rejected = _resolve_request_workspace(
             request, form_data.get("workspace")
@@ -900,8 +930,11 @@ def setup_chat_routes(
         )
 
         # Persist session mode after policy/privilege gates so blocked research
-        # turns remain ordinary chat/agent streams and saved messages.
-        _effective_mode = 'research' if effective_do_research else (chat_mode or 'chat')
+        # turns remain ordinary chat/agent streams and saved messages. Persist
+        # the user's BASE agent/chat choice — NOT a per-turn auto-escalation —
+        # so a one-off calendar/notes intent in a chat session doesn't silently
+        # convert it into an agent session forever.
+        _effective_mode = 'research' if effective_do_research else (_session_base_mode or 'chat')
         if _effective_mode in ('agent', 'research', 'chat'):
             set_session_mode(session, _effective_mode)
 
@@ -1545,6 +1578,23 @@ def setup_chat_routes(
         _verify_session_owner(request, session_id)
         stopped = agent_runs.stop(session_id)
         return {"stopped": stopped}
+
+    @router.post("/api/chat/mode/{session_id}")
+    async def chat_set_mode(request: Request, session_id: str) -> Dict[str, Any]:
+        """Persist a conversation's mode (agent|chat) as a SESSION property so it
+        is authoritative on every device, not a per-browser toggle. The send path
+        reads this via get_session_mode (see _resolve_session_mode); the client
+        posts here when the user flips the Agent/Chat toggle."""
+        _verify_session_owner(request, session_id)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        mode = str((body or {}).get("mode", "")).lower()
+        if mode not in ("agent", "chat"):
+            return {"ok": False, "error": "mode must be 'agent' or 'chat'"}
+        ok = set_session_mode(session_id, mode)
+        return {"ok": ok, "mode": mode}
 
     # ------------------------------------------------------------------ #
     # POST /api/chat/steer — inject a message into a RUNNING agent turn.

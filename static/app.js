@@ -1682,14 +1682,32 @@ function initializeEventListeners() {
       // Delay tool glow-up for a staggered effect
       setTimeout(() => applyModeToToggles(mode), 500);
     }
+    // __odysseusSetChatMode updates the UI only (used by selectSession to sync
+    // the pill to a session's stored mode). A USER click ALSO persists the mode
+    // to the current session server-side, because mode is a session property,
+    // not a per-device toggle — so the choice follows the conversation to every
+    // device (see /api/chat/mode + _resolve_session_mode).
     window.__odysseusSetChatMode = setMode;
+    function persistSessionMode(mode) {
+      try {
+        const sid = window.getCurrentSessionId && window.getCurrentSessionId();
+        if (!sid) return; // brand-new/unsaved chat — the first send seeds the mode
+        fetch(`${API_BASE}/api/chat/mode/${encodeURIComponent(sid)}`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode }),
+        }).catch(() => {});
+      } catch (_e) {}
+    }
     agentBtn.addEventListener('click', () => {
       // Agent mode turns off research if active
       const resChk = el('research-toggle');
       if (resChk && resChk.checked) _syncResearchIndicator(false);
       setMode('agent');
+      persistSessionMode('agent');
     });
-    chatBtn.addEventListener('click', () => setMode('chat'));
+    chatBtn.addEventListener('click', () => { setMode('chat'); persistSessionMode('chat'); });
     setMode(currentMode);
   })();
 
