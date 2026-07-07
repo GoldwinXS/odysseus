@@ -55,7 +55,16 @@ def _bash_timeout() -> int:
         return 600
 
 DEFAULT_BASH_TIMEOUT = 60 * 60     # kept for import compatibility; live value via _bash_timeout()
-DEFAULT_PYTHON_TIMEOUT = 60 * 60
+DEFAULT_PYTHON_TIMEOUT = 60 * 60   # kept for import compatibility; live value via _python_timeout()
+
+
+def _python_timeout() -> int:
+    """Foreground wall-clock cap for the ```python``` tool. Mirrors _bash_timeout
+    (sub-agent runner cap takes precedence, then the `agent_bash_timeout_seconds`
+    setting, default 600s) — the python tool previously hardcoded 3600s, so a
+    blocking call (or a server that slipped past the server-detect guard) could
+    freeze a turn for a full hour or eat a sub-agent's whole budget."""
+    return _bash_timeout()
 
 PROGRESS_INTERVAL_S = 2.0
 PROGRESS_TAIL_LINES = 12
@@ -179,6 +188,26 @@ class BashTool:
 class PythonTool:
     async def execute(self, content: str, ctx: dict) -> dict:
         from src.tool_execution import agent_cwd, _truncate
+        # A server/event loop in the FOREGROUND python tool never returns and
+        # hangs the whole turn (the bash tool auto-detaches servers; python does
+        # not). Refuse and point the model at the path that works.
+        try:
+            from src import bg_jobs
+            if bg_jobs.looks_long_running_python(content):
+                return {
+                    "error": (
+                        "This looks like a long-lived server, which the python tool runs in "
+                        "the FOREGROUND — it would never return and would hang your whole turn. "
+                        "Start servers with the bash tool and `#!bg` as the first line, which "
+                        "detaches it so your turn continues, e.g.:\n"
+                        "```bash\n#!bg\npython -m http.server 8000 --bind 0.0.0.0\n```\n"
+                        "Then confirm it's up with a quick curl and keep working."
+                    ),
+                    "exit_code": 1,
+                }
+        except Exception:
+            pass
+        _timeout = _python_timeout()
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
         proc = await asyncio.create_subprocess_exec(
@@ -190,11 +219,11 @@ class PythonTool:
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,
-            timeout=DEFAULT_PYTHON_TIMEOUT,
+            timeout=_timeout,
             progress_cb=progress_cb,
         )
         if timed_out:
-            return {"error": f"python: timed out after {DEFAULT_PYTHON_TIMEOUT}s — process killed", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
+            return {"error": f"python: timed out after {_timeout}s — process killed", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
         output = stdout.rstrip()
         err = stderr.rstrip()
         if err:

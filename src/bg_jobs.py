@@ -71,10 +71,10 @@ _LONG_RUNNING_RE = re.compile(
                                          # NAME inside prose (echo "…uvicorn…")
                                          # doesn't match.
     (?:
-        python[0-9.]*\s+(?:-\S+\s+)*-m\s+http\.server |
-        python[0-9.]*\s+(?:-\S+\s+)*-m\s+uvicorn |
+        python[0-9.]*\s+(?:-\S+\s+)*-m\s+(?:http\.server|uvicorn|flask|gunicorn|streamlit|waitress) |
+        python[0-9.]*\s+manage\.py\s+runserver |
         (?:uvicorn|gunicorn|hypercorn|daphne|waitress-serve) |
-        flask\s+run |
+        flask(?:\s+\S+)*\s+run\b |
         (?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|preview) |
         (?:npx\s+)?(?:vite|next|nuxt|serve|http-server|live-server) |
         node\s+\S*server |
@@ -86,6 +86,35 @@ _LONG_RUNNING_RE = re.compile(
     )
     """
 )
+
+# Server/event-loop starts inside PYTHON SOURCE (the ```python``` tool). Only
+# actual start CALLS match (not bare imports) to avoid false-positives on util
+# code that merely mentions these names. Run in the foreground python tool, any
+# of these hangs the whole turn — so the caller refuses and redirects to bash
+# `#!bg`, which detaches.
+_LONG_RUNNING_PY_RE = re.compile(
+    r"""(?xi)
+    \.serve_forever\s*\(
+    | \.run_forever\s*\(
+    | \buvicorn\.run\s*\(
+    | \bapp\.run\s*\(
+    | \b\w+\.run\s*\([^)]*\bport\s*=
+    | \b(?:HTTPServer|ThreadingHTTPServer|TCPServer|ThreadingTCPServer|make_server|run_simple)\s*\(
+    | -m\s+http\.server\b
+    | -m\s+uvicorn\b
+    """
+)
+
+
+def looks_long_running_python(src: str) -> bool:
+    """Heuristic: does this PYTHON SOURCE start a server / event loop that runs
+    until killed (http.server, Flask/FastAPI .run, serve_forever, uvicorn.run,
+    HTTPServer, …)? The ```python``` tool runs in the FOREGROUND with no
+    auto-detach, so such code hangs the whole turn — the caller uses this to
+    refuse and point the model at bash `#!bg` instead."""
+    if not src or not src.strip():
+        return False
+    return bool(_LONG_RUNNING_PY_RE.search(src))
 
 
 def looks_long_running(command: str) -> bool:

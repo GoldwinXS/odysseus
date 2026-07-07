@@ -56,6 +56,42 @@ def test_looks_long_running_rejects_normal_commands(cmd):
     assert bg_jobs.looks_long_running(cmd) is False
 
 
+@pytest.mark.parametrize("cmd", [
+    "flask --app app run",
+    "flask run",
+    "python -m flask run",
+    "python manage.py runserver",
+    "python -m streamlit run x.py",
+    "python -m gunicorn app:app",
+])
+def test_looks_long_running_detects_more_server_launchers(cmd):
+    assert bg_jobs.looks_long_running(cmd) is True
+
+
+# --- server detection in PYTHON SOURCE (the ```python``` tool) ---------------
+
+@pytest.mark.parametrize("src", [
+    "import socketserver\ns=socketserver.TCPServer(('',8000),h)\ns.serve_forever()",
+    "app.run(host='0.0.0.0', port=5000)",
+    "import uvicorn; uvicorn.run(app)",
+    "from http.server import HTTPServer\nHTTPServer(('',8000),H).serve_forever()",
+    "loop.run_forever()",
+])
+def test_looks_long_running_python_detects_servers(src):
+    assert bg_jobs.looks_long_running_python(src) is True
+
+
+@pytest.mark.parametrize("src", [
+    "print(1 + 1)",
+    "def serve_forever(): pass",    # a definition, not a call — must NOT match
+    "x = [i for i in range(10)]",
+    "df.run(mode=1)",               # unrelated .run() without a port
+    "",
+])
+def test_looks_long_running_python_rejects_compute(src):
+    assert bg_jobs.looks_long_running_python(src) is False
+
+
 # --- runaway reaper leaves uncapped servers alone ---------------------------
 
 def _seed_store(tmp_path, monkeypatch, rec):
