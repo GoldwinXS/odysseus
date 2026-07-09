@@ -57,7 +57,11 @@ const _QWEN3_MODEL_PATTERNS = ['qwen3', 'qwen-3'];
 export function effortSupport(modelId, endpointUrl) {
   if (!modelId || !endpointUrl) return true;
   if (_hostMatch(endpointUrl, 'anthropic.com')) {
-    return _modelContains(modelId, ['claude-3-7', 'claude-3.7', 'claude-opus-4', 'claude-sonnet-4', 'claude-haiku-4']);
+    // Any Claude model: the backend threads low/medium/high into
+    // output_config={"effort":...}. The old explicit list predated the
+    // Claude 5 family, so claude-sonnet-5 / claude-fable-5 showed "N/A" —
+    // which read as "the selector is broken" on the models used most.
+    return _modelContains(modelId, ['claude']);
   }
   if (_hostMatch(endpointUrl, 'openai.com')) {
     return _modelStartsWith(modelId, ['gpt-5']) || _modelStartsWith(modelId, ['o1', 'o3', 'o4']);
@@ -71,12 +75,15 @@ export function effortSupport(modelId, endpointUrl) {
   if (_hostMatch(endpointUrl, 'deepseek.com')) {
     return false; // no effort param exists on any DeepSeek chat model
   }
-  // Ollama / self-hosted OpenAI-compat: only the qwen3 "/no_think" switch is
-  // recognized, and only for "off" — but we don't know the SELECTED value
-  // here (this just answers "does this knob do anything for this model at
-  // all"), so qwen3 counts as supported (off works; low/med/high don't, but
-  // that's a finer distinction than the tooltip needs).
-  return _modelContains(modelId, _QWEN3_MODEL_PATTERNS);
+  // Ollama / self-hosted: the backend now maps the selector onto Ollama's
+  // top-level "think" param for every thinking-capable model (off=false,
+  // low/med/high=true; gpt-oss gets the level string), plus the qwen3
+  // "/no_think" soft switch. Mirror llm_core._THINKING_MODEL_PATTERNS.
+  return _modelContains(modelId, _QWEN3_MODEL_PATTERNS.concat([
+    'qwq', 'deepseek-r1', 'deepseek-reasoner', 'minimax', 'm2-reap',
+    'gemma', 'stepfun', 'step-3', 'step3', 'magistral', 'mistral-small',
+    'mistral-medium', 'gpt-oss',
+  ]));
 }
 
 export function getCurrentEffort() {

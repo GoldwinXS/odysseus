@@ -2290,6 +2290,18 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             model, messages_copy, temperature, max_tokens,
             stream=True, tools=tools, num_ctx=get_context_length(url, model),
         )
+        # UI reasoning-effort selector — native Ollama /api/chat accepts a
+        # top-level "think" param (bool; gpt-oss additionally accepts
+        # "low"/"medium"/"high" strings). This branch previously never applied
+        # the selector at all, so it was a silent no-op on every local model
+        # (the user-visible "effort isn't working" bug). Only touched for
+        # thinking-capable models so non-thinking models never see an
+        # unexpected param.
+        if reasoning_effort in ("off", "low", "medium", "high") and _supports_thinking(model):
+            if "gpt-oss" in (model or "").lower() and reasoning_effort != "off":
+                payload["think"] = reasoning_effort
+            else:
+                payload["think"] = reasoning_effort != "off"
     elif provider == "chatgpt-subscription":
         target_url = _normalize_chatgpt_subscription_url(url)
         h = _provider_headers(provider, headers)
@@ -2320,10 +2332,14 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
-        # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
-        # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
+        # gemma4, etc.), suppress thinking BY DEFAULT so tool calls aren't
+        # swallowed inside <think> blocks — but an EXPLICIT low/medium/high on
+        # the UI effort selector overrides the suppression (the user asked for
+        # thinking; the fence parser strips <think> blocks before tool parsing,
+        # so the swallow risk is accepted as their call). Ollama /v1 accepts
+        # "think" as a top-level param.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
-            payload["think"] = False
+            payload["think"] = reasoning_effort in ("low", "medium", "high")
         # UI reasoning-effort selector — OpenAI/Gemini/Z.AI get a payload field;
         # DeepSeek/unrecognized hosts are always a no-op (see docstring). The
         # qwen3 "/no_think" message mutation for this same knob already ran

@@ -129,6 +129,25 @@ async def start_server_resume_turn(
     except Exception:
         _fallbacks = []
 
+    # Session's reasoning-effort pref: a server-fired turn (sub-agent resume /
+    # auto-continue) previously dropped the selector entirely, so a session set
+    # to high effort silently continued at default. Same pref the composer
+    # restores from (/api/session/{id}/prefs).
+    _reasoning_effort = None
+    try:
+        from core.database import SessionLocal as _SL, Session as _DbSess
+        _db = _SL()
+        try:
+            _row = _db.query(_DbSess.prefs).filter(_DbSess.id == session_id).first()
+        finally:
+            _db.close()
+        if _row and isinstance(_row[0], dict):
+            _val = str(_row[0].get("reasoning_effort") or "").strip().lower()
+            if _val and _val != "default":
+                _reasoning_effort = _val
+    except Exception:
+        pass
+
     async def _resume_stream() -> AsyncGenerator[str, None]:
         full_response = ""
         last_metrics = None
@@ -144,6 +163,7 @@ async def start_server_resume_turn(
                 session_id=session_id,
                 owner=owner,
                 fallbacks=_fallbacks,
+                reasoning_effort=_reasoning_effort,
                 # A resume prompt reads as low-signal (no domain keywords), but
                 # it must run the full loop with history so the model reports
                 # the sub-agent's work instead of collapsing to a "Hey." stub.

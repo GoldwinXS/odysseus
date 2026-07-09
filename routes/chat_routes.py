@@ -63,11 +63,11 @@ def _stream_set(session_id: str, **fields) -> None:
     rec.update(fields)
 
 
-def _get_session_workspace_pref(session_id) -> "str | None":
-    """The session's persisted workspace pref, or None when the key was never
-    set. '' means 'explicitly no workspace'. The session — not this device's
-    localStorage — is the source of truth, so the working folder follows the
-    conversation to every device (same authority model as session mode)."""
+def _get_session_pref(session_id, key) -> "str | None":
+    """One value from the session's persisted prefs blob, or None when the key
+    was never set (distinct from set-to-empty). The session — not any single
+    device's local state — is the source of truth for per-conversation prefs
+    (same authority model as session mode)."""
     if not session_id:
         return None
     try:
@@ -77,11 +77,16 @@ def _get_session_workspace_pref(session_id) -> "str | None":
             row = _db.query(_DbSess.prefs).filter(_DbSess.id == session_id).first()
         finally:
             _db.close()
-        if row and isinstance(row[0], dict) and "workspace" in row[0]:
-            return str(row[0]["workspace"] or "")
+        if row and isinstance(row[0], dict) and key in row[0]:
+            return str(row[0][key] or "")
     except Exception:
         pass
     return None
+
+
+def _get_session_workspace_pref(session_id) -> "str | None":
+    """The session's persisted workspace pref ('' = explicitly none)."""
+    return _get_session_pref(session_id, "workspace")
 
 
 def _resolve_request_workspace(request, raw_value, session_id=None) -> tuple:
@@ -531,6 +536,16 @@ def setup_chat_routes(
         # the route just forwards it through; "default"/blank means no override
         # (apply_reasoning_effort in llm_core.py treats both as a no-op).
         reasoning_effort = (form_data.get("reasoning_effort") or (body or {}).get("reasoning_effort") or "").strip().lower() or None
+        if not reasoning_effort:
+            # No value posted. That usually means "default" — but right after a
+            # session switch the composer may simply not have loaded this
+            # session's stored pref yet (async GET), so it silently sends
+            # nothing and the session's explicit low/med/high choice is lost.
+            # Fall back to the persisted per-session pref; a posted value
+            # (the user just clicked the selector) still wins above.
+            _pref_eff = (_get_session_pref(session, "reasoning_effort") or "").lower()
+            if _pref_eff and _pref_eff != "default":
+                reasoning_effort = _pref_eff
         # Issue #3229: API callers send JSON, not FormData.  Read from the
         # JSON body as fallback so callers who send {"allow_bash": true}
         # actually get bash enabled.
