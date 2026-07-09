@@ -1457,7 +1457,9 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
       if (isIncognito) {
         fd.append('incognito', 'true');
       }
-      const _ws = (Storage.KEYS && Storage.get(Storage.KEYS.WORKSPACE, '')) || '';
+      // Session-scoped workspace (the server prefers the session's persisted
+      // pref anyway — this field only seeds sessions that never had one).
+      const _ws = (window.workspaceModule && window.workspaceModule.getWorkspace()) || '';
       if (_ws) {
         fd.append('workspace', _ws);
       }

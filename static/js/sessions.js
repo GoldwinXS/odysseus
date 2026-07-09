@@ -1958,6 +1958,14 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
     // Restore this session's reasoning-effort selection (falls back to the
     // global default when the session has no stored override).
     try { _notifyReasoningEffortSessionChanged(id); } catch (e) {}
+    // Restore this session's workspace pill — the working folder is a session
+    // property (prefs.workspace), the same on every device.
+    try {
+      import('./workspace.js').then((m) => {
+        const f = (m.default && m.default.notifySessionChanged) || m.notifySessionChanged;
+        if (f) f(id);
+      });
+    } catch (e) {}
     const meta = sessions.find(s => s.id === id);
 
     // Mode is a SESSION property, authoritative across devices — sync the
@@ -2321,6 +2329,13 @@ export function createDirectChat(url, modelId, endpointId) {
   // New chat has no stored reasoning-effort override yet — reset the
   // composer selector to the global default (per spec: new chats start there).
   try { _notifyReasoningEffortSessionChanged(null); } catch (e) {}
+  // New chat starts with no workspace (it gets one when the user picks it).
+  try {
+    import('./workspace.js').then((m) => {
+      const f = (m.default && m.default.notifySessionChanged) || m.notifySessionChanged;
+      if (f) f(null);
+    });
+  } catch (e) {}
   Storage.remove('lastSessionId');
   history.replaceState(null, '', window.location.pathname);
   document.querySelectorAll('.list-item.active-session, .session-item.active').forEach(el => {

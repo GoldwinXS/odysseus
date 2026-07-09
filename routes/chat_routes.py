@@ -63,8 +63,33 @@ def _stream_set(session_id: str, **fields) -> None:
     rec.update(fields)
 
 
-def _resolve_request_workspace(request, raw_value) -> tuple:
-    """Resolve the posted workspace for this request: (workspace, rejected).
+def _get_session_workspace_pref(session_id) -> "str | None":
+    """The session's persisted workspace pref, or None when the key was never
+    set. '' means 'explicitly no workspace'. The session — not this device's
+    localStorage — is the source of truth, so the working folder follows the
+    conversation to every device (same authority model as session mode)."""
+    if not session_id:
+        return None
+    try:
+        from core.database import SessionLocal as _SL, Session as _DbSess
+        _db = _SL()
+        try:
+            row = _db.query(_DbSess.prefs).filter(_DbSess.id == session_id).first()
+        finally:
+            _db.close()
+        if row and isinstance(row[0], dict) and "workspace" in row[0]:
+            return str(row[0]["workspace"] or "")
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_request_workspace(request, raw_value, session_id=None) -> tuple:
+    """Resolve the workspace for this request: (workspace, rejected).
+
+    The session's persisted workspace pref (set via /api/session/{id}/prefs)
+    is AUTHORITATIVE when present — the posted field only applies for sessions
+    that never had the pref set (legacy clients / brand-new sessions).
 
     Privilege is checked BEFORE the path ever touches the filesystem. Only
     admin/single-user callers can use the workspace-backed file/shell tools,
@@ -80,6 +105,9 @@ def _resolve_request_workspace(request, raw_value) -> tuple:
     that it was dropped.
     """
     requested = (raw_value or "").strip()
+    _pref = _get_session_workspace_pref(session_id)
+    if _pref is not None:
+        requested = _pref.strip()
     if not requested:
         return "", ""
     from src.tool_security import owner_is_admin_or_single_user
@@ -527,9 +555,11 @@ def setup_chat_routes(
         # may promote to 'agent' for THIS TURN ONLY (that promotion must not flip
         # the session's stored mode).
         _session_base_mode = chat_mode
-        # Workspace: confine the agent's file/shell tools to this folder.
+        # Workspace: confine the agent's file/shell tools to this folder. The
+        # SESSION's persisted pref wins over the posted field, so the working
+        # folder is the same for a conversation on every device.
         workspace, workspace_rejected = _resolve_request_workspace(
-            request, form_data.get("workspace")
+            request, form_data.get("workspace"), session_id=session
         )
         # Plan mode is a modifier on agent mode — it only makes sense with tools.
         if plan_mode:

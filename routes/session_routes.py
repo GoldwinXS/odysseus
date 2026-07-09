@@ -917,7 +917,10 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
     # `reasoning_effort` uses this; kept generic (whitelisted keys, merged with
     # any existing prefs rather than replacing the whole blob) so a future
     # per-session UI toggle doesn't need its own endpoint or DB column.
-    _SESSION_PREF_KEYS = {"reasoning_effort"}
+    # `workspace` makes the working folder a SESSION property (authoritative
+    # across devices — chat_routes prefers it over the posted per-turn field).
+    # '' = explicitly no workspace; a non-empty path is vetted server-side.
+    _SESSION_PREF_KEYS = {"reasoning_effort", "workspace"}
     _REASONING_EFFORT_VALUES = {"default", "off", "low", "medium", "high"}
 
     @router.get("/session/{session_id}/prefs")
@@ -950,6 +953,19 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             if val not in _REASONING_EFFORT_VALUES:
                 raise HTTPException(400, f"Invalid reasoning_effort value: {val!r}")
             updates["reasoning_effort"] = val
+        if "workspace" in updates:
+            raw_ws = str(updates["workspace"] or "").strip()
+            if raw_ws:
+                # Same vetting as the per-turn path (non-directories, sensitive
+                # roots, filesystem roots) so a bad path can't be persisted and
+                # silently refused on every later send.
+                from src.tool_execution import vet_workspace
+                vetted = vet_workspace(raw_ws)
+                if not vetted:
+                    raise HTTPException(400, f"Workspace path not usable: {raw_ws!r}")
+                updates["workspace"] = vetted
+            else:
+                updates["workspace"] = ""   # explicit 'no workspace'
         if not updates:
             raise HTTPException(400, "No recognized pref keys in body")
 

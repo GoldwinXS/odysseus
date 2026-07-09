@@ -4,6 +4,12 @@
 // folder, and show it as a removable pill in the chat input bar. While set, the
 // chat request sends `workspace` so the agent's file/shell tools are confined
 // to that folder (see routes/chat_routes.py + src/tool_execution.py).
+//
+// The workspace is a SESSION property (prefs.workspace via
+// /api/session/{id}/prefs), authoritative across devices — the same
+// conversation always runs in the same folder no matter where you open it.
+// The old localStorage value was per-device and is used only as a one-time
+// legacy fallback for sessions that never had the pref persisted.
 
 import Storage, { KEYS } from './storage.js';
 import uiModule from './ui.js';
@@ -14,9 +20,67 @@ const API_BASE = window.location.origin;
 const _FOLDER_SVG = '<svg class="workspace-row-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
 let _modal = null;
 let _curPath = '';
+// Current session's workspace (module state, session-scoped — NOT this
+// device's localStorage). Loaded by notifySessionChanged on session switch.
+let _current = '';
+// Session id the last prefs load was for — a slow GET landing after the user
+// switched sessions again must not clobber the newer session's value.
+let _loadedForSession = null;
+
+function _currentSessionId() {
+  const sm = window.sessionModule;
+  return (sm && sm.getCurrentSessionId && sm.getCurrentSessionId()) || null;
+}
 
 export function getWorkspace() {
-  return Storage.get(KEYS.WORKSPACE, '') || '';
+  return _current || '';
+}
+
+/**
+ * Reload the workspace pill for a (possibly new) session — the session's
+ * persisted prefs.workspace is the source of truth. Called on session switch
+ * and new chat (mirrors reasoningEffort.notifySessionChanged).
+ */
+export async function notifySessionChanged(sessionId) {
+  const token = sessionId || null;
+  _loadedForSession = token;
+  let ws = '';
+  if (sessionId) {
+    try {
+      const res = await fetch(`${API_BASE}/api/session/${sessionId}/prefs`, { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        const prefs = (data && data.prefs) || {};
+        if (Object.prototype.hasOwnProperty.call(prefs, 'workspace')) {
+          ws = prefs.workspace || '';
+        } else {
+          // Legacy session with no persisted pref: seed ONCE from this
+          // device's old global localStorage value, persisting it so every
+          // other device converges on the same folder from now on.
+          const legacy = Storage.get(KEYS.WORKSPACE, '') || '';
+          if (legacy) {
+            ws = legacy;
+            _persistWorkspace(sessionId, legacy);
+          }
+        }
+      }
+      if (_loadedForSession !== token) return;  // user already moved on
+    } catch (_) { /* keep '' — no confinement indicator */ }
+  }
+  _current = ws;
+  syncWorkspaceIndicator(_current);
+}
+
+async function _persistWorkspace(sessionId, path) {
+  if (!sessionId) return; // pending chat — value applies in memory only
+  try {
+    await fetch(`${API_BASE}/api/session/${sessionId}/prefs`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace: path || '' }),
+    });
+  } catch (_) { /* best-effort — the in-memory value still applies here */ }
 }
 
 function _basename(p) {
@@ -58,9 +122,16 @@ export function applyMode(_mode) {
 }
 
 export function setWorkspace(path) {
+  _current = path || '';
+  // Persist on the SESSION so other devices see the same folder. '' persists
+  // too — an explicit "no workspace" must also sync (and must override any
+  // legacy localStorage seed on the next load).
+  _persistWorkspace(_currentSessionId(), _current);
+  // Keep the legacy device-local key roughly in step so a downgrade/old tab
+  // doesn't resurrect a stale folder.
   if (path) Storage.set(KEYS.WORKSPACE, path);
   else Storage.remove(KEYS.WORKSPACE);
-  syncWorkspaceIndicator(path || '');
+  syncWorkspaceIndicator(_current);
 }
 
 /**
@@ -197,7 +268,8 @@ export function closeWorkspaceBrowser() {
 }
 
 export function initWorkspace() {
-  // Restore persisted workspace into the pill on load.
+  // Pill starts empty; notifySessionChanged fills it when a session loads
+  // (the session pref — not this device's storage — is the source of truth).
   syncWorkspaceIndicator(getWorkspace());
   const overflow = document.getElementById('overflow-workspace-btn');
   if (overflow) overflow.addEventListener('click', openWorkspaceBrowser);
@@ -205,4 +277,8 @@ export function initWorkspace() {
   if (pill) pill.addEventListener('click', clearWorkspace);
 }
 
-export default { initWorkspace, openWorkspaceBrowser, getWorkspace, setWorkspace, vetAndSetWorkspace, clearWorkspace, syncWorkspaceIndicator, applyMode };
+const workspaceModule = { initWorkspace, openWorkspaceBrowser, getWorkspace, setWorkspace, vetAndSetWorkspace, clearWorkspace, syncWorkspaceIndicator, applyMode, notifySessionChanged };
+// Global handle for modules that can't import statically without cycles
+// (chat.js's send path reads the current workspace synchronously).
+window.workspaceModule = workspaceModule;
+export default workspaceModule;
