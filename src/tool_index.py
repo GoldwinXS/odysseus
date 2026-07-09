@@ -60,6 +60,20 @@ ALWAYS_AVAILABLE = frozenset({
     # capability it needs that wasn't RAG-selected, so it must be reachable
     # every turn regardless of topic.
     "search_tools",
+    # Escalation to a stronger model. This is the ONE capability a weak/local
+    # model needs most and can least discover on its own — a 9B that's stuck
+    # can't be relied on to find its own lifeline. RAG never surfaced these for
+    # natural phrasings ("ask a teacher model", "ask a smarter model for
+    # guidance"), so a user asking for help four times still never got the tool
+    # (audit of session 152d3560). Keep both the teacher shortcut and the
+    # general model-to-model call always reachable so escalation always lands.
+    "ask_teacher",
+    "chat_with_model",
+    # Skill discovery/use. Banked skills (incl. teacher-escalation skills) are
+    # only useful if the model can list and read them without the user pointing
+    # the way; keep manage_skills reachable so the agent can pull the relevant
+    # procedure on its own.
+    "manage_skills",
 })
 
 # Tools that the Personal Assistant always has access to during scheduled
