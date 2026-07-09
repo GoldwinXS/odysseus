@@ -17,9 +17,102 @@ close / navigation / refresh). It does NOT survive a server restart.
 import asyncio
 import json
 import logging
+import os
+import time
 from typing import AsyncGenerator, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ── Restart-interruption journal ─────────────────────────────────────────
+# The run registry is in-memory by design, so a server restart used to kill
+# every in-flight turn SILENTLY — the top failure category in the 2026-07-09
+# stall audit (91 'stopped' turns; users typed "hello?" at dead sessions).
+# Minimal durability, stirrup-style: a tiny JSON journal of live runs written
+# atomically (temp+rename) on every start/finish. On boot, leftovers are turns
+# the dying process never finished; sweep_interrupted_runs() posts a PLAIN,
+# VISIBLE note into each affected session so the user knows what happened and
+# can say "continue" — silence was the bug, not the restart itself.
+
+def _inflight_path() -> str:
+    from core.constants import DATA_DIR
+    return os.path.join(DATA_DIR, "inflight_runs.json")
+
+
+def _inflight_load() -> dict:
+    try:
+        with open(_inflight_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("[agent-run] inflight journal unreadable (%s) — starting fresh", e)
+        return {}
+
+
+def _inflight_write(data: dict) -> None:
+    path = _inflight_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.debug("[agent-run] inflight journal write skipped: %s", e)
+
+
+def _inflight_add(session_id: str) -> None:
+    data = _inflight_load()
+    data[session_id] = {"started": time.time()}
+    _inflight_write(data)
+
+
+def _inflight_remove(session_id: str) -> None:
+    data = _inflight_load()
+    if session_id in data:
+        data.pop(session_id, None)
+        _inflight_write(data)
+
+
+def sweep_interrupted_runs() -> int:
+    """Called once at startup: turn journal leftovers into visible in-chat
+    notes ("interrupted by a server restart"), then clear the journal.
+    Returns the number of sessions marked."""
+    data = _inflight_load()
+    if not data:
+        return 0
+    marked = 0
+    try:
+        from core.models import ChatMessage, get_session_manager
+        sm = get_session_manager()
+    except Exception as e:
+        logger.warning("[agent-run] restart sweep: no session manager (%s)", e)
+        sm = None
+    if sm is not None:
+        for session_id, rec in data.items():
+            try:
+                sess = sm.get_session(session_id)
+                if sess is None:
+                    continue
+                sess.add_message(ChatMessage(
+                    "assistant",
+                    "This turn was interrupted by a server restart before it "
+                    "finished — the work above may be incomplete. Say \"continue\" "
+                    "to pick up where it left off.",
+                    metadata={"stopped": True, "interrupted_by_restart": True},
+                ))
+                marked += 1
+            except Exception as e:
+                logger.warning("[agent-run] restart sweep failed for %s: %s", session_id, e)
+        try:
+            sm.save_sessions()
+        except Exception:
+            pass
+    _inflight_write({})
+    if marked:
+        logger.warning("[agent-run] restart sweep: marked %d interrupted turn(s)", marked)
+    return marked
 
 
 class _Run:
@@ -241,6 +334,13 @@ async def _drain(session_id: str, agen: AsyncGenerator[str, None],
                 q.put_nowait((None, None))
             except Exception:
                 pass
+        # The turn ended through a NORMAL path (done/stopped/error — all of
+        # which saved or surfaced something) — clear its restart-journal entry
+        # so only process-death leftovers ever reach the startup sweep. Identity
+        # check: when this run was SUPERSEDED, _RUNS already holds the new run
+        # (whose journal entry must survive this old run's teardown).
+        if _RUNS.get(session_id) is run:
+            _inflight_remove(session_id)
         # Run is terminal — arm the grace timer so it (and its buffer) is
         # eventually freed even if nobody ever reconnects. subscribe() cancels
         # this on connect and re-arms on disconnect.
@@ -270,6 +370,7 @@ def start(session_id: str, agen: AsyncGenerator[str, None]) -> _Run:
             prev.evict_task.cancel()
     run = _Run()
     _RUNS[session_id] = run
+    _inflight_add(session_id)
     run.task = asyncio.create_task(_drain(session_id, agen, prev_task))
     return run
 
