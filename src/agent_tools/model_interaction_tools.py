@@ -426,7 +426,11 @@ async def spawn_agent(
 
     task = (content or "").strip()
     if not task:
-        return {"error": "No task provided for the sub-agent"}
+        return {"error": (
+            "No task provided for the sub-agent — the dispatch did NOT happen. "
+            "Re-issue the spawn_agent call with the full, self-contained task "
+            "text in its body (it cannot be empty or whitespace)."
+        )}
 
     # Optional leading directives, parsed off the first line(s) the same way:
     #   model: <name>        — override the model (defaults to this chat's model)

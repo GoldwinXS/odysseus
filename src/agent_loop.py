@@ -3412,6 +3412,10 @@ async def stream_agent_loop(
     # calling (some models — e.g. Gemini — otherwise spawn and then keep working
     # for the full round cap, so the user never gets their turn back).
     _spawned_background = False
+    # Errors from spawn_agent dispatches that FAILED (e.g. empty task). When a
+    # sibling dispatch succeeded the turn force-ends and the model never sees
+    # the error result, so these are surfaced in the end-of-turn confirmation.
+    _spawn_failures: list = []
 
     # Set when the loop runs out of rounds while the agent was still actively
     # using tools — i.e. it was cut off, not finished. Drives a "Continue" event
@@ -4868,6 +4872,15 @@ async def stream_agent_loop(
                 _effectful_used = True
             if block.tool_type == "spawn_agent" and result.get("background"):
                 _spawned_background = True
+            elif block.tool_type == "spawn_agent" and result.get("error"):
+                # A dispatch in this round FAILED (e.g. empty task text). If a
+                # sibling dispatch succeeded, the turn force-ends below and the
+                # model never sees this error — surface it in the end-of-turn
+                # confirmation so neither the user nor the model is left
+                # believing all agents are running (session b01a3f6b: third
+                # dispatch went out with no task and vanished into a one-line
+                # tool error the user had to decode).
+                _spawn_failures.append(str(result.get("error")))
 
             formatted = format_tool_result(desc, result)
             tool_results.append(formatted)
@@ -4910,6 +4923,13 @@ async def stream_agent_loop(
                 _confirm = "The background sub-agent is dispatched and running — its result will arrive here as a separate message when it finishes."
             else:
                 _confirm = "\n\n_Background sub-agent dispatched — its result will arrive here as a separate message when it finishes._"
+            if _spawn_failures:
+                _n_failed = len(_spawn_failures)
+                _confirm += (
+                    f"\n\n_Note: {_n_failed} sub-agent dispatch{'es' if _n_failed > 1 else ''} in this "
+                    f"round FAILED and {'are' if _n_failed > 1 else 'is'} NOT running "
+                    f"({'; '.join(_spawn_failures[:3])}). Ask me to re-dispatch if that work is still needed._"
+                )
             full_response += _confirm
             yield 'data: ' + json.dumps({"delta": _confirm}) + '\n\n'
             logger.info("[agent] background sub-agent dispatched — ending turn so the user regains control")
