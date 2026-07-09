@@ -25,16 +25,22 @@ def windows_bash_exe() -> Optional[str]:
         return None
     if _WIN_BASH_CACHE is not None:
         return _WIN_BASH_CACHE or None
-    import shutil
-    cand = shutil.which("bash")
-    if cand and "windowsapps" in cand.lower():
-        cand = None
+    # ONLY trust a bash that is part of a Git installation. Both
+    # System32\bash.exe and the WindowsApps shim are WSL relays that die with
+    # "execvpe(/bin/bash) failed" when no distro is set up (observed live) —
+    # a PATH hit is only acceptable when it points inside a Git dir.
+    cand = None
+    for p in (r"C:\Program Files\Git\bin\bash.exe",
+              r"C:\Program Files (x86)\Git\bin\bash.exe",
+              os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe")):
+        if os.path.exists(p):
+            cand = p
+            break
     if not cand:
-        for p in (r"C:\Program Files\Git\bin\bash.exe",
-                  r"C:\Program Files (x86)\Git\bin\bash.exe"):
-            if os.path.exists(p):
-                cand = p
-                break
+        import shutil
+        w = shutil.which("bash")
+        if w and "\\git\\" in w.lower():
+            cand = w
     _WIN_BASH_CACHE = cand or ""
     return cand or None
 
