@@ -24,10 +24,17 @@ def _clean_counters():
     subagent_runs._resume_running.clear()
 
 
+def _effective_cap() -> int:
+    """The live cap: settings-driven (agent_auto_continue_max), constant fallback."""
+    return subagent_runs._setting_int(
+        "agent_auto_continue_max", subagent_runs._MAX_AUTO_CONTINUES, 0, 50
+    )
+
+
 def test_auto_continue_cap_and_reset():
     sid = "sess-cap"
     assert subagent_runs.can_auto_continue(sid)
-    for _ in range(subagent_runs._MAX_AUTO_CONTINUES):
+    for _ in range(_effective_cap()):
         assert subagent_runs.can_auto_continue(sid)
         subagent_runs.note_auto_continue(sid)
     # Cap consumed.
@@ -74,7 +81,7 @@ def test_schedule_consumes_budget_and_fires_resume(monkeypatch):
 
 def test_schedule_noop_when_cap_reached(monkeypatch):
     sid = "sess-capped"
-    for _ in range(subagent_runs._MAX_AUTO_CONTINUES):
+    for _ in range(_effective_cap()):
         subagent_runs.note_auto_continue(sid)
 
     fired = []
@@ -90,4 +97,4 @@ def test_schedule_noop_when_cap_reached(monkeypatch):
 
     asyncio.run(_run())
     assert not fired
-    assert subagent_runs._auto_continue_count.get(sid) == subagent_runs._MAX_AUTO_CONTINUES
+    assert subagent_runs._auto_continue_count.get(sid) == _effective_cap()

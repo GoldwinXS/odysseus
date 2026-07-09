@@ -322,8 +322,20 @@ class ChatHandler:
             session.name = "Chat: " + derived if derived else "Chat"
 
     def trim_history_if_needed(self, session):
-        if len(session.history) > MAX_CONTEXT_MESSAGES:
-            session.history = session.history[-MAX_CONTEXT_MESSAGES:]
+        # Flat message-count cap on the in-memory working history. Was a silent
+        # hardcoded 90 — an agentic session full of short tool-result messages
+        # lost real context long before any token budget was near (the
+        # token-based trim in agent_loop/context_compactor is the real guard).
+        # Tunable via max_context_messages; clamped so a typo can't unbound it.
+        cap = MAX_CONTEXT_MESSAGES
+        try:
+            from src.settings import get_setting
+            cap = max(20, min(int(get_setting("max_context_messages", MAX_CONTEXT_MESSAGES)
+                                  or MAX_CONTEXT_MESSAGES), 2000))
+        except Exception:
+            pass
+        if len(session.history) > cap:
+            session.history = session.history[-cap:]
 
     async def handle_memory_command(self, session, message: str) -> Optional[str]:
         """Process inline memory commands. Returns response string or None."""

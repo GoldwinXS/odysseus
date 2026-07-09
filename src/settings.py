@@ -124,8 +124,34 @@ DEFAULT_SETTINGS = {
     # Tune via Settings or by editing data/settings.json.
     "research_run_timeout_seconds": 1800,
     "agent_max_tool_calls": 0,
-    "agent_max_rounds": 20,  # per-message agent step cap (clamped 1..200)
-    "subagent_max_rounds": 12,  # tool-loop rounds per background sub-agent
+    # Round caps are RUNAWAY BACKSTOPS, not working ceilings (user's standing
+    # rule). These defaults had drifted 10x below the hardcoded constants
+    # (20 vs MAX_AGENT_ROUNDS=200, 12 vs _SUBAGENT_MAX_ROUNDS=100) — a fresh
+    # install or settings reset silently regressed to limits that cut off
+    # legitimate work. Progress-based loop-breakers in agent_loop.py are what
+    # actually stop stuck runs; the caps just bound true runaways.
+    "agent_max_rounds": 200,  # per-message agent step cap (clamped 1..200)
+    "subagent_max_rounds": 100,  # tool-loop rounds per background sub-agent
+    # Consecutive server-fired auto-continues after a round-cap hit before the
+    # manual Continue button is the only path. Resets on real user activity.
+    "agent_auto_continue_max": 5,
+    # Sub-agent pool shape. per_owner is the practical "how many can I have
+    # running" number on a single-user box; total is the global runaway/RAM
+    # backstop; concurrent is how many EXECUTE at once (the rest queue).
+    # Local GPU models serialize on the GPU anyway — these mostly matter for
+    # API-backed sub-agents.
+    "subagent_max_per_owner": 8,
+    "subagent_max_total": 16,
+    "subagent_max_concurrent": 6,
+    # Consecutive BYTE-IDENTICAL tool calls inside a sub-agent before it is
+    # stopped as looping. 3 was the harshest detector in the codebase and
+    # killed legitimate poll/retry patterns (curl a health endpoint while a
+    # server warms up).
+    "subagent_loop_repeats": 6,
+    # Flat message-count cap on the in-memory session history (the token-based
+    # trim is the real context guard). Was a silent hardcoded 90, which starved
+    # agentic sessions full of short tool-result messages.
+    "max_context_messages": 400,
     # Soft input-token budget for the agent loop. The DEFAULT value (6000) is the
     # "auto" sentinel: it means "scale the budget to the model's context window"
     # (#1230) — so long-context models aren't capped at 6000. Set ANY OTHER value
@@ -144,13 +170,12 @@ DEFAULT_SETTINGS = {
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
     # Anthropic prompt-cache TTL for the tools+system+history prefix. Only "5m" and
-    # "1h" are valid (Anthropic offers no other values). Retaining a cache costs
-    # nothing — the sole price difference is the WRITE: "1h" = 2x input rate, "5m" =
-    # 1.25x. "1h" is cheaper for bursty/human chat (gaps >5 min re-READ the prefix at
-    # 0.1x instead of re-WRITING it every turn); "5m" is marginally cheaper only when
-    # every turn lands within 5 min. Agents running long within ONE turn are covered
-    # by either (internal calls are seconds apart). See llm_core._resolve_cache_ctrl.
-    "anthropic_cache_ttl": "1h",
+    # "1h" are valid (Anthropic offers no other values — no 10m). The sole price
+    # difference is the WRITE: "1h" = 2x input rate, "5m" = 1.25x; reads are 0.1x
+    # either way. "1h" pays off only when turns routinely land 5-60 min apart;
+    # within-5-min chat and long single agentic turns are fully covered by "5m".
+    # User preference (2026-07-09): default "5m". See llm_core._resolve_cache_ctrl.
+    "anthropic_cache_ttl": "5m",
     "agent_stream_timeout_seconds": 300,
     # Wall-clock cap for ONE MCP tool call (browser, memory, rag, email, ...).
     # MCP calls previously had no timeout at any layer, so a hung browser click

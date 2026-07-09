@@ -31,16 +31,37 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Hard ceiling on sub-agents tracked/running at once across ALL sessions. This is
-# the runaway backstop — the per-spawn Semaphore(3) bounds *concurrent* execution,
+# the runaway backstop — the execution semaphore bounds *concurrent* execution,
 # this bounds the total that can be outstanding (running OR queued on the
 # semaphore) so a misbehaving agent can't pile up work without limit.
-_MAX_TOTAL = 6
+# Both caps are settings-tunable (subagent_max_total / subagent_max_per_owner);
+# the constants are fallbacks. They were hardcoded at 6/3 — the literal source
+# of the user's "only 3 sub-agents" ceiling on a single-user box.
+_MAX_TOTAL = 16
 
 # Per-owner fairness cap: one owner may hold at most this many outstanding
 # sub-agents at once, so a single busy user can't consume the whole global pool
-# (and the shared Semaphore(3)) and starve everyone else. The global _MAX_TOTAL
-# above is still the hard backstop on top of this.
-_MAX_PER_OWNER = 3
+# and starve everyone else. The global _MAX_TOTAL above is still the hard
+# backstop on top of this.
+_MAX_PER_OWNER = 8
+
+
+def _setting_int(key: str, fallback: int, lo: int = 1, hi: int = 200) -> int:
+    """Settings-tunable integer with a clamped range and a constant fallback."""
+    try:
+        from src.settings import get_setting
+        v = int(get_setting(key, fallback) or fallback)
+        return max(lo, min(v, hi))
+    except Exception:
+        return fallback
+
+
+def max_total() -> int:
+    return _setting_int("subagent_max_total", _MAX_TOTAL, 1, 64)
+
+
+def max_per_owner() -> int:
+    return _setting_int("subagent_max_per_owner", _MAX_PER_OWNER, 1, 64)
 
 # How long a finished record (done/error) is retained so a poller that connects
 # late — page reload mid-run, a second browser — still sees the completion once.
@@ -217,7 +238,8 @@ def can_auto_continue(session_id: str) -> bool:
     """Whether a server-side round-cap auto-continue may fire for this session."""
     if session_id in _resume_running:
         return False
-    return _auto_continue_count.get(session_id, 0) < _MAX_AUTO_CONTINUES
+    _cap = _setting_int("agent_auto_continue_max", _MAX_AUTO_CONTINUES, 0, 50)
+    return _auto_continue_count.get(session_id, 0) < _cap
 
 
 def note_auto_continue(session_id: str) -> None:
@@ -246,11 +268,11 @@ def _owner_outstanding(owner: Optional[str]) -> int:
 def can_start(owner: Optional[str] = None) -> bool:
     """Whether another sub-agent may be started without breaching the caps.
 
-    Enforces both the global runaway backstop (_MAX_TOTAL) and per-owner fairness
-    (_MAX_PER_OWNER) so one owner can't monopolise the shared pool."""
-    if len(_TASKS) >= _MAX_TOTAL:
+    Enforces both the global runaway backstop (max_total) and per-owner fairness
+    (max_per_owner) so one owner can't monopolise the shared pool."""
+    if len(_TASKS) >= max_total():
         return False
-    return _owner_outstanding(owner) < _MAX_PER_OWNER
+    return _owner_outstanding(owner) < max_per_owner()
 
 
 def active_count() -> int:

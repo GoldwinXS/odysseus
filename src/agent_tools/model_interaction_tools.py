@@ -118,7 +118,24 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
 # incident): a sub-agent is a LEAF worker. It cannot spawn or orchestrate
 # further (depth is capped at exactly 1 — no fork bombs), concurrency is
 # bounded, each run is round- and time-limited.
-_SUBAGENT_SEMAPHORE = asyncio.Semaphore(3)   # max concurrent sub-agents
+# Max concurrently-EXECUTING sub-agents (excess spawns queue, they don't fail).
+# Sized once, lazily, from the subagent_max_concurrent setting (default 6;
+# restart to apply a change) — was a hardcoded Semaphore(3), which silently
+# serialized a 4th+ worker even when the ownership caps allowed it.
+_SUBAGENT_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _subagent_semaphore() -> asyncio.Semaphore:
+    global _SUBAGENT_SEMAPHORE
+    if _SUBAGENT_SEMAPHORE is None:
+        n = 6
+        try:
+            from src.settings import get_setting
+            n = max(1, min(int(get_setting("subagent_max_concurrent", 6) or 6), 32))
+        except Exception:
+            pass
+        _SUBAGENT_SEMAPHORE = asyncio.Semaphore(n)
+    return _SUBAGENT_SEMAPHORE
 _SUBAGENT_MAX_ROUNDS = 100                    # RUNAWAY BACKSTOP, not a working ceiling
                                               # — a sub-agent making genuine progress
                                               # must never be killed just for taking
@@ -148,9 +165,22 @@ _SUBAGENT_STALL_S = 180                       # PRIMARY guard: kill a sub-agent 
                                               # not slow-but-live work. A live worker streams
                                               # progress well inside this window. Tunable via
                                               # subagent_stall_timeout_seconds.
-_SUBAGENT_LOOP_REPEATS = 3                    # kill if the SAME tool call (name+args)
+_SUBAGENT_LOOP_REPEATS = 6                    # kill if the SAME tool call (name+args)
                                               # repeats this many times consecutively —
                                               # a stuck loop burning rounds/time.
+                                              # Raised from 3 (which killed legitimate
+                                              # poll/retry patterns, e.g. curl-ing a
+                                              # health endpoint while a server warms
+                                              # up); tunable via subagent_loop_repeats.
+
+
+def _subagent_loop_repeats() -> int:
+    try:
+        from src.settings import get_setting
+        return max(2, min(int(get_setting("subagent_loop_repeats", _SUBAGENT_LOOP_REPEATS)
+                               or _SUBAGENT_LOOP_REPEATS), 50))
+    except Exception:
+        return _SUBAGENT_LOOP_REPEATS
 
 def _subagent_timeout() -> int:
     """Live wall-clock SAFETY BACKSTOP, in seconds. Tunable via
@@ -405,10 +435,12 @@ async def spawn_agent(
     its final result is posted into this session as a new message on completion
     (or an error/timeout notice if it fails). Do not wait for or poll it.
 
-    Content: the task/instructions for the sub-agent. Optional first line(s)
-    ``model: <name>`` overrides the model (defaults to this chat's model) and
+    Content: the task/instructions for the sub-agent. Optional first line(s):
+    ``model: <name>`` overrides the model (defaults to this chat's model);
     ``timeout: <seconds>`` overrides the wall-clock backstop (clamped 60..21600;
-    stall detection still guards the run regardless).
+    stall detection still guards the run regardless);
+    ``rounds: <n>`` overrides the tool-loop round budget for this spawn
+    (clamped 1..400) — use it when a task genuinely needs a long run.
 
     Use for a self-contained unit of work you want done and reported back —
     e.g. "read js/render/models.js, screenshot localhost:1338, and list what
@@ -439,6 +471,7 @@ async def spawn_agent(
     # from the front, so the task text starts at the first non-directive line.
     model_spec = None
     timeout_override: Optional[int] = None
+    rounds_override: Optional[int] = None
     while True:
         low = task.lower()
         if low.startswith("model:"):
@@ -447,6 +480,20 @@ async def spawn_agent(
             task = rest.strip()
             if not task:
                 return {"error": "Sub-agent task was empty after the model: line"}
+        elif low.startswith(("rounds:", "max_rounds:")):
+            # Per-spawn round budget. The system prompt has ALWAYS told the
+            # parent it can "re-dispatch with an explicitly higher max_rounds"
+            # — but no such directive was ever parsed (only model:/timeout:),
+            # so the promise was a lie. Clamped 1..400; junk ignored.
+            first, _, rest = task.partition("\n")
+            _raw_r = first.split(":", 1)[1].strip()
+            try:
+                rounds_override = max(1, min(400, int(_raw_r)))
+            except ValueError:
+                rounds_override = None
+            task = rest.strip()
+            if not task:
+                return {"error": "Sub-agent task was empty after the rounds: line"}
         elif low.startswith("timeout:"):
             first, _, rest = task.partition("\n")
             _raw = first.split(":", 1)[1].strip()
@@ -513,6 +560,8 @@ async def spawn_agent(
     _url, _model, _headers, _owner, _task = url, model, headers, owner, task
     _parent_session = session_id
     _timeout_override = timeout_override   # per-spawn wall-clock cap, or None
+    # Per-spawn round budget: `rounds:` directive wins, else the setting.
+    _rounds_cap = rounds_override if rounds_override else _subagent_max_rounds()
     _summary = _task.splitlines()[0][:120] if _task else ""
 
     # Fallback chain if the primary sub-agent model fails (rate-limit / spend
@@ -860,7 +909,7 @@ async def spawn_agent(
                                                          # the parent turn's disabled policy
                 relevant_tools=set(_sub_tools),          # coding baseline force-included
                 workspace=_workspace,                    # inherit parent's project folder
-                max_rounds=_subagent_max_rounds(),
+                max_rounds=_rounds_cap,
                 max_tokens=_max_tokens,                  # the default 4096 truncated long
                                                          # final summaries mid-word; clamped
                                                          # above to the model's real ceiling
@@ -898,7 +947,7 @@ async def spawn_agent(
                         # Conservative loop guard: only EXACT consecutive repeats
                         # of the same tool+args. Raise a distinct error so the
                         # watchdog can kill with a "stuck in a loop" reason.
-                        if wd["loop_count"] >= _SUBAGENT_LOOP_REPEATS:
+                        if wd["loop_count"] >= _subagent_loop_repeats():
                             raise _SubagentLoopError(wd["loop_tool"] or "a tool", wd["loop_count"])
                     elif _t == "rounds_exhausted":
                         stats["hit_cap"] = True
@@ -943,7 +992,7 @@ async def spawn_agent(
         from src.agent_tools import subprocess_tools as _subproc
         _bash_tok = _subproc.set_subagent_bash_timeout(_subagent_bash_cap(_stall_s))
         try:
-            async with _SUBAGENT_SEMAPHORE:
+            async with _subagent_semaphore():
                 # Watchdog: run the drain as a task and poll it. Kill (cancel) it on
                 # (a) SILENCE for _stall_s — the primary guard: a hung/blocking
                 # command; or (b) total runtime past the wall-clock BACKSTOP (unless
@@ -1111,7 +1160,7 @@ async def spawn_agent(
                 result = _summary
             else:
                 _hdr = (
-                    f"(Hit the {_subagent_max_rounds()}-round limit; {stats['tools']} tool "
+                    f"(Hit the {_rounds_cap}-round limit; {stats['tools']} tool "
                     f"call(s) ran"
                     + (f", last: {stats['last_tool']}" if stats["last_tool"] else "")
                     + ". Work happened but the summary was cut off mid-write.)\n\n"
@@ -1131,7 +1180,8 @@ async def spawn_agent(
             elif stats["hit_cap"]:
                 result = (
                     f"(The sub-agent ran {stats['tools']} tool call(s) but hit its "
-                    f"{_subagent_max_rounds()}-round limit before writing a summary. "
+                    f"{_rounds_cap}-round limit before writing a summary. "
+                    "You can re-dispatch with a `rounds: <n>` first line for a bigger budget. "
                     "Try a narrower task, or spawn it with an explicit fast model.)"
                 )
             elif stats["tools"]:
@@ -1174,7 +1224,7 @@ async def spawn_agent(
         return {
             "error": (
                 f"Too many sub-agents already running (per-owner limit "
-                f"{subagent_runs._MAX_PER_OWNER}, global {subagent_runs._MAX_TOTAL}). "
+                f"{subagent_runs.max_per_owner()}, global {subagent_runs.max_total()}). "
                 "Wait for one to finish before spawning another."
             )
         }
