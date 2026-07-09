@@ -2644,25 +2644,57 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
                   note.className = 'stopped-indicator rounds-exhausted';
                   const label = document.createElement('span');
                   label.className = 'rounds-exhausted-label';
-                  label.textContent = `Reached the ${json.rounds || ''}-step limit — not finished.`;
-                  note.appendChild(label);
-                  const contBtn = document.createElement('button');
-                  contBtn.className = 'continue-btn';
-                  contBtn.title = 'Continue the task';
-                  contBtn.textContent = 'Continue ▸';
-                  const _holder = currentHolder;
-                  contBtn.addEventListener('click', () => {
-                    note.remove();
-                    _hideUserBubble = true;
-                    _pendingContinue = _holder;
-                    const msgInput = uiModule.el('message');
-                    if (msgInput) {
-                      msgInput.value = 'You hit the step limit before finishing — the task is not complete. Continue from exactly where you left off and keep going until it is done. Do NOT repeat work already done.';
-                      const sb = document.querySelector('.send-btn');
-                      if (sb) sb.click();
-                    }
-                  });
-                  note.appendChild(contBtn);
+                  if (json.auto_continue) {
+                    // The server is firing a hidden continue turn itself (capped;
+                    // see chat_flows.maybe_schedule_auto_continue). No button —
+                    // instead reattach to the new run once it registers (the old
+                    // run ends CLEANLY, so the `superseded` converge path never
+                    // fires — this retry loop is the discovery mechanism). The
+                    // note stays only if the continue never lands.
+                    label.textContent = `Reached the ${json.rounds || ''}-step limit — continuing automatically…`;
+                    note.appendChild(label);
+                    const _acSid = sessionModule.getCurrentSessionId();
+                    let _acTries = 0;
+                    const _acTimer = setInterval(async () => {
+                      _acTries += 1;
+                      if (sessionModule.getCurrentSessionId() !== _acSid || !note.isConnected) {
+                        clearInterval(_acTimer);
+                        return;
+                      }
+                      try {
+                        const mod = window.chatModule;
+                        if (mod && mod.resumeStream && !(mod.hasActiveStream && mod.hasActiveStream(_acSid))) {
+                          const attached = await mod.resumeStream(_acSid);
+                          if (attached) {
+                            clearInterval(_acTimer);
+                            note.remove();
+                            return;
+                          }
+                        }
+                      } catch (_) { /* retry on next tick */ }
+                      if (_acTries >= 8) clearInterval(_acTimer);  // ~20s then give up quietly
+                    }, 2500);
+                  } else {
+                    label.textContent = `Reached the ${json.rounds || ''}-step limit — not finished.`;
+                    note.appendChild(label);
+                    const contBtn = document.createElement('button');
+                    contBtn.className = 'continue-btn';
+                    contBtn.title = 'Continue the task';
+                    contBtn.textContent = 'Continue ▸';
+                    const _holder = currentHolder;
+                    contBtn.addEventListener('click', () => {
+                      note.remove();
+                      _hideUserBubble = true;
+                      _pendingContinue = _holder;
+                      const msgInput = uiModule.el('message');
+                      if (msgInput) {
+                        msgInput.value = 'You hit the step limit before finishing — the task is not complete. Continue from exactly where you left off and keep going until it is done. Do NOT repeat work already done.';
+                        const sb = document.querySelector('.send-btn');
+                        if (sb) sb.click();
+                      }
+                    });
+                    note.appendChild(contBtn);
+                  }
                   _chatBox.appendChild(note);
                   try { note.scrollIntoView({ block: 'end', behavior: 'smooth' }); } catch (_) { uiModule.scrollHistory && uiModule.scrollHistory(); }
                 }

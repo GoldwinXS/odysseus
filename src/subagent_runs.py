@@ -198,6 +198,31 @@ def note_user_activity(session_id: str) -> None:
     (normal send / steer / ack). Mirrors the frontend's resetSubagentAutoResume."""
     _resume_count.pop(session_id, None)
     _failure_resume_count.pop(session_id, None)
+    _auto_continue_count.pop(session_id, None)
+
+
+# Round-cap auto-continue (the "please continue" fix). When a turn exhausts
+# max_rounds mid-task, the server fires a hidden continue turn itself instead
+# of only rendering a Continue button that needs an open, watched browser —
+# audit of 2026-07-09 found the manual button was the ONLY path, and users
+# were typing "hello?"/"please continue" to do the watchdog's job by hand.
+# Capped per session so a task that can't finish doesn't burn rounds forever
+# (3 auto-continues x 20 rounds on top of the original 20 = 80 rounds max);
+# resets on genuine user activity like the resume caps above.
+_MAX_AUTO_CONTINUES = 3
+_auto_continue_count: Dict[str, int] = {}   # session_id -> consecutive auto-continues
+
+
+def can_auto_continue(session_id: str) -> bool:
+    """Whether a server-side round-cap auto-continue may fire for this session."""
+    if session_id in _resume_running:
+        return False
+    return _auto_continue_count.get(session_id, 0) < _MAX_AUTO_CONTINUES
+
+
+def note_auto_continue(session_id: str) -> None:
+    """Record that a round-cap auto-continue just fired (consumes cap budget)."""
+    _auto_continue_count[session_id] = _auto_continue_count.get(session_id, 0) + 1
 
 
 def _next_id() -> str:

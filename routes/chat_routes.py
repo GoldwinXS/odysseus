@@ -1308,6 +1308,12 @@ def setup_chat_routes(
                 _answered_by = None  # set if the selected model failed and a fallback answered
                 _requested_model = sess.model
                 _actual_model = None
+                # Set when the loop emits rounds_exhausted (hit the round cap
+                # mid-task). At [DONE]-time — i.e. AFTER the assistant message
+                # is saved — the server fires a hidden auto-continue turn
+                # itself (capped; see chat_flows) instead of relying on a
+                # human to click the Continue button.
+                _rounds_exhausted = False
                 # Live accumulator the agent loop appends each round's tool_event
                 # to. On a normal finish, tool_events reach us via the final
                 # metrics event; but an interrupt fires before that event, so
@@ -1400,6 +1406,20 @@ def setup_chat_routes(
                                         _agent_rounds = max(_agent_rounds, data.get("round", 1))
                                     elif data.get("type") == "tool_start":
                                         _agent_tool_calls += 1
+                                    elif data.get("type") == "rounds_exhausted":
+                                        _rounds_exhausted = True
+                                        try:
+                                            from src import subagent_runs as _sar_ac
+                                            if _sar_ac.can_auto_continue(session):
+                                                # Tell the client the server will
+                                                # continue on its own so it shows
+                                                # "continuing…" instead of only a
+                                                # manual button.
+                                                data["auto_continue"] = True
+                                                yield f'data: {json.dumps(data)}\n\n'
+                                                continue
+                                        except Exception:
+                                            pass
                                     yield chunk
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.
@@ -1462,6 +1482,15 @@ def setup_chat_routes(
                                     allow_background_extraction=not tool_policy.block_all_tool_calls,
                                 )
                             _stream_set(session, status="done")
+                            if _rounds_exhausted:
+                                # Message is saved — the server can now continue
+                                # the task itself (hidden turn, capped per
+                                # session, resets on real user activity).
+                                try:
+                                    from src.chat_flows import maybe_schedule_auto_continue
+                                    maybe_schedule_auto_continue(session, owner=_user)
+                                except Exception:
+                                    logger.exception("auto-continue scheduling failed (session %s)", session)
                             yield chunk
                 except (asyncio.CancelledError, GeneratorExit):
                     # Client disconnected — save partial response. Wrap
