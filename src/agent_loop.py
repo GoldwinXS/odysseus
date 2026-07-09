@@ -413,6 +413,40 @@ GENERIC LOOPBACK to allowed Odysseus internal endpoints. Use this whenever the u
 Blocked paths/routes (refused for safety): /api/auth/, /api/users/, /api/tokens/, /api/admin/, /api/shell/, /api/backup/restore, /api/email/accounts, POST /api/cookbook/packages/install, POST /api/cookbook/rebuild-engine, POST /api/cookbook/kill-pid.""",
 }
 
+# Host-environment note appended to the bash/python sections at import time.
+# Models constantly assumed a Unix host on this Windows deployment (sudo, apt,
+# /home paths) and were "surprised" every turn — tell them the truth up front.
+# Static per deployment, so it lives in the tool tail without hurting the
+# Anthropic cache prefix (tool sections are per-turn tail content).
+import os as _os
+if _os.name == "nt":
+    try:
+        from src.agent_tools.subprocess_tools import windows_bash_exe as _win_bash
+        _HAS_GIT_BASH = bool(_win_bash())
+    except Exception:
+        _HAS_GIT_BASH = False
+    if _HAS_GIT_BASH:
+        _ENV_NOTE = (
+            "\nENVIRONMENT: WINDOWS host. Your commands run through GIT BASH, so POSIX "
+            "syntax works (ls, grep, pipes, &&). Windows drives appear as /c/... ; "
+            "Windows-native tools (python, git, node) are on PATH. There is NO sudo, "
+            "apt, brew, or systemctl — install Python packages with pip and check "
+            "Windows services/processes via `tasklist`/`powershell -Command \"...\"` "
+            "when needed. User paths look like C:\\Users\\... (quote them or use /c/Users/...)."
+        )
+    else:
+        _ENV_NOTE = (
+            "\nENVIRONMENT: WINDOWS host, commands run through cmd.exe. Use Windows "
+            "commands (dir, type, findstr, where, tasklist) or run "
+            "`powershell -Command \"...\"` explicitly — ls/grep/export WILL fail. "
+            "There is NO sudo, apt, brew, or systemctl; install Python packages with pip."
+        )
+    TOOL_SECTIONS["bash"] += _ENV_NOTE
+    TOOL_SECTIONS["python"] += (
+        "\nENVIRONMENT: WINDOWS host — use raw strings or forward slashes for paths "
+        "(C:/Users/...), never assume /home or /tmp exists."
+    )
+
 def get_builtin_overrides() -> dict:
     """User overrides for built-in tool descriptions (TOOL_SECTIONS).
     Stored globally in settings.json so the user can preview + edit how

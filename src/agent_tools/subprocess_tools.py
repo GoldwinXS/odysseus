@@ -1,10 +1,42 @@
 import asyncio
 import contextvars
+import os
 import sys
 import time
 import collections
 from typing import Optional, Callable, Awaitable, Tuple, Dict
 from src.constants import MAX_OUTPUT_CHARS
+
+
+_WIN_BASH_CACHE: Optional[str] = None
+
+
+def windows_bash_exe() -> Optional[str]:
+    """Path to a REAL bash on Windows (Git Bash), or None.
+
+    asyncio.create_subprocess_shell on Windows runs cmd.exe — but every model
+    writes POSIX because the tool is literally named ```bash```, so ls/grep/
+    export/&&-pipelines failed constantly ("the model is surprised it's on
+    Windows"). When Git Bash is installed, route the tool through it so the
+    tool's name tells the truth. The WindowsApps bash.exe is the WSL launcher
+    (may prompt to install a distro) — skipped in favor of Git Bash."""
+    global _WIN_BASH_CACHE
+    if os.name != "nt":
+        return None
+    if _WIN_BASH_CACHE is not None:
+        return _WIN_BASH_CACHE or None
+    import shutil
+    cand = shutil.which("bash")
+    if cand and "windowsapps" in cand.lower():
+        cand = None
+    if not cand:
+        for p in (r"C:\Program Files\Git\bin\bash.exe",
+                  r"C:\Program Files (x86)\Git\bin\bash.exe"):
+            if os.path.exists(p):
+                cand = p
+                break
+    _WIN_BASH_CACHE = cand or ""
+    return cand or None
 
 # Cap on bash inside a sub-agent, set by the sub-agent runner for the duration of
 # its loop. A sub-agent's whole run is bounded by the same wall-clock cap bash
@@ -163,13 +195,26 @@ class BashTool:
         from src.tool_execution import agent_cwd, _truncate
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
-        proc = await asyncio.create_subprocess_shell(
-            content,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_subproc_env,
-            cwd=agent_cwd(),
-        )
+        _bash_exe = windows_bash_exe()
+        if _bash_exe:
+            # Windows + Git Bash: run the script through real bash so the POSIX
+            # commands every model writes (ls, grep, export, pipes) actually
+            # work, instead of cmd.exe mangling them.
+            proc = await asyncio.create_subprocess_exec(
+                _bash_exe, "-c", content,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_subproc_env,
+                cwd=agent_cwd(),
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                content,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_subproc_env,
+                cwd=agent_cwd(),
+            )
         _bash_to = _bash_timeout()
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,
