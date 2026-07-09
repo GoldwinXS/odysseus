@@ -143,6 +143,14 @@ DEFAULT_SETTINGS = {
     # want to actually use (e.g. 900_000 to fill a 1M-context model). See
     # `compute_input_token_budget`.
     "agent_input_token_hard_max": 200_000,
+    # Anthropic prompt-cache TTL for the tools+system+history prefix. Only "5m" and
+    # "1h" are valid (Anthropic offers no other values). Retaining a cache costs
+    # nothing — the sole price difference is the WRITE: "1h" = 2x input rate, "5m" =
+    # 1.25x. "1h" is cheaper for bursty/human chat (gaps >5 min re-READ the prefix at
+    # 0.1x instead of re-WRITING it every turn); "5m" is marginally cheaper only when
+    # every turn lands within 5 min. Agents running long within ONE turn are covered
+    # by either (internal calls are seconds apart). See llm_core._resolve_cache_ctrl.
+    "anthropic_cache_ttl": "1h",
     "agent_stream_timeout_seconds": 300,
     # After a successful edit_file / write_file, run a cheap by-extension
     # syntax/parse check on the written file (py_compile for .py, `node

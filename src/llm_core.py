@@ -1329,6 +1329,38 @@ def _convert_openai_content_to_anthropic(content):
     return converted
 
 
+# Prompt-cache breakpoint TTL. Anthropic offers exactly TWO values — "5m" and "1h"
+# (no 10-minute option). Holding a cache longer is FREE: you pay only to WRITE it
+# (create) or READ it, never to retain it, so a longer TTL has no idle cost. The
+# only price difference is the write itself — "1h" writes cost 2x the input rate,
+# "5m" writes 1.25x. Where "1h" wins: human chat is bursty (you pause >5 min between
+# messages, easy on mobile), so with "5m" the whole cached prefix (tools ~17k +
+# system + history) expires in the gap and gets re-WRITTEN at 1.25x every turn
+# instead of re-READ at 0.1x — a ~12x jump. Observed live: a short sonnet greeting
+# where cache_write (145k) ≈ cache_read (197k), making writes ~86% of the bill. "1h"
+# turns those re-writes into cheap reads (~4x cheaper on a slow chat). Agents that
+# run a while in ONE turn are already covered by "5m" — their internal calls are
+# seconds apart. Default "1h"; override per-deployment via the anthropic_cache_ttl
+# setting ("5m" or "1h").
+_VALID_CACHE_TTL = {"5m", "1h"}
+
+
+def _resolve_cache_ctrl() -> dict:
+    """Cache-control breakpoint dict, honouring the anthropic_cache_ttl setting.
+
+    Falls back to "1h" on any missing/invalid value so a typo can't silently
+    disable caching or send an unsupported ttl that would 400 the request."""
+    ttl = "1h"
+    try:
+        from src.settings import get_setting
+        val = str(get_setting("anthropic_cache_ttl", "1h") or "1h").strip().lower()
+        if val in _VALID_CACHE_TTL:
+            ttl = val
+    except Exception:
+        pass
+    return {"type": "ephemeral", "ttl": ttl}
+
+
 def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None, effort=None):
     """Convert OpenAI-style messages to Anthropic format.
 
@@ -1340,6 +1372,7 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     """
     system_parts = []
     chat_messages = []
+    cache_ctrl = _resolve_cache_ctrl()  # {"type":"ephemeral","ttl": 5m|1h}, per setting
     for m in messages:
         if m.get("role") == "system":
             system_parts.append(m.get("content") or "")
@@ -1401,7 +1434,7 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
                 # cache_control key into later rounds and non-Anthropic
                 # fallback providers.
                 marked = dict(last_block)
-                marked["cache_control"] = {"type": "ephemeral"}
+                marked["cache_control"] = cache_ctrl
                 chat_messages[-1]["content"] = list(last_content[:-1]) + [marked]
     # Anthropic only accepts temperature in [0.0, 1.0] and 400s on anything above
     # 1.0. Clamp here (in the Anthropic builder only) so presets/sliders that use
@@ -1441,13 +1474,13 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
         _idx = system_text.find(_SPLIT)
         if _idx > 0 and (tools or len(system_text) > 4000):
             stable = {"type": "text", "text": system_text[:_idx],
-                      "cache_control": {"type": "ephemeral"}}
+                      "cache_control": cache_ctrl}
             volatile = {"type": "text", "text": system_text[_idx:].lstrip("\n")}
             payload["system"] = [stable, volatile]
         else:
             system_block = {"type": "text", "text": system_text}
             if tools or len(system_text) > 4000:
-                system_block["cache_control"] = {"type": "ephemeral"}
+                system_block["cache_control"] = cache_ctrl
             payload["system"] = [system_block]
     if stream:
         payload["stream"] = True
@@ -1469,7 +1502,7 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             anthropic_tools.sort(key=lambda t: t["name"])
             # Cache the tool schemas too — they're stable for the whole agent run.
             # The breakpoint caches all tool defs preceding it in the request.
-            anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
+            anthropic_tools[-1]["cache_control"] = cache_ctrl
             payload["tools"] = anthropic_tools
     # Byte-for-byte cache-stability diagnostic. Prompt caching only hits if the
     # cached prefix is byte-identical turn-to-turn. Log a SHA of exactly what
