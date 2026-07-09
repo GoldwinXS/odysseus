@@ -152,6 +152,12 @@ DEFAULT_SETTINGS = {
     # by either (internal calls are seconds apart). See llm_core._resolve_cache_ctrl.
     "anthropic_cache_ttl": "1h",
     "agent_stream_timeout_seconds": 300,
+    # Wall-clock cap for ONE MCP tool call (browser, memory, rag, email, ...).
+    # MCP calls previously had no timeout at any layer, so a hung browser click
+    # wedged the turn forever while SSE heartbeats kept every watchdog happy.
+    # Name-based multipliers in mcp_manager raise this for image (>=900s) and
+    # video (>=3600s) generation tools.
+    "mcp_call_timeout_seconds": 240,
     # After a successful edit_file / write_file, run a cheap by-extension
     # syntax/parse check on the written file (py_compile for .py, `node
     # --check` for .js/.mjs/.cjs when node is on PATH, json.loads for .json)

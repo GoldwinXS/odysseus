@@ -5,6 +5,7 @@ Manages connections to MCP (Model Context Protocol) tool servers.
 Each server exposes tools that are made available to the agent loop.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -454,6 +455,29 @@ class McpManager:
         finally:
             db.close()
 
+    @staticmethod
+    def _call_timeout_s(tool_name: str) -> float:
+        """Wall-clock cap for one MCP tool call.
+
+        MCP calls had NO timeout at any layer — a hung browser click or a wedged
+        server subprocess blocked the turn forever, and the SSE heartbeat kept
+        every stall watchdog (client and sub-agent) convinced the turn was alive.
+        Base cap comes from the mcp_call_timeout_seconds setting; known-slow
+        generation tools get generous name-based multipliers (local SDXL/video on
+        consumer GPUs legitimately runs minutes-long)."""
+        base = 240.0
+        try:
+            from src.settings import get_setting
+            base = float(get_setting("mcp_call_timeout_seconds", 240) or 240)
+        except Exception:
+            pass
+        low = (tool_name or "").lower()
+        if "video" in low:
+            return max(base, 3600.0)
+        if "image" in low or "diffusion" in low:
+            return max(base, 900.0)
+        return base
+
     async def call_tool(self, qualified_name: str, arguments: Dict) -> Dict:
         """Call an MCP tool by its qualified name (mcp__{server_id}__{tool_name}).
 
@@ -470,8 +494,26 @@ class McpManager:
         if not session:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
 
+        _timeout_s = self._call_timeout_s(tool_name)
         try:
-            result = await self._do_call(session, tool_name, arguments, server_id=server_id)
+            result = await asyncio.wait_for(
+                self._do_call(session, tool_name, arguments, server_id=server_id),
+                timeout=_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            # Deliberately NOT the reconnect path: the server is hung/slow, not
+            # provably dead, and re-issuing the same call would double the wait.
+            # Surface a tool-error the model can react to instead of wedging the
+            # turn forever.
+            logger.error(f"MCP tool call timed out after {int(_timeout_s)}s: {qualified_name}")
+            return {
+                "error": (
+                    f"MCP tool call timed out after {int(_timeout_s)}s: {tool_name}. "
+                    "The call was abandoned; the server may be hung or the operation "
+                    "is too slow. Try a different approach or tell the user."
+                ),
+                "exit_code": 124,
+            }
         except Exception as e:
             # Auto-reconnect for builtin servers whose subprocess may have died
             if self.is_builtin(server_id):
@@ -481,7 +523,16 @@ class McpManager:
                     session = self._sessions.get(server_id)
                     if session:
                         try:
-                            result = await self._do_call(session, tool_name, arguments, server_id=server_id)
+                            result = await asyncio.wait_for(
+                                self._do_call(session, tool_name, arguments, server_id=server_id),
+                                timeout=_timeout_s,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"MCP tool call timed out after reconnect: {qualified_name}")
+                            return {
+                                "error": f"MCP tool call timed out after {int(_timeout_s)}s (after reconnect): {tool_name}",
+                                "exit_code": 124,
+                            }
                         except Exception as e2:
                             logger.error(f"MCP tool call failed after reconnect: {qualified_name}: {e2}")
                             return {"error": str(e2), "exit_code": 1}
