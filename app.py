@@ -95,19 +95,20 @@ _console_h = logging.StreamHandler()
 _console_h.setFormatter(_formatter)
 _root_logger.addHandler(_console_h)
 
+_log_file = None
 try:
     _log_dir = os.path.join(DATA_DIR, "logs")
     os.makedirs(_log_dir, exist_ok=True)
     _log_file = os.path.join(_log_dir, "app.log")
 
-    # RotatingFileHandler is not multi-process safe (e.g. if uvicorn is run with --workers N).
-    # Odysseus is single-process by convention, so this is acceptable, but be aware that
-    # concurrent log rotation issues can arise if multiple workers are configured.
-    _file_h = logging.handlers.RotatingFileHandler(
-        _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    _file_h.setFormatter(_formatter)
-    _root_logger.addHandler(_file_h)
+    # Self-healing handler: the stdlib RotatingFileHandler died silently on
+    # 2026-07-09 (Windows rename/write failure swallowed by handleError),
+    # leaving the server unobservable for hours. See src/log_health.py; a
+    # canary task started in the lifespan rebuilds the handler if it ever
+    # goes dead anyway. Still not multi-process safe (single-process by
+    # convention).
+    from src.log_health import build_file_handler as _build_file_handler
+    _root_logger.addHandler(_build_file_handler(_log_file, _formatter))
 except Exception as e:
     _root_logger.warning(f"Failed to initialize file logging handler (falling back to console-only): {e}")
 
@@ -961,6 +962,22 @@ async def _startup_event():
     app.state._startup_tasks = _startup_tasks
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
+    # Logging watchdog: heartbeat + rebuild the file handler if it goes dead
+    # (the 2026-07-09 silent-logging blackout). See src/log_health.py.
+    if _log_file:
+        try:
+            from src.log_health import start_log_canary
+            _startup_tasks.append(start_log_canary(_log_file))
+        except Exception as _e:
+            logger.warning("Failed to start log canary: %s", _e)
+    # Turns that were in flight when the previous process died get a visible
+    # "interrupted by a server restart" note in their sessions instead of
+    # silence (the top stall category in the 2026-07-09 audit).
+    try:
+        from src.agent_runs import sweep_interrupted_runs
+        sweep_interrupted_runs()
+    except Exception as _e:
+        logger.warning("Restart-interruption sweep failed: %s", _e)
     # Always-on monitor that auto-continues the agent when a background bash
     # job (#!bg) finishes — re-invokes the turn with the job output.
     try:
