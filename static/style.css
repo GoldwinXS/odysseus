@@ -9708,6 +9708,14 @@ body.fullwidth-chat .chat-history {
 .agent-thread.collapsed .agent-thread-node {
   display: none;
 }
+/* Live auto-fold: while a thread streams with .fold-prior, only the NEWEST
+   chip stays visible — each earlier tool folds behind the summary line the
+   moment the next tool starts (the user asked for collapse-on-next-tool, not
+   collapse-on-next-text-message). Clicking the summary pins the full list
+   open (chat.js/chatRenderer.js remove .fold-prior and set pinnedOpen). */
+.agent-thread.fold-prior:not(.collapsed) .agent-thread-node:not(:last-child) {
+  display: none;
+}
 /* NOTE: a `min-height` on a collapsed streaming thread was tried to give the
    pulse a longer rail, but it inflated the thread into a long empty line that
    only snapped back to regular spacing once the reply arrived. The pulse

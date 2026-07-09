@@ -2418,6 +2418,9 @@ export function collapseAgentThreadSummary(threadWrap) {
   const header = threadWrap.querySelector(':scope > .agent-thread-summary');
   if (!header) return;
   threadWrap.classList.add('collapsed');
+  // Live auto-fold is over — drop it so a later manual expand from the
+  // resting state shows ALL chips, not just the last one.
+  threadWrap.classList.remove('fold-prior');
   header.setAttribute('aria-expanded', 'false');
 }
 
@@ -2430,6 +2433,15 @@ if (typeof document !== 'undefined' && !window.__odysseus_thread_summary_click_b
   const _toggleThreadSummary = (header) => {
     const thread = header.closest('.agent-thread');
     if (!thread) return;
+    // A live auto-folding thread (only the newest chip visible): first click
+    // means "show me everything" — pin the full list open for the rest of
+    // this stream instead of collapsing to the bare summary.
+    if (thread.classList.contains('fold-prior') && !thread.classList.contains('collapsed')) {
+      thread.classList.remove('fold-prior');
+      thread.dataset.pinnedOpen = '1';
+      header.setAttribute('aria-expanded', 'true');
+      return;
+    }
     const collapsed = thread.classList.toggle('collapsed');
     header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   };

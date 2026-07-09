@@ -2914,6 +2914,14 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
                 }
                 threadWrap.dataset.round = String(_thisRound);
                 threadWrap.classList.add('streaming');
+                // Auto-fold: as soon as THIS chip appears, every earlier chip in
+                // the thread folds behind the summary line (CSS hides all but the
+                // last node while .fold-prior is on) — the user watches the
+                // current tool, not a growing stack. Clicking the summary pins
+                // the full list open for this thread (dataset.pinnedOpen).
+                if (threadWrap.dataset.pinnedOpen !== '1') {
+                  threadWrap.classList.add('fold-prior');
+                }
                 lastToolThread = threadWrap;
                 const toolLabel = _toolLabels[json.tool.toLowerCase()] || json.tool;
                 const toolIcon = _toolIcons[json.tool.toLowerCase()] || '\u25B6';
