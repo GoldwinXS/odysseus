@@ -2054,7 +2054,7 @@ async function _loadFolders({ resetMissing = false } = {}) {
     sel.appendChild(sep2);
     const schedOpt = document.createElement('option');
     schedOpt.value = '__scheduled__';
-    schedOpt.textContent = 'Scheduled';
+    schedOpt.textContent = 'Pending & Scheduled';
     if (state._libFolder === '__scheduled__') schedOpt.selected = true;
     sel.appendChild(schedOpt);
     sel.value = state._libFolder;
@@ -3158,22 +3158,101 @@ async function _loadEmails({ force = false, useCache = true } = {}) {
 }
 
 async function _loadScheduled(grid, sp) {
-  const res = await fetch(`${API_BASE}/api/email/scheduled`);
-  const data = await res.json();
+  // Two queues share this view:
+  //  - pending: agent-staged emails (send_email under agent_email_confirm) that
+  //    are NOT sent and NOT in the mailbox Drafts folder — they wait HERE for
+  //    the user to approve (Send) or discard (Cancel). Without this surface the
+  //    staged email was invisible and stuck (the "went to drafts" bug).
+  //  - scheduled: user-scheduled future sends (existing behavior).
+  let pending = [];
+  let items = [];
+  try {
+    const [pRes, sRes] = await Promise.all([
+      fetch(`${API_BASE}/api/email/pending`),
+      fetch(`${API_BASE}/api/email/scheduled`),
+    ]);
+    pending = (await pRes.json()).pending || [];
+    items = (await sRes.json()).scheduled || [];
+  } catch (e) {
+    if (sp) sp.destroy();
+    grid.innerHTML = '<div class="email-loading">Failed to load the queue</div>';
+    return;
+  }
   if (sp) sp.destroy();
-  const items = data.scheduled || [];
   grid.innerHTML = '';
   const stats = document.getElementById('email-lib-stats');
-  if (stats) stats.textContent = `${items.length} scheduled`;
+  if (stats) stats.textContent =
+    `${pending.length} awaiting approval · ${items.length} scheduled`;
   _setEmailSyncStatus({
     updatedAt: new Date().toISOString(),
     source: 'local',
     loading: false,
   });
 
-  if (items.length === 0) {
-    grid.innerHTML = '<div class="email-loading">No scheduled emails</div>';
+  if (pending.length === 0 && items.length === 0) {
+    grid.innerHTML = '<div class="email-loading">Nothing awaiting approval or scheduled</div>';
     return;
+  }
+
+  // ── Agent drafts awaiting approval (staged, nothing sent) ──────────────
+  for (const it of pending) {
+    const card = document.createElement('div');
+    card.className = 'doclib-card memory-item';
+    const subject = it.subject || '(no subject)';
+    const toDisplay = it.to_addr || '(no recipient)';
+    const bodyFull = it.body || '';
+    const bodyPreview = bodyFull.slice(0, 400);
+
+    const content = document.createElement('div');
+    content.style.cssText = 'flex:1;min-width:0;';
+    content.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span class="memory-item-title">${_esc(subject)}</span>
+        <span style="font-size:9px;color:#e6a817;border:1px solid #e6a817;padding:1px 4px;border-radius:4px;">AWAITING APPROVAL</span>
+      </div>
+      <div style="font-size:10px;opacity:0.7;margin-top:2px;">To: ${_esc(toDisplay)}</div>
+      ${bodyPreview ? `<div style="font-size:10px;opacity:0.6;margin-top:4px;white-space:pre-wrap;max-height:5.5em;overflow:hidden;">${_esc(bodyPreview)}${bodyFull.length > 400 ? '…' : ''}</div>` : ''}
+    `;
+    card.appendChild(content);
+
+    const actionsWrap = document.createElement('div');
+    actionsWrap.className = 'memory-item-actions';
+
+    // Send (approve → poller delivers immediately)
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'memory-item-btn';
+    sendBtn.title = 'Approve and send now';
+    sendBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>';
+    sendBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const { styledConfirm } = await import('./ui.js');
+      const ok = await styledConfirm(`Send this email now to ${toDisplay}?`, { confirmText: 'Send', cancelText: 'Keep staged' });
+      if (!ok) return;
+      try {
+        await fetch(`${API_BASE}/api/email/pending/${it.id}/approve`, { method: 'POST' });
+      } catch (err) { console.error(err); }
+      _loadEmails();
+    });
+    actionsWrap.appendChild(sendBtn);
+
+    // Discard (cancel the staged draft)
+    const discardBtn = document.createElement('button');
+    discardBtn.className = 'memory-item-btn';
+    discardBtn.title = 'Discard this draft';
+    discardBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    discardBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const { styledConfirm } = await import('./ui.js');
+      const ok = await styledConfirm(`Discard draft "${subject}"?`, { confirmText: 'Discard', cancelText: 'Keep', danger: true });
+      if (!ok) return;
+      try {
+        await fetch(`${API_BASE}/api/email/pending/${it.id}`, { method: 'DELETE' });
+      } catch (err) { console.error(err); }
+      _loadEmails();
+    });
+    actionsWrap.appendChild(discardBtn);
+    card.appendChild(actionsWrap);
+    grid.appendChild(card);
   }
 
   for (const it of items) {

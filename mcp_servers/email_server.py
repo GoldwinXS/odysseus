@@ -1177,9 +1177,11 @@ def _stash_agent_draft(*, to, subject, body, in_reply_to=None, references=None,
         "subject": subject or "",
         "body": body or "",
         "message": (
-            "✋ Draft staged for your approval — nothing has been sent yet.\n"
-            "Review the To/Subject/Body above. Reply 'send' to deliver, or "
-            "'cancel' to discard."
+            "Draft staged for your approval — nothing has been sent yet, and it "
+            "is NOT saved to your mailbox Drafts folder. Tell the user to open "
+            "the email panel and select 'Pending & Scheduled', where they can "
+            "review the message and either Send or Discard it. Do NOT say it "
+            "went to their Drafts folder."
         ),
     }
 

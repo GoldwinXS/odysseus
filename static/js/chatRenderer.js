@@ -1847,7 +1847,7 @@ export function displayMetrics(messageElement, metrics) {
   // Default: show tok/s if available, else fall back to other stats
   const costStr0 = cost !== null ? `$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}` : null;
   const metricsLabel = tps != null && tps !== 'undefined'
-    ? `${tps} tok/s`
+    ? (costStr0 ? `${tps} tok/s · ${costStr0}` : `${tps} tok/s`)
     : costStr0
       ? `${outputTokens} tok · ${costStr0}`
       : outputTokens
