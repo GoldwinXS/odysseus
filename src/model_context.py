@@ -105,14 +105,28 @@ def is_local_endpoint(url: str) -> bool:
 # ---------------------------------------------------------------------------
 DEFAULT_CONTEXT = 128000
 REQUEST_TIMEOUT = 5
+# Ollama's out-of-box context when a model has no baked num_ctx and isn't loaded
+# yet. Used as the conservative floor for a confirmed-Ollama endpoint so we never
+# over-send into a window Ollama will silently truncate (see _ollama_served_context).
+OLLAMA_DEFAULT_NUM_CTX = 4096
 
 # Known context windows for major API models (used as fallback when /models
 # endpoint doesn't report context_length).
 # Substring matching — use the shortest unique prefix so variants get caught.
 KNOWN_CONTEXT_WINDOWS = {
     # --- Anthropic ---
+    # 1M-context current gen. _lookup_known picks the LONGEST matching key, so
+    # these specific ids win over the 200k generics below — older Opus 4.0/4.1/4.5
+    # (match 'claude-opus-4') and Sonnet 4.0/4.5 stay at their real 200k.
+    'claude-fable-5': 1000000,
+    'claude-mythos-5': 1000000,
+    'claude-sonnet-5': 1000000,
+    'claude-sonnet-4-6': 1000000,
+    'claude-opus-4-6': 1000000,
+    'claude-opus-4-7': 1000000,
+    'claude-opus-4-8': 1000000,
+    # 200k older gen / generic fallbacks
     'claude-sonnet-4-5': 200000,
-    'claude-sonnet-4-6': 200000,
     'claude-sonnet-4': 200000,
     'claude-opus-4': 200000,
     'claude-haiku-4': 200000,
@@ -149,6 +163,7 @@ KNOWN_CONTEXT_WINDOWS = {
     'deepseek-v2': 64000,
 
     # --- Google ---
+    'gemini-3': 1048576,          # Gemini 3.x (incl. 3.5) — 1M+ window
     'gemini-2.5-pro': 1048576,
     'gemini-2.5-flash': 1048576,
     'gemini-2.0-flash': 1048576,
@@ -333,6 +348,7 @@ def _model_ctx_from_entry(m: dict) -> Optional[int]:
     for field in (
         "context_length",
         "context_window",
+        "max_input_tokens",   # Anthropic Models API reports the window here
         "max_model_len",
         "max_context_length",
         "max_seq_len",
@@ -399,6 +415,63 @@ def _proxy_catalog_context(endpoint_url: str, model: str) -> Optional[int]:
     return None
 
 
+def _ollama_served_context(endpoint_url: str, model: str) -> Optional[int]:
+    """Real SERVED context window (num_ctx) for an Ollama-served model.
+
+    Ollama advertises the model's *training* context (e.g. 262144 for Qwen-based
+    models) in /api/show model_info, but it SERVES at num_ctx — 4096 by default
+    unless the modelfile bakes a value or OLLAMA_CONTEXT_LENGTH raises it. Trusting
+    the training max makes the harness send an 8K prompt into a 4K window, and
+    Ollama silently truncates it — the model then answers from half a prompt and
+    looks broken (observed: Ornith 9B replying "Done." / hallucinating because its
+    ls/glob results were cut off). So we read the SERVED number, in priority:
+      1. /api/ps  — a loaded model reports its actual num_ctx (ground truth, also
+         reflects OLLAMA_CONTEXT_LENGTH and per-load overrides).
+      2. /api/show 'parameters' — a modelfile-baked num_ctx (e.g. our :16k tag),
+         known even before the model is loaded.
+      3. If the endpoint answered as Ollama but neither gave a value (base model,
+         not loaded), fall back to Ollama's 4096 default — a conservative floor.
+    Returns None only when the endpoint isn't Ollama (so the caller can fall
+    through to the llama.cpp /slots probe)."""
+    base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
+    base = base.rstrip("/")
+
+    def _match(mid: Optional[str]) -> bool:
+        if not mid:
+            return False
+        return mid == model or mid.split("/")[-1] == model.split("/")[-1]
+
+    ollama_confirmed = False
+    # 1) Loaded model → its live num_ctx.
+    try:
+        r = httpx.get(f"{base}/api/ps", timeout=REQUEST_TIMEOUT)
+        if r.is_success:
+            ollama_confirmed = True
+            for m in (r.json().get("models") or []):
+                if _match(m.get("model") or m.get("name")):
+                    ctx = m.get("context_length")
+                    if isinstance(ctx, (int, float)) and ctx > 0:
+                        return int(ctx)
+    except Exception:
+        pass
+    # 2) Modelfile-baked num_ctx (present before the model is loaded).
+    try:
+        r = httpx.post(f"{base}/api/show", json={"model": model}, timeout=REQUEST_TIMEOUT)
+        if r.is_success:
+            ollama_confirmed = True
+            for line in str(r.json().get("parameters") or "").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "num_ctx":
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    # Confirmed Ollama but no explicit served ctx → it will load at the default.
+    return OLLAMA_DEFAULT_NUM_CTX if ollama_confirmed else None
+
+
 def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
     """Query the model API for context length. Returns (context_length, known) where
     ``known`` is False only for the bare DEFAULT_CONTEXT fallback."""
@@ -422,6 +495,16 @@ def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
             logger.info(f"Proxy catalog reports context window for {model}: {api_ctx}")
             return api_ctx, True
         return DEFAULT_CONTEXT, False
+
+    # Ollama serves at num_ctx (4096 default), NOT the training-max it advertises
+    # in metadata — read the SERVED window so we don't over-send and get silently
+    # truncated (the Ornith-9B-looked-broken bug). Ollama-specific; returns None
+    # for non-Ollama local endpoints so the /slots probe below still runs.
+    if is_local_endpoint(endpoint_url):
+        _served = _ollama_served_context(endpoint_url, model)
+        if _served:
+            logger.info(f"Ollama serves {model} at context={_served} (served num_ctx, not training max)")
+            return _served, True
 
     # Try llama.cpp /slots endpoint first — reports actual serving context
     if is_local_endpoint(endpoint_url):
