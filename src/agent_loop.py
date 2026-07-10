@@ -2901,8 +2901,21 @@ async def stream_agent_loop(
             if mcp_mgr:
                 try:
                     for _mt in mcp_mgr.get_all_tools(_mcp_disabled_map):
-                        if not _mt.get("is_disabled") and _mt.get("name"):
-                            _stable.add(_mt["name"])
+                        if _mt.get("is_disabled"):
+                            continue
+                        # QUALIFIED name — the schema filter, executor, and
+                        # search_tools catalog all use mcp__server__tool. The
+                        # bare name used to go in here, matched nothing, and
+                        # MCP schemas silently never shipped on the stable
+                        # path (round-4 audit's "loaded-set inconsistency").
+                        _qn = _mt.get("qualified_name")
+                        # Skip MCP tools that have a native alias schema
+                        # (generate_image/generate_video route to these same
+                        # servers via the executor's alias map) — offering
+                        # both wastes a routing decision on a duplicate.
+                        if _qn and _qn not in ("mcp__image_gen__generate_image",
+                                               "mcp__video_gen__generate_video"):
+                            _stable.add(_qn)
                 except Exception as _e:
                     logger.debug("[tool-cache] MCP tool enumerate skipped: %s", _e)
             _stable -= set(disabled_tools or set())
