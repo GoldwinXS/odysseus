@@ -1952,10 +1952,12 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
               if (_streamSessionId === streamSessionId) _streamSessionId = null;
               const _sid = streamSessionId;
               setTimeout(() => {
-                Promise.resolve(resumeStream(_sid)).then((ok) => {
+                // clearInflight: this tab rendered the replaced run's partial —
+                // drop it before the replay re-draws, or the text doubles.
+                Promise.resolve(resumeStream(_sid, { clearInflight: true })).then((ok) => {
                   // The new run may not be registered yet during the brief
                   // cancel/replace window (resume 404s → false); retry once.
-                  if (ok === false) setTimeout(() => { try { resumeStream(_sid); } catch (_e) {} }, 500);
+                  if (ok === false) setTimeout(() => { try { resumeStream(_sid, { clearInflight: true }); } catch (_e) {} }, 500);
                 }).catch(() => {});
               }, 0);
               break;
@@ -4148,9 +4150,10 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
    * reloaded from the DB so its full render stays faithful. Returns true if it
    * attached, false to let the caller fall back to spinner+poll.
    */
-  export async function resumeStream(sessionId) {
+  export async function resumeStream(sessionId, opts) {
     if (!sessionId) return false;
     if (hasActiveStream(sessionId)) return false;
+    const _clearInflight = !!(opts && opts.clearInflight);
 
     let res;
     try {
@@ -4178,6 +4181,42 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
     // user isn't currently viewing via the poll-retry path in sessions.js).
     if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
       _setComposerPlaceholder(true);
+    }
+
+    // DEDUPE before replay: subscribe() replays the run's buffer FROM SEQ 0,
+    // i.e. it re-renders the WHOLE in-flight turn. If this tab already
+    // rendered part of that same turn (its reader died silently, or the
+    // superseded/converge path re-attached), the stale partial must go first
+    // — otherwise the text appears TWICE until a manual refresh rebuilds from
+    // the DB ("I see model output twice" bug).
+    //
+    // Two strengths:
+    //  - default: remove only UNAMBIGUOUSLY-unfinalized trailing artifacts
+    //    (live tool-thread blocks, a holder still carrying its spinner, the
+    //    rounds-exhausted note). Finalized bubbles are never touched — a
+    //    completed answer must not vanish when we attach to a follow-up run.
+    //  - clearInflight (superseded/converge callers): this tab WAS rendering
+    //    the replaced run, so EVERYTHING after the last user bubble is that
+    //    run's partial render — drop it all; the replay re-draws the truth.
+    if (sessionModule.getCurrentSessionId && sessionModule.getCurrentSessionId() === sessionId) {
+      if (_clearInflight) {
+        const _msgs = box.querySelectorAll(':scope > .msg-user');
+        const _lastUser = _msgs.length ? _msgs[_msgs.length - 1] : null;
+        if (_lastUser) {
+          while (_lastUser.nextElementSibling) _lastUser.nextElementSibling.remove();
+        }
+      } else {
+        let _tail = box.lastElementChild;
+        while (_tail) {
+          const _isLiveThread = _tail.classList && _tail.classList.contains('agent-thread') && _tail.classList.contains('streaming');
+          const _isLiveHolder = _tail.classList && _tail.classList.contains('msg-ai') && _tail.querySelector('.ai-spinner');
+          const _isExhaustNote = _tail.classList && _tail.classList.contains('rounds-exhausted');
+          if (!_isLiveThread && !_isLiveHolder && !_isExhaustNote) break;
+          const _prev = _tail.previousElementSibling;
+          _tail.remove();
+          _tail = _prev;
+        }
+      }
     }
 
     const holder = document.createElement('div');
@@ -4274,8 +4313,10 @@ import { getCurrentEffort as _getCurrentReasoningEffort } from './reasoningEffor
             _resumingStreams.delete(sessionId);
             const _sid = sessionId;
             setTimeout(() => {
-              Promise.resolve(resumeStream(_sid)).then((ok) => {
-                if (ok === false) setTimeout(() => { try { resumeStream(_sid); } catch (_e) {} }, 500);
+              // clearInflight: this resumed view rendered the replaced run's
+              // partial — drop it before the new run's replay re-draws.
+              Promise.resolve(resumeStream(_sid, { clearInflight: true })).then((ok) => {
+                if (ok === false) setTimeout(() => { try { resumeStream(_sid, { clearInflight: true }); } catch (_e) {} }, 500);
               }).catch(() => {});
             }, 0);
             break readLoop;

@@ -781,6 +781,12 @@ def format_search_tools_result(
         return text[:160]
 
     lines = [f"- {n} — {_oneliner(catalog.get(n, ''))}" for n in names]
+    # How much of the catalog the model ALREADY has this turn. On caching
+    # endpoints the stable full tool set loads (nearly) everything natively,
+    # so browse mode legitimately returns only the leftovers — say so, or the
+    # short list reads as a broken catalog (in-harness audit 2026-07-09:
+    # "search_tools with an empty query only returns MCP tools").
+    _already = len([n for n in catalog if n in exclude])
     if (query or "").strip():
         header = (
             f"Tools matching '{query.strip()}':" if names
@@ -789,6 +795,12 @@ def format_search_tools_result(
         )
     else:
         header = f"All available tools ({len(names)}):"
+        if _already:
+            header = (
+                f"Tools NOT already loaded this turn ({len(names)}; "
+                f"{_already} others are already in your current tool set and "
+                f"callable right now):"
+            )
 
     footer = (
         "These tools are now available — just call them normally on your next "

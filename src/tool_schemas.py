@@ -1094,6 +1094,57 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_research",
+            "description": "List, read, or delete saved deep-research results from the Library (the reports trigger_research produces).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "read", "delete"],
+                               "description": "list = show saved research (with ids); read = open one report; delete = remove one."},
+                    "id": {"type": "string", "description": "Research id (required for read/delete; get it from action=list)."},
+                    "search": {"type": "string", "description": "Optional filter for action=list."},
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generate an image from a text prompt (local diffusion). The image is saved to the gallery and shown inline in chat; the result includes an image id usable with view_image/edit_image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What to draw — subject, style, mood, composition."},
+                    "model": {"type": "string", "description": "Optional model override (default is the configured local model)."},
+                    "size": {"type": "string", "description": "Optional size like 1024x1024."},
+                    "quality": {"type": "string", "description": "Optional quality hint (e.g. standard, hd)."},
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_video",
+            "description": "Generate a short video clip from a text prompt (local pipeline; can take minutes). The clip is saved to the gallery and shown inline in chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What the clip should show."},
+                    "duration_seconds": {"type": "number", "description": "Optional clip length in seconds."},
+                    "resolution": {"type": "string", "description": "Optional resolution like 720p."},
+                    "image_url": {"type": "string", "description": "Optional source image for image-to-video."},
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "resolve_contact",
             "description": "Look up a contact by name. Searches CardDAV address book and sent email history. Returns email addresses (when available) or phone numbers. Use when the user says 'message [name]', 'email [name]', or asks for someone's contact details.",
             "parameters": {
@@ -1712,6 +1763,13 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         else:
             content = args.get("path", "")
     elif tool_type in ("grep", "glob", "ls"):
+        content = json.dumps(args) if args else "{}"
+    elif tool_type in ("generate_image", "generate_video", "manage_research"):
+        # Executor-side parsers all prefer the JSON form (see
+        # _parse_generate_image/_parse_generate_video/do_manage_research) —
+        # these three were callable ONLY from fenced models until their native
+        # schemas were added (the in-harness audits' "advertised but not
+        # wired" finding).
         content = json.dumps(args) if args else "{}"
     elif tool_type == "get_workspace":
         content = ""
