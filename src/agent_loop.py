@@ -2877,8 +2877,27 @@ async def stream_agent_loop(
     # every turn with no cache discount).
     if not guide_only and not _relevant_tools and _endpoint_caches_prompts(endpoint_url):
         try:
-            from src.tool_index import ALWAYS_AVAILABLE
-            _stable = set(TOOL_SECTIONS.keys()) | set(ALWAYS_AVAILABLE)
+            from src.tool_index import ALWAYS_AVAILABLE, BUILTIN_TOOL_DESCRIPTIONS
+            # UNION of every registry that makes a built-in callable. The old
+            # `set(TOOL_SECTIONS.keys())` had two holes a user-run audit caught
+            # live (the model reported "rules reference grep/glob/ls/api_call/
+            # trigger_research but they're not in my schema"):
+            #   1. tuple keys went in AS TUPLES, so their member tools were
+            #      never in the set;
+            #   2. indexed tools with no TOOL_SECTIONS entry (grep, glob, ls,
+            #      api_call, trigger_research, ...) were dropped entirely on
+            #      cache-capable endpoints — reachable via RAG on non-caching
+            #      providers, silently missing on Anthropic.
+            _stable = set(ALWAYS_AVAILABLE) | set(BUILTIN_TOOL_DESCRIPTIONS)
+            for _k in TOOL_SECTIONS.keys():
+                if isinstance(_k, tuple):
+                    _stable.update(_k)
+                else:
+                    _stable.add(_k)
+            for _s in FUNCTION_TOOL_SCHEMAS:
+                _n = _s.get("function", {}).get("name")
+                if _n:
+                    _stable.add(_n)
             if mcp_mgr:
                 try:
                     for _mt in mcp_mgr.get_all_tools(_mcp_disabled_map):
